@@ -138,3 +138,12 @@ def test_lru_cache_put_if_fits():
 
     with pytest.raises(ValueError, match="value too large"):
         cache.put("big", 11)
+
+
+def test_lru_cache_touch_missing_key_does_not_corrupt_order():
+    cache = _TrackingLRUCache(3)
+
+    cache.touch(99)
+
+    assert len(cache) == 0
+    assert 99 not in cache.order
