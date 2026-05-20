@@ -727,7 +727,6 @@ class DelegatingParser(Parser):
                 if not delta_message:
                     delta_message = DeltaMessage()
                 delta_message.reasoning = reasoning
-
             if (
                 delta_message
                 and delta_message.tool_calls
