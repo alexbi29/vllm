@@ -1511,10 +1511,6 @@ class GPUModelRunner(
         self._may_reorder_batch(scheduler_output)
         # Refresh batch metadata with any pending updates.
         self.input_batch.refresh_metadata()
-        # Apply the reasoning/answer temperature split for this step (no-op
-        # unless a request set reasoning_temperature). Must run every step,
-        # after refresh_metadata, since the phase changes mid-generation.
-        self.input_batch.update_reasoning_temperature()
 
         # Incrementally update ngram_gpu tensors after batch is stable
         if is_ngram_gpu:
@@ -3696,6 +3692,7 @@ class GPUModelRunner(
         # Update output token ids with tokens sampled in last step
         # if async scheduling and required by current sampling params.
         self.input_batch.update_async_output_token_ids()
+        self.input_batch.update_reasoning_temperature()
         if spec_decode_metadata is None:
             return self.sampler(
                 logits=logits,
