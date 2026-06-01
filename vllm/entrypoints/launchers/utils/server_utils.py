@@ -34,9 +34,7 @@ def get_uvicorn_log_config(args: Namespace) -> dict | None:
 
     Priority:
     1. If log_config_file is specified, use it
-    2. If disable_access_log_for_endpoints or JSON formatting is specified,
-       create a config with the requested filter and format
-    3. Otherwise, return None (use uvicorn defaults)
+    2. Otherwise, create a config with timestamps and the requested filter/format
     """
     # First, try to load from file if specified
     logging_config = getattr(args, "logging_config", None)
@@ -52,21 +50,18 @@ def get_uvicorn_log_config(args: Namespace) -> dict | None:
     formatter: LogFormatter = (
         logging_config.formatter if logging_config is not None else "text"
     )
-    if args.disable_access_log_for_endpoints or formatter == "json":
-        from vllm.logging_utils import create_uvicorn_log_config
+    from vllm.logging_utils import create_uvicorn_log_config
 
-        excluded_paths = [
-            p.strip()
-            for p in (args.disable_access_log_for_endpoints or "").split(",")
-            if p.strip()
-        ]
-        return create_uvicorn_log_config(
-            excluded_paths=excluded_paths,
-            log_level=args.uvicorn_log_level,
-            formatter=formatter,
-        )
-
-    return None
+    excluded_paths = [
+        p.strip()
+        for p in (args.disable_access_log_for_endpoints or "").split(",")
+        if p.strip()
+    ]
+    return create_uvicorn_log_config(
+        excluded_paths=excluded_paths,
+        log_level=args.uvicorn_log_level,
+        formatter=formatter,
+    )
 
 
 _running_tasks: set[asyncio.Task] = set()
