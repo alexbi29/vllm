@@ -1409,6 +1409,11 @@ class Gemma4ForCausalLM(
             "vision_tower.": None,
             "embed_audio.": None,
             "embed_vision.": None,
+            # Normalize compressed-tensors packed MoE suffixes for expert loading.
+            ".gate_up_proj_packed": ".gate_up_proj.weight_packed",
+            ".gate_up_proj_scale": ".gate_up_proj.weight_scale",
+            ".down_proj_packed": ".down_proj.weight_packed",
+            ".down_proj_scale": ".down_proj.weight_scale",
         },
         orig_to_new_prefix={
             # Gemma4ForConditionalGeneration already loads the text stack
