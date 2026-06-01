@@ -312,6 +312,13 @@ class SamplingParams(
     watermarking: bool | None = None
     """Whether to apply the engine's configured watermark to this request.
     ``None`` defaults to enabled."""
+    reasoning_temperature: float = 1.0
+    """Temperature used during the reasoning/thinking phase.
+    When the model is generating reasoning tokens (before the answer begins),
+    this temperature is used instead of the regular ``temperature``.
+    Set to 1.0 (the default) to use the same temperature for both phases;
+    set to 0.0 for greedy reasoning while using a stochastic answer, or
+    higher for stochastic reasoning with a greedy answer."""
     top_p: float = 1.0
     """Controls the cumulative probability of the top tokens to consider. Must
     be in (0, 1]. Set to 1 to consider all tokens."""
@@ -460,6 +467,7 @@ class SamplingParams(
         repetition_penalty: float | None = 1.0,
         temperature: float | None = 1.0,
         watermarking: bool | None = None,
+        reasoning_temperature: float | None = None,
         top_p: float | None = 1.0,
         top_k: int = 0,
         min_p: float = 0.0,
@@ -528,6 +536,9 @@ class SamplingParams(
             else repetition_penalty,
             temperature=1.0 if temperature is None else temperature,
             watermarking=watermarking,
+            reasoning_temperature=1.0
+            if reasoning_temperature is None
+            else reasoning_temperature,
             top_p=1.0 if top_p is None else top_p,
             top_k=top_k,
             min_p=min_p,
@@ -570,6 +581,17 @@ class SamplingParams(
                 _MAX_TEMP,
             )
             self.temperature = max(self.temperature, _MAX_TEMP)
+
+        if 0 < self.reasoning_temperature < _MAX_TEMP:
+            logger.warning(
+                "reasoning_temperature %s is less than %s, which may cause "
+                "numerical errors nan or inf in tensors. We have maxed it "
+                "out to %s.",
+                self.reasoning_temperature,
+                _MAX_TEMP,
+                _MAX_TEMP,
+            )
+            self.reasoning_temperature = max(self.reasoning_temperature, _MAX_TEMP)
 
         if self.seed == -1:
             self.seed = None
@@ -616,7 +638,10 @@ class SamplingParams(
                 "invariant. Set seed in SamplingParams or use temperature=0."
             )
 
-        if self.temperature < _SAMPLING_EPS:
+        if (
+            self.temperature < _SAMPLING_EPS
+            and self.reasoning_temperature < _SAMPLING_EPS
+        ):
             # Zero temperature means greedy sampling.
             self.top_p = 1.0
             self.top_k = 0
@@ -674,6 +699,13 @@ class SamplingParams(
                 f"temperature must be in [0, 2], got {self.temperature}.",
                 parameter="temperature",
                 value=self.temperature,
+            )
+        if self.reasoning_temperature < 0.0:
+            raise VLLMValidationError(
+                f"reasoning_temperature must be non-negative, got "
+                f"{self.reasoning_temperature}.",
+                parameter="reasoning_temperature",
+                value=self.reasoning_temperature,
             )
         if not 0.0 < self.top_p <= 1.0:
             raise VLLMValidationError(
@@ -1455,6 +1487,7 @@ class SamplingParams(
             f"repetition_penalty={self.repetition_penalty}, "
             f"temperature={self.temperature}, "
             f"watermarking={self.watermarking}, "
+            f"reasoning_temperature={self.reasoning_temperature}, "
             f"top_p={self.top_p}, "
             f"top_k={self.top_k}, "
             f"min_p={self.min_p}, "
