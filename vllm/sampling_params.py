@@ -698,7 +698,15 @@ class SamplingParams(
 
     @cached_property
     def sampling_type(self) -> SamplingType:
-        if self.temperature < _SAMPLING_EPS:
+        reasoning_temperature = (
+            self.temperature
+            if self.reasoning_temperature is None
+            else self.reasoning_temperature
+        )
+        if (
+            self.temperature < _SAMPLING_EPS
+            and reasoning_temperature < _SAMPLING_EPS
+        ):
             return SamplingType.GREEDY
         if self.seed is not None:
             return SamplingType.RANDOM_SEED
@@ -855,6 +863,23 @@ class SamplingParams(
     ) -> None:
         if speculative_config is None:
             return
+
+        if (
+            self.reasoning_temperature is not None
+            and self.reasoning_temperature != self.temperature
+        ):
+            logger.warning_once(
+                "reasoning_temperature is not supported with speculative "
+                "decoding yet. Ignoring reasoning_temperature and using "
+                "temperature for all generated tokens."
+            )
+            self.reasoning_temperature = None
+            self.__dict__.pop("sampling_type", None)
+            if self.temperature < _SAMPLING_EPS:
+                self.top_p = 1.0
+                self.top_k = 0
+                self.min_p = 0.0
+                self._verify_greedy_sampling()
 
         # Some sampling parameters are not yet compatible with spec decoding.
         if self.min_p > _SAMPLING_EPS or self.logit_bias:
