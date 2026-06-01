@@ -612,12 +612,20 @@ class ChatCompletionRequest(OpenAIBaseModel):
         if self.kv_transfer_params:
             # Pass in kv_transfer_params via extra_args
             extra_args["kv_transfer_params"] = self.kv_transfer_params
+
+        # Extract known extension parameters from extra_args before passing
+        # rest downstream.  Pop them so they don't end up in extra_args.
+        reasoning_temperature: float | None = extra_args.pop(
+            "reasoning_temperature", None
+        )
+
         return SamplingParams.from_optional(
             n=self.n,
             presence_penalty=self.presence_penalty,
             frequency_penalty=self.frequency_penalty,
             repetition_penalty=repetition_penalty,
             temperature=temperature,
+            reasoning_temperature=reasoning_temperature,
             top_p=top_p,
             top_k=top_k,
             min_p=min_p,
