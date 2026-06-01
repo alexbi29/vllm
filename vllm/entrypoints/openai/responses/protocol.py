@@ -422,8 +422,13 @@ class ResponsesRequest(OpenAIBaseModel):
         if self.ec_transfer_params:
             extra_args["ec_transfer_params"] = self.ec_transfer_params
 
+        reasoning_temperature: float | None = extra_args.pop(
+            "reasoning_temperature", None
+        )
+
         return SamplingParams.from_optional(
             temperature=temperature,
+            reasoning_temperature=reasoning_temperature,
             top_p=top_p,
             top_k=top_k,
             max_tokens=max_tokens,
