@@ -334,7 +334,9 @@ class CompletionRequest(OpenAIBaseModel):
 
         echo_without_generation = self.echo and self.max_tokens == 0
 
-        extra_args: dict[str, Any] = self.vllm_xargs if self.vllm_xargs else {}
+        # Copy so popping known extension params below does not mutate the
+        # request's ``vllm_xargs`` in place.
+        extra_args: dict[str, Any] = dict(self.vllm_xargs) if self.vllm_xargs else {}
         if self.kv_transfer_params:
             # Pass in kv_transfer_params via extra_args
             extra_args["kv_transfer_params"] = self.kv_transfer_params

@@ -237,13 +237,14 @@ class SamplingParams(
     """Controls the randomness of the sampling. Lower values make the model
     more deterministic, while higher values make the model more random. Zero
     means greedy sampling."""
-    reasoning_temperature: float = 1.0
+    reasoning_temperature: float | None = None
     """Temperature used during the reasoning/thinking phase.
-    When the model is generating reasoning tokens (before the answer begins),
-    this temperature is used instead of the regular ``temperature``.
-    Set to 1.0 (the default) to use the same temperature for both phases;
-    set to 0.0 for greedy reasoning while using a stochastic answer, or
-    higher for stochastic reasoning with a greedy answer."""
+    When set and different from ``temperature``, reasoning/thinking tokens are
+    sampled at ``reasoning_temperature`` while the answer is sampled at
+    ``temperature``. For example ``temperature=0.0, reasoning_temperature=0.7``
+    gives a greedy answer with stochastic reasoning. Leave unset (``None``,
+    the default) to use ``temperature`` for both phases — no split, no
+    overhead."""
     top_p: float = 1.0
     """Controls the cumulative probability of the top tokens to consider. Must
     be in (0, 1]. Set to 1 to consider all tokens."""
@@ -428,9 +429,7 @@ class SamplingParams(
             if repetition_penalty is None
             else repetition_penalty,
             temperature=1.0 if temperature is None else temperature,
-            reasoning_temperature=1.0
-            if reasoning_temperature is None
-            else reasoning_temperature,
+            reasoning_temperature=reasoning_temperature,
             top_p=1.0 if top_p is None else top_p,
             top_k=top_k,
             min_p=min_p,
@@ -469,7 +468,9 @@ class SamplingParams(
             )
             self.temperature = max(self.temperature, _MAX_TEMP)
 
-        if 0 < self.reasoning_temperature < _MAX_TEMP:
+        if self.reasoning_temperature is not None and (
+            0 < self.reasoning_temperature < _MAX_TEMP
+        ):
             logger.warning(
                 "reasoning_temperature %s is less than %s, which may cause "
                 "numerical errors nan or inf in tensors. We have maxed it "
@@ -478,9 +479,7 @@ class SamplingParams(
                 _MAX_TEMP,
                 _MAX_TEMP,
             )
-            self.reasoning_temperature = max(
-                self.reasoning_temperature, _MAX_TEMP
-            )
+            self.reasoning_temperature = max(self.reasoning_temperature, _MAX_TEMP)
 
         if self.seed == -1:
             self.seed = None
@@ -513,8 +512,16 @@ class SamplingParams(
 
         self._verify_args()
 
-        if self.temperature < _SAMPLING_EPS and self.reasoning_temperature < _SAMPLING_EPS:
-            # Both temperatures are effectively zero -> fully greedy sampling.
+        # ``reasoning_temperature is None`` means the reasoning phase mirrors
+        # ``temperature``, so the request is fully greedy iff ``temperature``
+        # is. A set, non-greedy reasoning_temperature keeps top_p/top_k/min_p
+        # alive for the (random) reasoning phase even when the answer is greedy.
+        reasoning_temp_greedy = (
+            self.reasoning_temperature is None
+            or self.reasoning_temperature < _SAMPLING_EPS
+        )
+        if self.temperature < _SAMPLING_EPS and reasoning_temp_greedy:
+            # Both phases are effectively zero -> fully greedy sampling.
             self.top_p = 1.0
             self.top_k = 0
             self.min_p = 0.0
@@ -577,7 +584,7 @@ class SamplingParams(
                 parameter="temperature",
                 value=self.temperature,
             )
-        if self.reasoning_temperature < 0.0:
+        if self.reasoning_temperature is not None and self.reasoning_temperature < 0.0:
             raise VLLMValidationError(
                 f"reasoning_temperature must be non-negative, got "
                 f"{self.reasoning_temperature}.",
