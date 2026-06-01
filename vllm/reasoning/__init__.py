@@ -132,6 +132,10 @@ _REASONING_PARSERS_TO_REGISTER = {
         "inkling_reasoning_parser",
         "InklingParserReasoningAdapter",
     ),
+    "lfm2": (
+        "lfm2_reasoning_parser",
+        "Lfm2ReasoningParser",
+    ),
 }
 
 
