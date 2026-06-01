@@ -1650,6 +1650,14 @@ class Gemma4ForCausalLM(
                     ".router.per_expert_scale",
                     ".moe.per_expert_scale",
                 )
+                # compressed-tensors uses underscore suffixes for
+                # packed MoE weights; convert to dot-separated form
+                # so downstream expert_params_mapping can match.
+                name = re.sub(
+                    r"\.(gate_up_proj|down_proj)_(packed|scale)\b",
+                    r".\1.weight_\2",
+                    name,
+                )
                 if ".experts.gate_up_proj" in name:
                     name = name.replace(
                         ".experts.gate_up_proj",
