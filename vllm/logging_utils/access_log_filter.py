@@ -107,7 +107,8 @@ def create_uvicorn_log_config(
             },
             "access": {
                 "()": "uvicorn.logging.AccessFormatter",
-                "fmt": '%(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s',  # noqa: E501
+                "fmt": '%(levelprefix)s %(asctime)s %(client_addr)s - "%(request_line)s" %(status_code)s',  # noqa: E501
+                "datefmt": "%m-%d %H:%M:%S",
             },
         },
         "handlers": {
