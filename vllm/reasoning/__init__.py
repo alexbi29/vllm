@@ -193,6 +193,10 @@ _REASONING_PARSERS_TO_REGISTER = {
         "zaya_engine_reasoning_parser",
         "ZayaParserReasoningAdapter",
     ),
+    "lfm2": (
+        "lfm2_reasoning_parser",
+        "Lfm2ReasoningParser",
+    ),
 }
 
 
