@@ -298,15 +298,6 @@
                                 {%- endif -%}
                             {%- endfor -%}
                             {{- format_tool_response_block(ns_tname.name, ns_txt.s) -}}
-                            {%- for part in tool_body -%}
-                                {%- if part.get('type') in ['image', 'image_url'] -%}
-                                    {{- '<|image|>' -}}
-                                {%- elif part.get('type') in ['audio', 'input_audio'] -%}
-                                    {{- '<|audio|>' -}}
-                                {%- elif part.get('type') == 'video' -%}
-                                    {{- '<|video|>' -}}
-                                {%- endif -%}
-                            {%- endfor -%}
                         {%- else -%}
                             {{- format_tool_response_block(ns_tname.name, tool_body) -}}
                         {%- endif -%}
