@@ -53,7 +53,3 @@ class SamplingMetadata:
     # When non-None, use ``holder.has_tracked_requests()`` to see if this batch applies
     # thinking-token-budget logits (holder may exist with an empty tracking set).
     thinking_budget_state_holder: ThinkingBudgetStateHolder | None = None
-
-    # Temperature split for reasoning vs answer phase.
-    reasoning_temperature: torch.Tensor | None = None
-    think_mask: torch.Tensor | None = None
