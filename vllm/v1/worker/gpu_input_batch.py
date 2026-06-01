@@ -199,10 +199,24 @@ class InputBatch:
             device="cpu",
             pin_memory=pin_memory,
         )
-        self.reasoning_temperature_cpu = (
-            self.reasoning_temperature_cpu_tensor.numpy()
+        self.reasoning_temperature_cpu = self.reasoning_temperature_cpu_tensor.numpy()
+        # Requests whose reasoning_temperature differs from temperature. The
+        # batch-level split path is active iff this set is non-empty (see the
+        # ``has_reasoning_temp_split`` property), so it clears automatically
+        # once all such requests leave the batch.
+        self.reasoning_temp_split_reqs: set[str] = set()
+        # Think state seeded from each row's prompt (fallback when the output
+        # contains no marker yet).
+        self.prompt_in_think_cpu = np.zeros(max_num_reqs, dtype=bool)
+        # Live per-step think mask, refreshed every decode step in
+        # ``update_reasoning_temperature`` and copied to the GPU for the blend.
+        self.think_in_think_cpu_tensor = torch.zeros(
+            (max_num_reqs,), dtype=torch.bool, device="cpu", pin_memory=pin_memory
         )
-        self.has_reasoning_temp_split = False
+        self.think_in_think_cpu = self.think_in_think_cpu_tensor.numpy()
+        self.think_in_think_gpu = torch.zeros(
+            (max_num_reqs,), dtype=torch.bool, device=device
+        )
         # Think-boundary token IDs, populated from reasoning_config.
         self.think_start_token_ids: list[int] = []
         self.think_end_token_ids: list[int] = []
@@ -405,9 +419,14 @@ class InputBatch:
         self.block_table.add_row(request.block_ids, req_index)
 
         if sampling_params := request.sampling_params:
+            # ``reasoning_temperature is None`` means "mirror temperature", so
+            # the split is only active when it is set AND differs. Comparing
+            # the raw default (None) here is what keeps ordinary requests off
+            # the mixed sampling path.
+            reasoning_temperature = sampling_params.reasoning_temperature
             has_reasoning_split = (
-                sampling_params.reasoning_temperature
-                != sampling_params.temperature
+                reasoning_temperature is not None
+                and reasoning_temperature != sampling_params.temperature
             )
             if has_reasoning_split:
                 # When the temperature split is active, the request must go
@@ -419,12 +438,12 @@ class InputBatch:
                 # to 1.0 in apply_temperature), and torch.where() selects
                 # greedy vs random per-request based on the blended temp.
                 # Store the ORIGINAL temperature in temperature_cpu and the
-                # thinking-phase temp in reasoning_temperature_cpu. The
-                # blend in _make_sampling_metadata() chooses between them.
+                # thinking-phase temp in reasoning_temperature_cpu;
+                # update_reasoning_temperature() blends them each step.
                 self.temperature_cpu[req_index] = sampling_params.temperature
                 self.greedy_reqs.add(req_id)
                 self.random_reqs.add(req_id)
-                self.has_reasoning_temp_split = True
+                self.reasoning_temp_split_reqs.add(req_id)
             elif sampling_params.sampling_type == SamplingType.GREEDY:
                 # Should avoid division by zero later when apply_temperature.
                 self.temperature_cpu[req_index] = 0.0
@@ -433,9 +452,21 @@ class InputBatch:
                 self.temperature_cpu[req_index] = sampling_params.temperature
                 self.random_reqs.add(req_id)
 
-            self.reasoning_temperature_cpu[req_index] = (
-                sampling_params.reasoning_temperature
-            )
+            if has_reasoning_split:
+                self.reasoning_temperature_cpu[req_index] = reasoning_temperature
+                # Seed the live think state from the prompt; the per-step update
+                # refines it from generated output.
+                in_think = self._prompt_in_think(request.prompt_token_ids)
+                self.prompt_in_think_cpu[req_index] = in_think
+                self.think_in_think_cpu[req_index] = in_think
+            else:
+                # Mirror temperature so the per-step blend is a no-op for rows
+                # that did not request a split.
+                self.reasoning_temperature_cpu[req_index] = self.temperature_cpu[
+                    req_index
+                ]
+                self.prompt_in_think_cpu[req_index] = False
+                self.think_in_think_cpu[req_index] = False
 
             self.top_p_cpu[req_index] = sampling_params.top_p
             if sampling_params.top_p < 1:
@@ -595,6 +626,7 @@ class InputBatch:
 
         self.greedy_reqs.discard(req_id)
         self.random_reqs.discard(req_id)
+        self.reasoning_temp_split_reqs.discard(req_id)
         self.top_p_reqs.discard(req_id)
         self.top_k_reqs.discard(req_id)
         self.frequency_penalties_reqs.discard(req_id)
@@ -698,6 +730,14 @@ class InputBatch:
         self.reasoning_temperature_cpu[i1], self.reasoning_temperature_cpu[i2] = (
             self.reasoning_temperature_cpu[i2],
             self.reasoning_temperature_cpu[i1],
+        )
+        self.prompt_in_think_cpu[i1], self.prompt_in_think_cpu[i2] = (
+            self.prompt_in_think_cpu[i2],
+            self.prompt_in_think_cpu[i1],
+        )
+        self.think_in_think_cpu[i1], self.think_in_think_cpu[i2] = (
+            self.think_in_think_cpu[i2],
+            self.think_in_think_cpu[i1],
         )
         self.top_p_cpu[i1], self.top_p_cpu[i2] = self.top_p_cpu[i2], self.top_p_cpu[i1]
         self.top_k_cpu[i1], self.top_k_cpu[i2] = self.top_k_cpu[i2], self.top_k_cpu[i1]
@@ -826,12 +866,16 @@ class InputBatch:
                 (last_req_index, empty_index, MoveDirectionality.UNIDIRECTIONAL)
             )
 
-            self.temperature_cpu[empty_index] = self.temperature_cpu[
-                last_req_index
-            ]
+            self.temperature_cpu[empty_index] = self.temperature_cpu[last_req_index]
             self.reasoning_temperature_cpu[empty_index] = (
                 self.reasoning_temperature_cpu[last_req_index]
             )
+            self.prompt_in_think_cpu[empty_index] = self.prompt_in_think_cpu[
+                last_req_index
+            ]
+            self.think_in_think_cpu[empty_index] = self.think_in_think_cpu[
+                last_req_index
+            ]
             self.top_p_cpu[empty_index] = self.top_p_cpu[last_req_index]
             self.top_k_cpu[empty_index] = self.top_k_cpu[last_req_index]
             self.frequency_penalties_cpu[empty_index] = self.frequency_penalties_cpu[
@@ -889,71 +933,95 @@ class InputBatch:
             self.sampling_metadata = self._make_sampling_metadata()
 
     @staticmethod
-    def _last_token_sequence_index(
-        token_ids: list[int], seq: list[int]
-    ) -> int:
-        """Find the last occurrence of *seq* in *token_ids*, or -1."""
-        if not seq or not token_ids:
+    def _last_token_sequence_index(token_ids: list[int], seq: list[int]) -> int:
+        """Find the start index of the last occurrence of *seq* in
+        *token_ids*, or -1 if absent."""
+        if not seq or len(token_ids) < len(seq):
             return -1
         for i in range(len(token_ids) - len(seq), -1, -1):
             if token_ids[i : i + len(seq)] == seq:
                 return i
         return -1
 
-    def _compute_think_mask(self, num_reqs: int) -> torch.Tensor | None:
-        """Build a boolean mask: ``True`` = request is in thinking mode.
+    def _prompt_in_think(self, prompt_token_ids: list[int] | None) -> bool:
+        """Whether *prompt_token_ids* ends inside a thinking section."""
+        if not prompt_token_ids:
+            return False
+        if not self.think_start_token_ids or not self.think_end_token_ids:
+            return False
+        last_start = self._last_token_sequence_index(
+            prompt_token_ids, self.think_start_token_ids
+        )
+        last_end = self._last_token_sequence_index(
+            prompt_token_ids, self.think_end_token_ids
+        )
+        return last_start > last_end
 
-        Scans each request's combined token sequence (prompt + output) for
-        think-start and think-end markers.  Returns ``None`` when the split
-        is not active or there are no think-boundary markers configured.
+    def _update_think_state(self, num_reqs: int) -> None:
+        """Refresh the per-row think mask in ``think_in_think_cpu``.
+
+        For each split request, find the last think-start and think-end markers
+        in the generated output: the row is "in think" when a start marker is
+        the most recent of the two. If neither marker is present yet, fall back
+        to the prompt's think state.
+
+        NOTE: this rescans the full output each step (O(output_len) per split
+        row). A scanned-prefix incremental version is unsafe under async
+        scheduling, where the in-flight token slot holds a placeholder (-1)
+        that is overwritten with the real token id a step later — advancing a
+        cursor over that slot skips the real marker. A correct incremental
+        version would need to track the last *committed* output length; left as
+        a follow-up optimization.
+        """
+        start = self.think_start_token_ids
+        end = self.think_end_token_ids
+        for req_id in self.reasoning_temp_split_reqs:
+            i = self.req_id_to_index.get(req_id)
+            if i is None or i >= num_reqs:
+                continue
+            out = self.req_output_token_ids[i]
+            if not out:
+                self.think_in_think_cpu[i] = bool(self.prompt_in_think_cpu[i])
+                continue
+            last_start = self._last_token_sequence_index(out, start)
+            last_end = self._last_token_sequence_index(out, end)
+            if last_start >= 0 or last_end >= 0:
+                self.think_in_think_cpu[i] = last_start > last_end
+            else:
+                self.think_in_think_cpu[i] = bool(self.prompt_in_think_cpu[i])
+
+    def update_reasoning_temperature(self) -> None:
+        """Apply the reasoning/answer temperature split for the current step.
+
+        Called every decode step (unlike ``_make_sampling_metadata``, which
+        only runs on batch changes). Recomputes the live ``temperature`` tensor
+        the sampler reads as ``where(in_think, reasoning_temperature,
+        temperature)``, so the effective temperature follows the model across
+        the think/answer boundary mid-generation. No-op (zero overhead) when no
+        request in the batch requested a split.
         """
         if not self.has_reasoning_temp_split:
-            return None
+            return
         if not self.think_start_token_ids or not self.think_end_token_ids:
-            return None
+            return
+        num_reqs = self.num_reqs
+        if num_reqs == 0 or self.all_greedy:
+            return
 
-        mask = torch.zeros(num_reqs, dtype=torch.bool, device=self.device)
-        start_len = len(self.think_start_token_ids)
-        end_len = len(self.think_end_token_ids)
-
-        for i in range(num_reqs):
-            # Combine prompt tokens (numpy slice) with output tokens.
-            prompt_len = int(self.num_prompt_tokens[i])
-            combined: list[int] = []
-            if prompt_len > 0:
-                combined.extend(
-                    self.token_ids_cpu[i, :prompt_len].tolist()
-                )
-            if i < len(self.req_output_token_ids):
-                out = self.req_output_token_ids[i]
-                if out is not None:
-                    combined.extend(out)
-
-            if len(combined) < max(start_len, end_len):
-                continue
-
-            # Scan from the end for the latest occurrence of each marker.
-            last_start = -1
-            for j in range(len(combined) - start_len, -1, -1):
-                if (
-                    combined[j : j + start_len]
-                    == self.think_start_token_ids
-                ):
-                    last_start = j
-                    break
-            last_end = -1
-            for j in range(len(combined) - end_len, -1, -1):
-                if (
-                    combined[j : j + end_len]
-                    == self.think_end_token_ids
-                ):
-                    last_end = j
-                    break
-
-            if last_start >= 0 or last_end >= 0:
-                mask[i] = last_start > last_end
-
-        return mask
+        self._update_think_state(num_reqs)
+        # Reset to the answer-phase base, then blend in reasoning temps where
+        # the row is currently thinking. Starting from the CPU base each step
+        # keeps the blend idempotent (no drift from repeated in-place writes).
+        answer = copy_slice(self.temperature_cpu_tensor, self.temperature, num_reqs)
+        reasoning = copy_slice(
+            self.reasoning_temperature_cpu_tensor,
+            self.reasoning_temperature,
+            num_reqs,
+        )
+        mask = copy_slice(
+            self.think_in_think_cpu_tensor, self.think_in_think_gpu, num_reqs
+        )
+        torch.where(mask, reasoning, answer, out=self.temperature[:num_reqs])
 
     def _make_sampling_metadata(self) -> SamplingMetadata:
         num_reqs = self.num_reqs
@@ -1039,37 +1107,17 @@ class InputBatch:
                     req_index = self.req_id_to_index[req_id]
                     logprob_token_ids_by_index[req_index] = token_ids
 
-        # --- Temperature split for reasoning vs answer phase ---
-        think_mask: torch.Tensor | None = None
-        reasoning_temperature_tensor: torch.Tensor | None = None
-
-        if self.has_reasoning_temp_split and temperature is not None:
-            # Copy the reasoning-phase temperature to the GPU.
-            reasoning_temperature_tensor = copy_slice(
-                self.reasoning_temperature_cpu_tensor,
-                self.reasoning_temperature,
-                num_reqs,
-            )
-            # Determine which requests are currently in thinking mode.
-            think_mask = self._compute_think_mask(num_reqs)
-
-            if think_mask is not None:
-                # Blend: for requests in thinking mode, use
-                # reasoning_temperature; for answer mode, use the original
-                # temperature (already in ``temperature``).
-                blended = torch.where(
-                    think_mask, reasoning_temperature_tensor, temperature
-                )
-                # Write the blended result back into the GPU tensor.
-                self.temperature[:num_reqs].copy_(blended)
-                temperature = self.temperature[:num_reqs]
-
+        # The reasoning/answer temperature split is applied per decode step in
+        # ``update_reasoning_temperature`` (called after ``refresh_metadata``),
+        # not here: this metadata is only rebuilt on batch changes, so blending
+        # here would freeze the phase at admission time. ``temperature`` is the
+        # answer-phase base; the per-step update overwrites the same tensor
+        # (``self.temperature[:num_reqs]``, which this view aliases) in place
+        # before the sampler reads it.
         return SamplingMetadata(
             temperature=temperature,
             all_greedy=self.all_greedy,
             all_random=self.all_random,
-            reasoning_temperature=reasoning_temperature_tensor,
-            think_mask=think_mask,
             top_p=None if self.no_top_p else self.top_p[:num_reqs],
             top_k=None if self.no_top_k else self.top_k[:num_reqs],
             generators=self.generators,
@@ -1240,6 +1288,10 @@ class InputBatch:
     @property
     def num_reqs(self) -> int:
         return len(self.req_id_to_index)
+
+    @property
+    def has_reasoning_temp_split(self) -> bool:
+        return len(self.reasoning_temp_split_reqs) > 0
 
     @property
     def all_greedy(self) -> bool:
