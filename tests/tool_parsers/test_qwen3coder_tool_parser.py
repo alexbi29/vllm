@@ -3,6 +3,7 @@
 
 import json
 from collections.abc import Generator
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -29,6 +30,9 @@ from vllm.tool_parsers.qwen3_engine_tool_parser import (
 )
 
 MODEL = "Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8"
+QWEN36_TEMPLATE = (
+    Path(__file__).resolve().parents[2] / "examples/chat_template_qwen36_fixed.jinja"
+)
 
 
 @pytest.fixture(scope="module")
@@ -152,6 +156,25 @@ def _as_chat_completion_tools(
                 )
             )
     return normalized
+
+
+def test_qwen36_template_auto_disables_thinking_with_tools(
+    qwen3_tokenizer, sample_tools
+):
+    tools = [
+        tool.model_dump(exclude_none=True)
+        for tool in _as_chat_completion_tools(sample_tools)
+    ]
+
+    prompt = qwen3_tokenizer.apply_chat_template(
+        [{"role": "user", "content": "What is the weather in Dallas, Texas?"}],
+        tools=tools,
+        chat_template=QWEN36_TEMPLATE.read_text(),
+        add_generation_prompt=True,
+        tokenize=False,
+    )
+
+    assert prompt.endswith("<|im_start|>assistant\n<think>\n\n</think>\n\n")
 
 
 def assert_tool_calls(
