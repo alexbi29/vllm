@@ -11,7 +11,7 @@
 {#- ======================================================================== -#}
 
 {%- set enable_thinking = enable_thinking if enable_thinking is defined else true -%}
-{%- set auto_disable_thinking_with_tools = auto_disable_thinking_with_tools if auto_disable_thinking_with_tools is defined else false -%}
+{%- set auto_disable_thinking_with_tools = auto_disable_thinking_with_tools if auto_disable_thinking_with_tools is defined else true -%}
 {%- set preserve_thinking = preserve_thinking if preserve_thinking is defined else false -%}
 {%- set add_vision_id = add_vision_id if add_vision_id is defined else false -%}
 {%- set max_tool_arg_chars = max_tool_arg_chars if max_tool_arg_chars is defined else 0 -%}
@@ -164,22 +164,22 @@
         {{- '<|im_start|>user\n' ~ content ~ '<|im_end|>\n' -}}
 
     {%- elif message.role == 'assistant' -%}
-        {#- Auto-close unclosed thinking before <tool_call> -#}
-        {%- if '<tool_call>' in content and 'thinking' in content -%}
-            {%- set _last_think = content.rfind('thinking') -%}
-            {%- set _last_close_think = content.rfind(' response') -%}
+        {#- Auto-close unclosed <think> block before <tool_call> -#}
+        {%- if '<tool_call>' in content and '<think>' in content -%}
+            {%- set _last_think = content.rfind('<think>') -%}
+            {%- set _last_close_think = content.rfind('</think>') -%}
             {%- set _last_close_thinking = content.rfind('</thinking>') -%}
             {%- set _last_close = _last_close_think if _last_close_think > _last_close_thinking else _last_close_thinking -%}
             {%- set _tool_pos = content.find('<tool_call>') -%}
             {%- if _last_close < _last_think or _last_close == -1 -%}
                 {%- if _tool_pos > _last_think -%}
-                    {%- set content = content[:_tool_pos] ~ ' response' ~ content[_tool_pos:] -%}
+                    {%- set content = content[:_tool_pos] ~ '</think>\n\n' ~ content[_tool_pos:] -%}
                 {%- else -%}
-                    {%- set content = content ~ ' response' -%}
+                    {%- set content = content ~ '</think>\n\n' -%}
                 {%- endif -%}
             {%- endif -%}
         {%- endif -%}
-        {#- Extract reasoning_content (supports  response and </thinking>) -#}
+        {#- Extract reasoning_content (supports </think> and </thinking>) -#}
         {%- set reasoning_content = '' -%}
         {%- if message.reasoning_content is defined and message.reasoning_content is not none -%}
             {%- if message.reasoning_content is string -%}
@@ -189,24 +189,24 @@
             {%- endif -%}
         {%- else -%}
             {%- set _think_end = '' -%}
-            {%- if '\n response' in content -%}
-                {%- set _think_end = ' response' -%}
+            {%- if '</think>' in content -%}
+                {%- set _think_end = '</think>' -%}
             {%- elif '\n</thinking>' in content -%}
                 {%- set _think_end = '</thinking>' -%}
             {%- endif -%}
             {%- if _think_end and _think_end in content -%}
-                {%- set reasoning_content = content.split(_think_end)[0].rstrip('\n').split('thinking')[-1].lstrip('\n') -%}
+                {%- set reasoning_content = content.split(_think_end)[0].rstrip('\n').split('<think>')[-1].lstrip('\n') -%}
                 {%- set content = content.split(_think_end)[-1].lstrip('\n') -%}
             {%- endif -%}
         {%- endif -%}
         {%- set reasoning_content = reasoning_content | trim -%}
 
         {#- Render turn                                                          -#}
-        {#- preserve_thinking=true: always include  thinking blocks (even empty)   -#}
+        {#- preserve_thinking=true: always include <think> blocks (even empty)   -#}
         {#- preserve_thinking=false: only include after last query, skip empty   -#}
         {#-   (keeps prefix-cache hits stable — HF Qwen3.5-122B-A10B disc#22)   -#}
         {%- if preserve_thinking or (loop.index0 > ns.last_query_index and reasoning_content) -%}
-            {{- '<|im_start|>assistant\n thinking\n' ~ reasoning_content ~ '\n response\n\n' ~ content -}}
+            {{- '<|im_start|>assistant\n<think>\n' ~ reasoning_content ~ '\n</think>\n\n' ~ content -}}
         {%- else -%}
             {{- '<|im_start|>assistant\n' ~ content -}}
         {%- endif -%}
@@ -289,8 +289,8 @@
 {%- if add_generation_prompt -%}
     {{- '<|im_start|>assistant\n' -}}
     {%- if not _thinking or _last_is_tool_relay -%}
-        {{- ' thinking\n\n response\n\n' -}}
+        {{- '<think>\n\n</think>\n\n' -}}
     {%- else -%}
-        {{- ' thinking\n' -}}
+        {{- '<think>\n' -}}
     {%- endif -%}
 {%- endif -%}
