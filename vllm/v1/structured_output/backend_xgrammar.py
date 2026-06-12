@@ -163,7 +163,11 @@ class XgrammarGrammar(StructuredOutputGrammar):
                 )
                 return False
             self.num_processed_tokens += 1
-        self._is_terminated = self.matcher.is_terminated()
+            if self.matcher.is_terminated():
+                self._is_terminated = True
+                break
+        else:
+            self._is_terminated = self.matcher.is_terminated()
         return True
 
     def validate_tokens(self, tokens: list[int]) -> list[int]:
@@ -173,9 +177,14 @@ class XgrammarGrammar(StructuredOutputGrammar):
         Returns the prefix list of tokens that are accepted by the FSM.
         """
         accepted_tokens = []
+        if self._is_terminated:
+            return accepted_tokens
+
         for token in tokens:
             if self.matcher.accept_token(token):
                 accepted_tokens.append(token)
+                if self.matcher.is_terminated():
+                    break
             else:
                 break
         if len(accepted_tokens) > 0:
