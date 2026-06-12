@@ -1298,7 +1298,7 @@ class MambaManager(SingleTypeKVCacheManager):
             return computed_blocks, hit_length
 
         max_num_blocks = max_length // block_size
-        if use_eagle and max_num_blocks > 0:
+        if drop_eagle_block and max_num_blocks > 0:
             # Full-attention cache hit lookup matches one extra block and then
             # drops that final block as it's only partially accepted. Mamba/GDN state
             # blocks are [null, ..., state] so popping after a match removes the state
