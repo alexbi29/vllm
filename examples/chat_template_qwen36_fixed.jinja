@@ -2,7 +2,7 @@
 {#-                                                                           -#}
 {#- Config (--chat-template-kwargs):                                          -#}
 {#-   enable_thinking                  bool   (default true)                  -#}
-{#-   auto_disable_thinking_with_tools bool   (default true)                  -#}
+{#-   auto_disable_thinking_with_tools bool   (default false)                 -#}
 {#-   preserve_thinking                bool   (default false)                 -#}
 {#-   add_vision_id                    bool   (default false)                 -#}
 {#-   max_tool_arg_chars               int    (default 0 = unlimited)         -#}
@@ -11,7 +11,7 @@
 {#- ======================================================================== -#}
 
 {%- set enable_thinking = enable_thinking if enable_thinking is defined else true -%}
-{%- set auto_disable_thinking_with_tools = auto_disable_thinking_with_tools if auto_disable_thinking_with_tools is defined else true -%}
+{%- set auto_disable_thinking_with_tools = auto_disable_thinking_with_tools if auto_disable_thinking_with_tools is defined else false -%}
 {%- set preserve_thinking = preserve_thinking if preserve_thinking is defined else false -%}
 {%- set add_vision_id = add_vision_id if add_vision_id is defined else false -%}
 {%- set max_tool_arg_chars = max_tool_arg_chars if max_tool_arg_chars is defined else 0 -%}
