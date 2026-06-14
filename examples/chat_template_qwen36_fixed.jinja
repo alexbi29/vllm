@@ -66,7 +66,7 @@
         {%- set _av = v | string -%}
     {%- endif -%}
     {%- if max_tool_arg_chars > 0 and _av | length > max_tool_arg_chars -%}
-        {{- _av[:max_tool_arg_chars] ~ '\n[TRUNCATED]' -}}
+        {{- _av[:max_tool_arg_chars] ~ '\n[TRUNCATED original_chars=' ~ (_av | length) ~ ' shown_chars=' ~ max_tool_arg_chars ~ ']' -}}
     {%- else -%}
         {{- _av -}}
     {%- endif -%}
@@ -82,13 +82,6 @@
     {%- set _sys_msg = messages[0] -%}
     {%- set _msgs = messages[1:] -%}
 {%- endif -%}
-
-{#- Validate no mid-conversation system/developer messages -#}
-{%- for message in _msgs -%}
-    {%- if message.role == 'system' or message.role == 'developer' -%}
-        {{- raise_exception('System/developer message must be at the beginning of the conversation.') -}}
-    {%- endif -%}
-{%- endfor -%}
 
 {%- set _dropped = 0 -%}
 {%- set _compression = false -%}
@@ -201,11 +194,11 @@
         {%- endif -%}
         {%- set reasoning_content = reasoning_content | trim -%}
 
-        {#- Render turn                                                          -#}
-        {#- preserve_thinking=true: always include <think> blocks (even empty)   -#}
+        {#- Render turn                                                         -#}
+        {#- preserve_thinking=true: preserve only non-empty reasoning blocks     -#}
         {#- preserve_thinking=false: only include after last query, skip empty   -#}
         {#-   (keeps prefix-cache hits stable — HF Qwen3.5-122B-A10B disc#22)   -#}
-        {%- if preserve_thinking or (loop.index0 > ns.last_query_index and reasoning_content) -%}
+        {%- if reasoning_content and (preserve_thinking or loop.index0 > ns.last_query_index) -%}
             {{- '<|im_start|>assistant\n<think>\n' ~ reasoning_content ~ '\n</think>\n\n' ~ content -}}
         {%- else -%}
             {{- '<|im_start|>assistant\n' ~ content -}}
@@ -255,7 +248,7 @@
             {{- '<|im_start|>user' -}}
         {%- endif -%}
         {%- if max_tool_response_chars > 0 and content | length > max_tool_response_chars -%}
-            {%- set content = content[:max_tool_response_chars] ~ '\n[TRUNCATED]' -%}
+            {%- set content = content[:max_tool_response_chars] ~ '\n[TRUNCATED original_chars=' ~ (content | length) ~ ' shown_chars=' ~ max_tool_response_chars ~ ']' -%}
         {%- endif -%}
         {%- set _rid = '' -%}
         {%- if message.tool_call_id is defined and message.tool_call_id is not none -%}
@@ -275,8 +268,8 @@
             {{- '<|im_end|>\n' -}}
         {%- endif -%}
 
-    {%- elif message.role == 'developer' -%}
-        {#- already rendered above as system -#}
+    {%- elif message.role == 'system' or message.role == 'developer' -%}
+        {{- '<|im_start|>system\n' ~ content ~ '<|im_end|>\n' -}}
 
     {%- else -%}
         {{- raise_exception('Unexpected message role: ' ~ message.role) -}}
