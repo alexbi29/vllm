@@ -167,7 +167,7 @@ def _render_qwen36(qwen3_tokenizer, messages, **kwargs) -> str:
     )
 
 
-def test_qwen36_template_auto_disables_thinking_with_tools(
+def test_qwen36_template_keeps_thinking_with_tools_by_default(
     qwen3_tokenizer, sample_tools
 ):
     tools = [
@@ -181,6 +181,26 @@ def test_qwen36_template_auto_disables_thinking_with_tools(
         chat_template=QWEN36_TEMPLATE.read_text(),
         add_generation_prompt=True,
         tokenize=False,
+    )
+
+    assert prompt.endswith("<|im_start|>assistant\n<think>\n")
+
+
+def test_qwen36_template_auto_disable_thinking_with_tools_opt_in(
+    qwen3_tokenizer, sample_tools
+):
+    tools = [
+        tool.model_dump(exclude_none=True)
+        for tool in _as_chat_completion_tools(sample_tools)
+    ]
+
+    prompt = qwen3_tokenizer.apply_chat_template(
+        [{"role": "user", "content": "What is the weather in Dallas, Texas?"}],
+        tools=tools,
+        chat_template=QWEN36_TEMPLATE.read_text(),
+        add_generation_prompt=True,
+        tokenize=False,
+        auto_disable_thinking_with_tools=True,
     )
 
     assert prompt.endswith("<|im_start|>assistant\n<think>\n\n</think>\n\n")
