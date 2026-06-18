@@ -206,6 +206,39 @@ def test_qwen36_template_auto_disable_thinking_with_tools_opt_in(
     assert prompt.endswith("<|im_start|>assistant\n<think>\n\n</think>\n\n")
 
 
+@pytest.mark.parametrize(
+    ("kwargs", "expected_suffix"),
+    [
+        ({}, "<|im_start|>assistant\n<think>\n"),
+        ({"thinking": False}, "<|im_start|>assistant\n<think>\n\n</think>\n\n"),
+        ({"thinking": True}, "<|im_start|>assistant\n<think>\n"),
+        (
+            {"enable_thinking": False},
+            "<|im_start|>assistant\n<think>\n\n</think>\n\n",
+        ),
+        (
+            {"enable_thinking": True, "thinking": False},
+            "<|im_start|>assistant\n<think>\n",
+        ),
+        (
+            {"enable_thinking": False, "thinking": True},
+            "<|im_start|>assistant\n<think>\n\n</think>\n\n",
+        ),
+    ],
+)
+def test_qwen36_template_supports_thinking_alias(
+    qwen3_tokenizer, kwargs, expected_suffix
+):
+    prompt = _render_qwen36(
+        qwen3_tokenizer,
+        [{"role": "user", "content": "Use short answers."}],
+        add_generation_prompt=True,
+        **kwargs,
+    )
+
+    assert prompt.endswith(expected_suffix)
+
+
 def test_qwen36_template_preserve_thinking_remains_opt_in(qwen3_tokenizer):
     messages = [
         {"role": "user", "content": "First question"},
