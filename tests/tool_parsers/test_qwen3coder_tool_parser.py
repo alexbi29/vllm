@@ -30,6 +30,9 @@ from vllm.tool_parsers.qwen3_engine_tool_parser import (
 )
 
 MODEL = "Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8"
+QWEN35_TEMPLATE = (
+    Path(__file__).resolve().parents[2] / "examples/chat_template_qwen35_fixed.jinja"
+)
 QWEN36_TEMPLATE = (
     Path(__file__).resolve().parents[2] / "examples/chat_template_qwen36_fixed.jinja"
 )
@@ -165,6 +168,40 @@ def _render_qwen36(qwen3_tokenizer, messages, **kwargs) -> str:
         tokenize=False,
         **kwargs,
     )
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected_suffix"),
+    [
+        ({}, "<|im_start|>assistant\n<think>\n"),
+        ({"thinking": False}, "<|im_start|>assistant\n<think>\n\n</think>\n\n"),
+        ({"thinking": True}, "<|im_start|>assistant\n<think>\n"),
+        (
+            {"enable_thinking": False},
+            "<|im_start|>assistant\n<think>\n\n</think>\n\n",
+        ),
+        (
+            {"enable_thinking": True, "thinking": False},
+            "<|im_start|>assistant\n<think>\n",
+        ),
+        (
+            {"enable_thinking": False, "thinking": True},
+            "<|im_start|>assistant\n<think>\n\n</think>\n\n",
+        ),
+    ],
+)
+def test_qwen35_template_supports_thinking_alias(
+    qwen3_tokenizer, kwargs, expected_suffix
+):
+    prompt = qwen3_tokenizer.apply_chat_template(
+        [{"role": "user", "content": "Use short answers."}],
+        chat_template=QWEN35_TEMPLATE.read_text(),
+        add_generation_prompt=True,
+        tokenize=False,
+        **kwargs,
+    )
+
+    assert prompt.endswith(expected_suffix)
 
 
 def test_qwen36_template_keeps_thinking_with_tools_by_default(
