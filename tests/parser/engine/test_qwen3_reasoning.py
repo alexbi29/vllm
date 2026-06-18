@@ -543,6 +543,35 @@ class TestThinkingDisabled:
         )
         assert p.parser_engine_config.initial_state == ParserState.CONTENT
 
+    def test_thinking_alias_disabled_initial_state_is_content(self, mock_tokenizer):
+        p = Qwen3Parser(
+            mock_tokenizer,
+            chat_template_kwargs={"thinking": False},
+        )
+        assert p.parser_engine_config.initial_state == ParserState.CONTENT
+
+    @pytest.mark.parametrize(
+        ("chat_template_kwargs", "expected_state"),
+        [
+            (
+                {"enable_thinking": True, "thinking": False},
+                ParserState.REASONING,
+            ),
+            (
+                {"enable_thinking": False, "thinking": True},
+                ParserState.CONTENT,
+            ),
+        ],
+    )
+    def test_enable_thinking_takes_precedence_over_thinking_alias(
+        self, mock_tokenizer, chat_template_kwargs, expected_state
+    ):
+        p = Qwen3Parser(
+            mock_tokenizer,
+            chat_template_kwargs=chat_template_kwargs,
+        )
+        assert p.parser_engine_config.initial_state == expected_state
+
     def test_thinking_enabled_initial_state_is_reasoning(self, mock_tokenizer):
         p = Qwen3Parser(
             mock_tokenizer,
