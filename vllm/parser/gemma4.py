@@ -532,6 +532,14 @@ class Gemma4Parser(ParserEngine):
 
         return delta_text, delta_token_ids
 
+    def is_reasoning_end(self, input_ids: list[int]) -> bool:
+        # A generated tool call can stop at <|tool_response>. Let the preceding
+        # tool-call/end transition determine the state instead of masking it
+        # with that boundary. Other turn boundaries retain upstream semantics.
+        return super().is_reasoning_end(
+            [tid for tid in input_ids if tid != self._tool_response_token_id]
+        )
+
     def _prompt_ends_in_open_reasoning(self, prompt_token_ids: Sequence[int]) -> bool:
         """Whether the prompt tail is inside an open ``<|channel>`` block.
 
