@@ -474,7 +474,10 @@ class Gemma4Parser(ParserEngine):
             if new_turn_id is not None and tid == new_turn_id:
                 return not self._thinking_enabled
             if tool_response_id is not None and tid == tool_response_id:
-                return not self._thinking_enabled
+                # <|tool_response> can be the stop token immediately after a
+                # generated tool call. Keep scanning backward so a preceding
+                # <|tool_call> in the same delta still ends reasoning.
+                continue
             if end_id is not None and tid == end_id:
                 return True
         return True
