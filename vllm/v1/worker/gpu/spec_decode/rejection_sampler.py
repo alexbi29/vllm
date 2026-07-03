@@ -137,6 +137,7 @@ class RejectionSampler:
         idx_mapping_np: np.ndarray,
         expanded_idx_mapping: torch.Tensor,
         expanded_local_pos: torch.Tensor,
+        draft_logits_index_mapping: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         processed_logits = self.sampler.apply_sampling_params(
             logits,
@@ -158,6 +159,7 @@ class RejectionSampler:
             self.sampler.sampling_states.temperature.gpu,
             self.sampler.sampling_states.seeds.gpu,
             self.num_speculative_steps,
+            draft_logits_index_mapping,
             self.synthetic_conditional_rates,
             use_fp64=self.sampler.use_fp64_gumbel,
             use_block_verification=self.use_block_verification,
@@ -173,6 +175,7 @@ class RejectionSampler:
         pos: torch.Tensor,
         max_chunk_logits: int,
         max_num_logprobs: int,
+        draft_logits_index_mapping: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, LogprobsTensors | None]:
         cu_num_logits_np = input_batch.cu_num_logits_np
         use_processed_logits = self.sampler.logprobs_mode in PROCESSED_LOGPROBS_MODES
@@ -196,6 +199,8 @@ class RejectionSampler:
                 input_batch.idx_mapping_np[start:end],
                 input_batch.expanded_idx_mapping[lo:hi],
                 input_batch.expanded_local_pos[lo:hi],
+                # Indexed by persistent request-state index, so it stays global.
+                draft_logits_index_mapping,
             )
             chunk_logprobs = self._get_logprobs_tensors(
                 sampled,
@@ -234,6 +239,7 @@ class RejectionSampler:
         logits: torch.Tensor,
         input_batch: InputBatch,
         draft_logits: torch.Tensor | None = None,
+        draft_logits_index_mapping: torch.Tensor | None = None,
     ) -> SamplerOutput:
         # NOTE(woosuk): We intentionally compute num_nans before sampling to make clear
         # that num_nans is computed before applying penalties and temperature.
@@ -254,6 +260,7 @@ class RejectionSampler:
             pos,
             max_chunk_logits,
             max_num_logprobs,
+            draft_logits_index_mapping,
         )
 
         num_sampled, num_rejected = get_num_sampled_and_rejected(
