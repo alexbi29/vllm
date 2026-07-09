@@ -128,6 +128,10 @@ _REASONING_PARSERS_TO_REGISTER = {
         "step3p5_reasoning_parser",
         "Step3p5ReasoningParser",
     ),
+    "lfm2": (
+        "lfm2_reasoning_parser",
+        "Lfm2ReasoningParser",
+    ),
 }
 
 
