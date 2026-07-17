@@ -1,3 +1,9 @@
+{#
+  Template: Google Gemma 4 Canonical Chat Template
+  Author: Google Gemma Engineering Team
+  Published: 2026-07-09
+  Context: Fixed tool-calling loops, turn closures, and thinking content-ordering.
+#}
 {%- macro format_parameters(properties, required, filter_keys=false) -%}
     {%- set standard_keys = ['description', 'type', 'properties', 'required', 'nullable'] -%}
     {%- set ns = namespace(found_first=false) -%}
@@ -226,14 +232,12 @@
     {%- set continue_same_model_turn = (role == 'model' and ns.prev_non_tool_role == 'assistant') -%}
     {%- if not continue_same_model_turn -%}
         {{- '<|turn>' + role + '\n' }}
-        {%- if role == 'model' and not enable_thinking and not (message.get('reasoning') or message.get('reasoning_content')) -%}
-            {{- '<|channel>thought\n<channel|>' -}}
-        {%- endif -%}
+
     {%- endif -%}
 
     {#- Render reasoning/reasoning_content as thinking channel -#}
     {%- set thinking_text = message.get('reasoning') or message.get('reasoning_content') -%}
-    {%- set thinking_gate = (loop.index0 > ns_turn.last_user_idx) or preserve_thinking -%}
+    {%- set thinking_gate = (loop.index0 > ns_turn.last_user_idx) or (preserve_thinking and message.get('tool_calls')) -%}
     {%- if thinking_text and thinking_gate -%}
         {{- '<|channel>thought\n' + thinking_text + '\n<channel|>' -}}
     {%- endif -%}
@@ -298,6 +302,15 @@
                                 {%- endif -%}
                             {%- endfor -%}
                             {{- format_tool_response_block(ns_tname.name, ns_txt.s) -}}
+                            {%- for part in tool_body -%}
+                                {%- if part.get('type') in ['image', 'image_url'] -%}
+                                    {{- '<|image|>' -}}
+                                {%- elif part.get('type') in ['audio', 'input_audio'] -%}
+                                    {{- '<|audio|>' -}}
+                                {%- elif part.get('type') == 'video' -%}
+                                    {{- '<|video|>' -}}
+                                {%- endif -%}
+                            {%- endfor -%}
                         {%- else -%}
                             {{- format_tool_response_block(ns_tname.name, tool_body) -}}
                         {%- endif -%}
@@ -356,8 +369,7 @@
         {%- if ns.prev_message_type == 'tool_call' and not ns_tr_out.flag -%}
             {{- '<|tool_response>' -}}
         {%- elif continues_into_next -%}
-            {{- '\n' -}}
-        {%- elif not (ns_tr_out.flag and not has_content) -%}
+        {%- elif not (ns_tr_out.flag and not has_content and not next_nt.found) -%}
             {{- '<turn|>\n' -}}
         {%- endif -%}
 
