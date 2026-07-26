@@ -212,7 +212,7 @@ class InputBatch:
             (max_num_reqs,),
             dtype=torch.float32,
             device="cpu",
-            pin_memory=pin_memory,
+            pin_memory=PIN_MEMORY,
         )
         self.reasoning_temperature_cpu = self.reasoning_temperature_cpu_tensor.numpy()
         # Requests whose reasoning_temperature differs from temperature. The
@@ -226,7 +226,7 @@ class InputBatch:
         # Live per-step think mask, refreshed every decode step in
         # ``update_reasoning_temperature`` and copied to the GPU for the blend.
         self.think_in_think_cpu_tensor = torch.zeros(
-            (max_num_reqs,), dtype=torch.bool, device="cpu", pin_memory=pin_memory
+            (max_num_reqs,), dtype=torch.bool, device="cpu", pin_memory=PIN_MEMORY
         )
         self.think_in_think_cpu = self.think_in_think_cpu_tensor.numpy()
         self.think_in_think_gpu = torch.zeros(
