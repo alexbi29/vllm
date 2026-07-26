@@ -183,7 +183,15 @@
 {#- ===== SETUP ===== -#}
 {%- set ns = namespace(prev_message_type=None, prev_non_tool_role=None) -%}
 {%- set loop_messages = messages -%}
-{%- set enable_thinking = enable_thinking | default(false) -%}
+{#- `thinking` is an accepted alias for `enable_thinking`. An explicitly passed
+    `thinking` takes precedence, so a request-level `thinking` overrides a
+    server-level `--default-chat-template-kwargs '{"enable_thinking": ...}'`,
+    which would otherwise always be defined and silently win. -#}
+{%- if thinking is defined -%}
+    {%- set enable_thinking = thinking -%}
+{%- else -%}
+    {%- set enable_thinking = enable_thinking | default(false) -%}
+{%- endif -%}
 {%- set preserve_thinking = preserve_thinking | default(false) -%}
 {{- bos_token -}}
 {#- Handle System/Tool Definitions Block -#}
