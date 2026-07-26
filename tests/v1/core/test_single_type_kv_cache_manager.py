@@ -222,7 +222,7 @@ def test_mamba_possible_cached_prefix_with_eagle_drop():
         kv_cache_spec=mamba_spec,
         drop_eagle_block=True,
         alignment_tokens=block_size,
-    )[0]
+    )[0][0]
 
     assert len(computed_blocks) == 2
     assert computed_blocks[0] == block_pool.null_block
