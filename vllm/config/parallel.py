@@ -669,6 +669,23 @@ class ParallelConfig:
     # In this case, ensure the input to the experts is sequence parallel
     # to avoid the excess work.
     #
+    # Note this rationale is about replication across the *tensor* parallel
+    # group, so it applies at data_parallel_size == 1. Upstream #48849 added
+    # `and self.data_parallel_size > 1` here to recover ~5.6 GiB of SP buffers
+    # on a pure-TP Nemotron 550B config, but it measured only memory, not
+    # throughput. On DeepSeek-V4-Flash at TP=2 + EP (SM120, DP=1) the SP
+    # buffers cost no KV capacity at all, while turning SP-MoE off costs real
+    # decode throughput:
+    #
+    #   C=1 decode   274.6-276.7 -> 288.2-289.8 tok/s  (+5%)
+    #   prefill 1K         5,948 ->        6,259       (+5%)
+    #   prefill 4K         7,518 ->        7,536       (flat)
+    #   available KV   11.44 GiB ->    11.44 GiB       (identical)
+    #   GPU KV tokens  1,189,790 ->    1,189,790       (identical)
+    #
+    # So the DP>1 requirement is not kept here. If the pure-TP memory
+    # regression needs addressing, the gate should be made config-aware
+    # rather than disabling SP-MoE for every DP=1 deployment.
     @property
     def use_sequence_parallel_moe(self) -> bool:
         return (
@@ -683,7 +700,6 @@ class ParallelConfig:
             )
             and self.enable_expert_parallel
             and self.tensor_parallel_size > 1
-            and self.data_parallel_size > 1
         )
 
     @property
