@@ -162,6 +162,114 @@ class LogitBiasLogitsProcessor(LogitsProcessor):
         return logits
 
 
+class SuppressTokensLogitsProcessor(LogitsProcessor):
+    """Applies a model's ``generation_config.json`` ``suppress_tokens`` (every
+    generated position) and ``begin_suppress_tokens`` (first generated
+    position only), mirroring transformers' ``SuppressTokensLogitsProcessor``
+    / ``SuppressTokensAtBeginLogitsProcessor``.
+
+    Whisper is the model this exists for: its generation config declares both
+    fields specifically to keep the decoder from emitting non-speech and
+    special tokens, and HF's ``generate()`` applies them unconditionally.
+    Without them, a decoder-prompt long enough to shift the model's raw logit
+    distribution (e.g. a large ``<|prev|>`` context) can make an illegal
+    token - notably EOS at the very first position - competitive under
+    ordinary sampling, and greedy decoding then picks it: the request
+    terminates with an empty transcript, or degenerates into a repetition
+    loop, with no error raised anywhere.
+
+    Entirely config-driven and a no-op for every model whose generation
+    config does not declare these fields, so it is safe to enable
+    unconditionally rather than gating it behind model-specific logic.
+    """
+
+    def __init__(
+        self, vllm_config: "VllmConfig", device: torch.device, is_pin_memory: bool
+    ):
+        self.device = device
+        gen_config = vllm_config.model_config.try_get_generation_config()
+        self.suppress_tokens: list[int] = list(gen_config.get("suppress_tokens") or [])
+        self.begin_suppress_tokens: list[int] = list(
+            gen_config.get("begin_suppress_tokens") or []
+        )
+        self.enabled = bool(self.suppress_tokens or self.begin_suppress_tokens)
+
+        self._suppress_idx = (
+            self._device_tensor(self.suppress_tokens, torch.long)
+            if self.suppress_tokens
+            else None
+        )
+
+        # index -> live reference to that request's output_tok_ids, kept only
+        # while still empty (i.e. the request has not generated its first
+        # token yet)
+        self._at_begin: dict[int, Sequence[int]] = {}
+        self._begin_slice: tuple[torch.Tensor, torch.Tensor] = (
+            self._device_tensor([], torch.int32),
+            self._device_tensor([], torch.int32),
+        )
+        self.neg_inf_tensor = torch.tensor(
+            -float("inf"), dtype=torch.float32, device=self.device
+        )
+
+    def is_argmax_invariant(self) -> bool:
+        """Suppressing tokens is only a no-op for models whose generation
+        config declares neither field - true for every model except Whisper
+        and its close relatives."""
+        return not self.enabled
+
+    @staticmethod
+    def _add_begin_request(
+        _: SamplingParams, __: list[int] | None, output_tok_ids: list[int]
+    ) -> Sequence[int] | None:
+        # only requests still at their first generated token need tracking;
+        # `output_tok_ids` is a live reference, so its length is re-checked
+        # against the current state on every update_state call
+        return None if output_tok_ids else output_tok_ids
+
+    def _device_tensor(self, data: list, dtype: torch.dtype) -> torch.Tensor:
+        return async_tensor_h2d(data, device=self.device, dtype=dtype)
+
+    def update_state(self, batch_update: BatchUpdate | None):
+        if not self.enabled or not self.begin_suppress_tokens:
+            return
+        needs_update = process_dict_updates(
+            self._at_begin, batch_update, self._add_begin_request
+        )
+        if self._at_begin:
+            # a request that has generated at least one token is past
+            # "begin" and no longer needs this constraint
+            past_begin = tuple(
+                idx for idx, out_ids in self._at_begin.items() if out_ids
+            )
+            if past_begin:
+                needs_update = True
+                for idx in past_begin:
+                    del self._at_begin[idx]
+
+        if needs_update:
+            reqs: list[int] = []
+            toks: list[int] = []
+            for req in self._at_begin:
+                reqs.extend([req] * len(self.begin_suppress_tokens))
+                toks.extend(self.begin_suppress_tokens)
+            self._begin_slice = (
+                self._device_tensor(reqs, torch.int32),
+                self._device_tensor(toks, torch.int32),
+            )
+
+    def apply(self, logits: torch.Tensor) -> torch.Tensor:
+        if not self.enabled:
+            return logits
+        if self._suppress_idx is not None:
+            # every request, every generated position - matches HF's
+            # unconditional per-step application of suppress_tokens
+            logits[:, self._suppress_idx] = -float("inf")
+        if self._at_begin:
+            logits.index_put_(self._begin_slice, self.neg_inf_tensor)
+        return logits
+
+
 class MinTokensLogitsProcessor(LogitsProcessor):
     def __init__(
         self, vllm_config: "VllmConfig", device: torch.device, is_pin_memory: bool
