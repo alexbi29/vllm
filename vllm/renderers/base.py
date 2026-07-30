@@ -934,10 +934,18 @@ class BaseRenderer(ABC, Generic[_T]):
             ),
         )
 
+        skip_decoder_start_token = False
+        if self.mm_processor is not None:
+            from vllm.multimodal.processing import EncDecMultiModalProcessor
+
+            if isinstance(self.mm_processor, EncDecMultiModalProcessor):
+                skip_decoder_start_token = self.mm_processor.skip_decoder_start_token
+
         return build_enc_dec_input(
             encoder_input=encoder_input,
             decoder_input=decoder_input,
             decoder_start_token_id=self.get_dec_start_token_id(),
+            skip_decoder_start_token=skip_decoder_start_token,
         )
 
     def process_for_engine(

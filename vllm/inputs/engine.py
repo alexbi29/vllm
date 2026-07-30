@@ -360,7 +360,9 @@ def build_enc_dec_input(
     else:
         assert_never(enc_input)
 
-    if not skip_decoder_start_token:
+    # An empty decoder sequence cannot generate; give it the start token even
+    # when the model opts out of the prepend for non-empty prompts.
+    if not skip_decoder_start_token or not dec_input_new["prompt_token_ids"]:
         dec_input_new["prompt_token_ids"] = _prepare_decoder_input_ids_for_generation(
             dec_input_new["prompt_token_ids"],
             decoder_start_token_id,
