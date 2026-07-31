@@ -64,16 +64,20 @@ def _compile(config: InklingFA4WarmupConfig, max_seqlen_q: int, num_reqs: int) -
             dtype=config.dtype,
             device=device,
         )
+        # Mirror the runtime cache layout exactly: FlashAttentionBackend packs
+        # K/V into the content dim (logical (B, H, N, 2*D), NHD physical
+        # (B, N, H, 2*D)), and _split_kv_cache hands the layer transposed
+        # last-dim halves. The SM120 dense-KV fallback detects this packing by
+        # stride, so warmup must trace the same strides it will see live.
         kv = torch.empty(
             1,
-            2,
             config.block_size,
             config.num_kv_heads,
-            config.head_dim,
+            2 * config.head_dim,
             dtype=config.kv_dtype,
             device=device,
         )
-        key_cache, value_cache = kv.unbind(1)
+        key_cache, value_cache = kv.split(config.head_dim, dim=-1)
         inkling_fa4_rel_attention(
             q,
             key_cache,

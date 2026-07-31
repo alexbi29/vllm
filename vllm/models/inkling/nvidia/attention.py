@@ -7,8 +7,11 @@ from typing import cast
 import torch
 from torch import nn
 
-from vllm.compilation.breakable_cudagraph import eager_break_during_capture
-from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.compilation.breakable_cudagraph import (
+    BreakableCUDAGraphCapture,
+    eager_break_during_capture,
+)
+from vllm.config import CUDAGraphMode, VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -294,11 +297,45 @@ class InklingAttention(nn.Module, AttentionLayerBase):
         rel_logits: torch.Tensor,
         output: torch.Tensor,
     ) -> None:
+        # During breakable-cudagraph capture this op runs eagerly between
+        # graph segments and only its OUTPUT BUFFER ADDRESS matters (values
+        # are dummy); the recorded lambda re-runs the full path with real
+        # metadata at replay. Skipping the work here avoids gathering a
+        # max_model_len-sized dense KV per global layer per capture bucket on
+        # the SM120 fallback -- that transient (~3 GiB/layer at 262K ctx)
+        # OOMs capture at high gpu-memory-utilization.
+        # NOTE: not `capture._capturing` -- add_eager() ends the graph
+        # segment (clearing that flag) before running this fn eagerly. The
+        # capture CONTEXT being active is the correct "capture-time" signal;
+        # it is absent at replay, so replays take the full path.
+        if (
+            BreakableCUDAGraphCapture.current() is not None
+            # In FULL mode the op must record its real kernels into the graph.
+            and get_forward_context().cudagraph_runtime_mode != CUDAGraphMode.FULL
+        ):
+            output.zero_()
+            return
+
         attn_metadata = get_forward_context().attn_metadata
         assert isinstance(attn_metadata, dict)
         md = cast(FlashAttentionMetadata, attn_metadata[self.prefix])
 
         nt = md.num_actual_tokens
+        # Padded cudagraph batch rows: the metadata builder rewrites only the
+        # real prefix of query_start_loc, so the tail can hold STALE values
+        # from an earlier (e.g. prefill) batch. A padded row then looks like a
+        # huge-q request: seqlen_k - seqlen_q goes hugely negative and the
+        # SM120 kernel's unsigned wide-multiply address arithmetic wraps by
+        # terabytes (verified via CUDA coredump: Warp MMU Fault with a ~2^32
+        # uniform operand). Clamp + running-max turns every padded row into a
+        # well-formed zero-length request. Cached per metadata object so only
+        # the first layer of each KV group pays the two tiny kernels.
+        cu_seqlens_q = getattr(md, "_inkling_cu_sanitized", None)
+        if cu_seqlens_q is None:
+            cu_seqlens_q = torch.cummax(
+                torch.clamp(md.query_start_loc, max=nt), dim=0
+            ).values
+            md._inkling_cu_sanitized = cu_seqlens_q  # type: ignore[attr-defined]
         key_cache, value_cache = self._split_kv_cache()
         max_seqlen_q = bucket_max_seqlen_q(md.max_query_len)
         num_splits = inkling_fa4_num_splits(
@@ -315,7 +352,7 @@ class InklingAttention(nn.Module, AttentionLayerBase):
             value_cache,
             block_table=md.block_table,
             cache_seqlens=md.seq_lens,
-            cu_seqlens_q=md.query_start_loc,
+            cu_seqlens_q=cu_seqlens_q,
             max_seqlen_q=max_seqlen_q,
             softmax_scale=self.scaling,
             causal=True,
@@ -324,4 +361,7 @@ class InklingAttention(nn.Module, AttentionLayerBase):
             rel_logits=rel_logits[:nt],
             num_splits=num_splits,
             out=output[:nt],
+            # Host-side int: lets the SM120 dense-KV fallback size its gather
+            # without any device read (a sync would abort cudagraph capture).
+            max_seq_len=md.max_seq_len,
         )
