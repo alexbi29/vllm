@@ -3,6 +3,7 @@
 
 import json
 from collections.abc import Generator
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -29,6 +30,12 @@ from vllm.tool_parsers.qwen3_engine_tool_parser import (
 )
 
 MODEL = "Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8"
+QWEN35_TEMPLATE = (
+    Path(__file__).resolve().parents[2] / "examples/chat_template_qwen35_fixed.jinja"
+)
+QWEN36_TEMPLATE = (
+    Path(__file__).resolve().parents[2] / "examples/chat_template_qwen36_fixed.jinja"
+)
 
 
 @pytest.fixture(scope="module")
@@ -152,6 +159,215 @@ def _as_chat_completion_tools(
                 )
             )
     return normalized
+
+
+def _render_qwen36(qwen3_tokenizer, messages, **kwargs) -> str:
+    return qwen3_tokenizer.apply_chat_template(
+        messages,
+        chat_template=QWEN36_TEMPLATE.read_text(),
+        tokenize=False,
+        **kwargs,
+    )
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected_suffix"),
+    [
+        ({}, "<|im_start|>assistant\n<think>\n"),
+        ({"thinking": False}, "<|im_start|>assistant\n<think>\n\n</think>\n\n"),
+        ({"thinking": True}, "<|im_start|>assistant\n<think>\n"),
+        (
+            {"enable_thinking": False},
+            "<|im_start|>assistant\n<think>\n\n</think>\n\n",
+        ),
+        (
+            {"enable_thinking": True, "thinking": False},
+            "<|im_start|>assistant\n<think>\n",
+        ),
+        (
+            {"enable_thinking": False, "thinking": True},
+            "<|im_start|>assistant\n<think>\n\n</think>\n\n",
+        ),
+    ],
+)
+def test_qwen35_template_supports_thinking_alias(
+    qwen3_tokenizer, kwargs, expected_suffix
+):
+    prompt = qwen3_tokenizer.apply_chat_template(
+        [{"role": "user", "content": "Use short answers."}],
+        chat_template=QWEN35_TEMPLATE.read_text(),
+        add_generation_prompt=True,
+        tokenize=False,
+        **kwargs,
+    )
+
+    assert prompt.endswith(expected_suffix)
+
+
+def test_qwen36_template_keeps_thinking_with_tools_by_default(
+    qwen3_tokenizer, sample_tools
+):
+    tools = [
+        tool.model_dump(exclude_none=True)
+        for tool in _as_chat_completion_tools(sample_tools)
+    ]
+
+    prompt = qwen3_tokenizer.apply_chat_template(
+        [{"role": "user", "content": "What is the weather in Dallas, Texas?"}],
+        tools=tools,
+        chat_template=QWEN36_TEMPLATE.read_text(),
+        add_generation_prompt=True,
+        tokenize=False,
+    )
+
+    assert prompt.endswith("<|im_start|>assistant\n<think>\n")
+
+
+def test_qwen36_template_auto_disable_thinking_with_tools_opt_in(
+    qwen3_tokenizer, sample_tools
+):
+    tools = [
+        tool.model_dump(exclude_none=True)
+        for tool in _as_chat_completion_tools(sample_tools)
+    ]
+
+    prompt = qwen3_tokenizer.apply_chat_template(
+        [{"role": "user", "content": "What is the weather in Dallas, Texas?"}],
+        tools=tools,
+        chat_template=QWEN36_TEMPLATE.read_text(),
+        add_generation_prompt=True,
+        tokenize=False,
+        auto_disable_thinking_with_tools=True,
+    )
+
+    assert prompt.endswith("<|im_start|>assistant\n<think>\n\n</think>\n\n")
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected_suffix"),
+    [
+        ({}, "<|im_start|>assistant\n<think>\n"),
+        ({"thinking": False}, "<|im_start|>assistant\n<think>\n\n</think>\n\n"),
+        ({"thinking": True}, "<|im_start|>assistant\n<think>\n"),
+        (
+            {"enable_thinking": False},
+            "<|im_start|>assistant\n<think>\n\n</think>\n\n",
+        ),
+        (
+            {"enable_thinking": True, "thinking": False},
+            "<|im_start|>assistant\n<think>\n",
+        ),
+        (
+            {"enable_thinking": False, "thinking": True},
+            "<|im_start|>assistant\n<think>\n\n</think>\n\n",
+        ),
+    ],
+)
+def test_qwen36_template_supports_thinking_alias(
+    qwen3_tokenizer, kwargs, expected_suffix
+):
+    prompt = _render_qwen36(
+        qwen3_tokenizer,
+        [{"role": "user", "content": "Use short answers."}],
+        add_generation_prompt=True,
+        **kwargs,
+    )
+
+    assert prompt.endswith(expected_suffix)
+
+
+def test_qwen36_template_preserve_thinking_remains_opt_in(qwen3_tokenizer):
+    messages = [
+        {"role": "user", "content": "First question"},
+        {
+            "role": "assistant",
+            "content": "First answer",
+            "reasoning_content": "private plan",
+        },
+        {"role": "user", "content": "Second question"},
+    ]
+
+    default_prompt = _render_qwen36(qwen3_tokenizer, messages)
+    preserved_prompt = _render_qwen36(
+        qwen3_tokenizer, messages, preserve_thinking=True
+    )
+
+    assert "private plan" not in default_prompt
+    assert "<think>\nprivate plan\n</think>\n\nFirst answer" in preserved_prompt
+
+
+def test_qwen36_template_preserve_thinking_skips_empty_blocks(qwen3_tokenizer):
+    messages = [
+        {"role": "user", "content": "What is the weather in Dallas?"},
+        {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "",
+            "tool_calls": [
+                {
+                    "function": {
+                        "name": "get_current_weather",
+                        "arguments": {"city": "Dallas", "state": "TX"},
+                    }
+                }
+            ],
+        },
+    ]
+
+    prompt = _render_qwen36(qwen3_tokenizer, messages, preserve_thinking=True)
+
+    assert "<|im_start|>assistant\n<tool_call>" in prompt
+    assert "<think>\n\n</think>\n\n<tool_call>" not in prompt
+
+
+@pytest.mark.parametrize("role", ["system", "developer"])
+def test_qwen36_template_renders_mid_conversation_system_roles(
+    qwen3_tokenizer, role
+):
+    prompt = _render_qwen36(
+        qwen3_tokenizer,
+        [
+            {"role": "user", "content": "Use short answers."},
+            {"role": "assistant", "content": "OK."},
+            {"role": role, "content": "Use metric units."},
+            {"role": "user", "content": "Weather?"},
+        ],
+    )
+
+    assert "<|im_start|>system\nUse metric units.<|im_end|>\n" in prompt
+
+
+def test_qwen36_template_truncation_markers_include_original_lengths(
+    qwen3_tokenizer,
+):
+    prompt = _render_qwen36(
+        qwen3_tokenizer,
+        [
+            {"role": "user", "content": "Look this up."},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "search",
+                            "arguments": {"query": "abcdef"},
+                        }
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "content": "0123456789",
+                "tool_call_id": "call_1",
+            },
+        ],
+        max_tool_arg_chars=3,
+        max_tool_response_chars=4,
+    )
+
+    assert "abc\n[TRUNCATED original_chars=6 shown_chars=3]" in prompt
+    assert "0123\n[TRUNCATED original_chars=10 shown_chars=4]" in prompt
 
 
 def assert_tool_calls(
