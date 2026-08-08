@@ -18,6 +18,7 @@ from vllm.v1.sample.logits_processor.builtin import (
     LogitBiasLogitsProcessor,
     MinPLogitsProcessor,
     MinTokensLogitsProcessor,
+    SuppressTokensLogitsProcessor,
     process_dict_updates,
 )
 from vllm.v1.sample.logits_processor.interface import (
@@ -50,6 +51,10 @@ BUILTIN_LOGITS_PROCESSORS: list[type[LogitsProcessor]] = [
     MinTokensLogitsProcessor,
     LogitBiasLogitsProcessor,
     MinPLogitsProcessor,
+    # config-driven no-op for any model that doesn't declare suppress_tokens /
+    # begin_suppress_tokens in its generation_config (i.e. every model except
+    # Whisper and close relatives) - see class docstring for why this exists
+    SuppressTokensLogitsProcessor,
 ]
 
 
@@ -346,6 +351,7 @@ __all__ = [
     "LogitBiasLogitsProcessor",
     "MinPLogitsProcessor",
     "MinTokensLogitsProcessor",
+    "SuppressTokensLogitsProcessor",
     "BatchUpdate",
     "BatchUpdateBuilder",
     "MoveDirectionality",

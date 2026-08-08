@@ -687,6 +687,14 @@ class WhisperDummyInputsBuilder(BaseDummyInputsBuilder[WhisperProcessingInfo]):
 
 
 class WhisperMultiModalProcessor(EncDecMultiModalProcessor[WhisperProcessingInfo]):
+    # A Whisper decoder prompt starts with either <|startoftranscript|> or,
+    # when conditioning on prompt/prefix text, <|startofprev|>. The generic
+    # enc-dec prepend of decoder_start_token_id (== <|startoftranscript|>)
+    # must not run in the latter case: an extra SOT before <|startofprev|>
+    # shifts every position and makes the model treat the prompt text as its
+    # own transcript, which it then keeps "continuing" instead of listening.
+    skip_decoder_start_token: bool = True
+
     def create_encoder_prompt(
         self,
         prompt: str | list[int],
@@ -815,8 +823,12 @@ class WhisperForConditionalGeneration(
                 "Language must be specified when creating the Whisper prompt"
             )
 
+        # The prompt region must be introduced by the <|startofprev|> special
+        # token (there is no "<|prev|>" in the Whisper vocabulary - that string
+        # tokenizes as literal text) and the prompt itself must carry a leading
+        # space, matching tokenizer.get_prompt_ids() in transformers.
         decoder_text = (
-            f"<|prev|>{request_prompt}" if request_prompt else ""
+            f"<|startofprev|> {request_prompt.strip()}" if request_prompt else ""
         ) + f"<|startoftranscript|><|{language}|><|{task_type}|><|notimestamps|>"
 
         return ExplicitEncoderDecoderPrompt(
