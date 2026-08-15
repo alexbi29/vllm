@@ -12,6 +12,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from vllm.exceptions import VLLMValidationError
 from vllm.sampling_params import _MAX_TEMP, SamplingParams, SamplingType
 
 
@@ -101,7 +102,7 @@ def test_greedy_reset_applies_when_both_greedy():
 
 
 def test_negative_reasoning_temperature_rejected():
-    with pytest.raises(ValueError):
+    with pytest.raises(VLLMValidationError):
         SamplingParams(reasoning_temperature=-0.1)
 
 
