@@ -206,19 +206,31 @@ class SpeechToTextBaseServing(GenerateBaseServing):
         self,
         audio_chunk: np.ndarray,
         request_id: str,
+        language_choices: list[str] | None = None,
     ) -> str:
         """Auto-detect the spoken language from an audio chunk.
 
         Delegates prompt construction and output parsing to the model class
         via ``get_language_detection_prompt`` and
-        ``parse_language_detection_output``.
+        ``parse_language_detection_output``. ``language_choices`` restricts
+        detection to a served subset of ISO 639-1 codes (e.g. ``['en', 'es']``).
         """
+        if language_choices is not None:
+            unknown = [c for c in language_choices
+                       if c not in self.model_cls.supported_languages]
+            if unknown:
+                raise VLLMValidationError(
+                    f"Unsupported language_choices {unknown!r}; must be "
+                    f"ISO 639-1 codes from "
+                    f"{list(self.model_cls.supported_languages)}."
+                )
         prompt = self.model_cls.get_language_detection_prompt(
             audio_chunk,
             self.asr_config,
         )
         allowed_token_ids = self.model_cls.get_language_token_ids(
             self.tokenizer,
+            language_choices=language_choices,
         )
         sampling_params = SamplingParams(
             max_tokens=1,
@@ -282,7 +294,10 @@ class SpeechToTextBaseServing(GenerateBaseServing):
         ):
             # Auto-detect language from the first chunk.
             request.language = await self._detect_language(
-                chunks[0], f"{request_id}-lang_detect"
+                chunks[0], f"{request_id}-lang_detect",
+                # TranslationRequest has no language_choices field; only
+                # transcription gains the served-language constraint.
+                language_choices=getattr(request, "language_choices", None),
             )
 
         parsed_prompts: list[DictPrompt] = []

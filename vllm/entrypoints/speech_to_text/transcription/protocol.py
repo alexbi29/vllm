@@ -74,6 +74,16 @@ class TranscriptionRequest(OpenAIBaseModel):
     will improve accuracy and latency.
     """
 
+    language_choices: list[str] | None = Field(
+        default=None,
+        description=(
+            "Restrict automatic language detection to this subset of ISO 639-1 "
+            "codes (e.g. ['en', 'es']), so a wrong or undesired language can "
+            "never be picked. Ignored when `language` is supplied; absent means "
+            "any supported language may be detected."
+        ),
+    )
+
     hotwords: str | None = None
     """
     hotwords refers to a list of important words or phrases that the model
