@@ -414,18 +414,57 @@ class Gemma4Parser(ParserEngine):
         self._reasoning_text: str = ""
         self._prefix_stripped: bool = False
         self._is_first_feed: bool = True
+        # Armed when the prompt tail leaves us inside a pre-opened thought
+        # channel (post-tool-response continuation). Detects the reasoning-leak
+        # signature: the model closing an *empty* channel at the very start of
+        # its turn, which would stream its CoT as content. Log-only; the stream
+        # is left unmodified.
+        self._guarded_leading_close: bool = False
 
     def _reset(self, initial_state=None) -> None:
         super()._reset(initial_state=initial_state)
         self._reasoning_text = ""
         self._prefix_stripped = False
         self._is_first_feed = True
+        self._guarded_leading_close = False
 
     def _preprocess_feed(
         self,
         delta_text: str,
         delta_token_ids: Sequence[int],
     ) -> tuple[str, Sequence[int]]:
+        if self._guarded_leading_close:
+            # Post-tool continuation inside a pre-opened ``<|channel>``: the
+            # model sometimes emits ``<channel|>`` at token 0 (closing an
+            # empty thought) and then writes the rest of its reasoning, which
+            # is therefore classified as ``content`` and spoken verbatim.
+            # DETECT and LOG that reasoning-leak signature here, but do NOT
+            # modify the stream.
+            saw_anything = False
+            leading_close = False
+            if delta_token_ids:
+                saw_anything = True
+                if delta_token_ids[0] == self._reasoning_end_token_id:
+                    leading_close = True
+            if delta_text:
+                text = delta_text.lstrip()
+                if text:
+                    saw_anything = True
+                if text.startswith(CHANNEL_END):
+                    leading_close = True
+            if leading_close:
+                logger.error(
+                    "Gemma4 reasoning leak: post-tool-response continuation "
+                    "closed an empty thought channel at token 0 "
+                    "(`<|channel>` open in prompt, `<channel|>` emitted with "
+                    "no reasoning); the CoT that follows will stream as "
+                    "content. Stream left unmodified."
+                )
+            if saw_anything:
+                # The leak signature (if any) is at the very first token; stop
+                # watching once real output has started.
+                self._guarded_leading_close = False
+
         if not self._is_first_feed:
             return delta_text, delta_token_ids
         self._is_first_feed = False
@@ -529,6 +568,11 @@ class Gemma4Parser(ParserEngine):
         # ``ParserEngineReasoningAdapter.extract_reasoning_streaming``) from
         # clobbering this with ``CONTENT``.
         self._streaming_initialized = True
+        # Post-tool continuation: the prompt tail is already inside the thought
+        # channel, so a turn that starts with ``<channel|>`` closes an *empty*
+        # thought and dumps its CoT into content (reasoning leak). Arm the
+        # detector until we have seen real output.
+        self._guarded_leading_close = True
 
     def _events_to_delta(
         self,
