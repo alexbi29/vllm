@@ -49,6 +49,7 @@ from vllm.model_executor.models.transformers.utils import recursive_replace_line
 from vllm.model_executor.models.utils import WeightsMapper, maybe_prefix
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.platforms import current_platform
+from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
@@ -732,6 +733,11 @@ class DiffusionGemmaRequestStates:
             max_num_reqs, canvas_length, hidden_size, dtype=torch.float32, device=device
         )
 
+        # Whether the prompt tail leaves the request inside an open
+        # ``<|channel>`` thinking block (post-tool-response continuation).
+        # CPU-side; set once at add_request, mirrors Gemma4Parser.
+        self.prompt_open_reasoning = np.zeros(max_num_reqs, dtype=bool)
+
     def init_canvas(self, slot_indices: torch.Tensor) -> None:
         """Initialize canvas with random tokens for the given slots.
 
@@ -746,17 +752,19 @@ class DiffusionGemmaRequestStates:
             device=self.device,
         )
 
-    def add_request(self, slot_idx: int) -> None:
+    def add_request(self, slot_idx: int, prompt_open_reasoning: bool = False) -> None:
         self.is_encoder_phase[slot_idx].fill_(True)
         self.init_canvas(async_tensor_h2d([slot_idx], device=self.device))
         self.step[slot_idx].fill_(0)
         self.accepted_canvas_history_len[slot_idx].fill_(0)
         self.self_conditioning_embeds[slot_idx] = 0
+        self.prompt_open_reasoning[slot_idx] = prompt_open_reasoning
 
     def remove_request(self, slot_idx: int) -> None:
         self.is_encoder_phase[slot_idx].fill_(False)
         self.accepted_canvas_history_len[slot_idx].fill_(0)
         self.self_conditioning_embeds[slot_idx] = 0
+        self.prompt_open_reasoning[slot_idx] = False
 
 
 class DiffusionGemmaModelState(ModelState):
@@ -805,6 +813,22 @@ class DiffusionGemmaModelState(ModelState):
         )
         self._req_id_to_index: dict[str, int] = {}
 
+        # Gemma-4 ``<|channel>`` thinking delimiters (single tokens in this
+        # vocab), used to enforce per-request ``thinking_token_budget`` at
+        # canvas-commit time. Falls back to the values the parser already
+        # derives (100/101) if the tokenizer lookup is unavailable.
+        try:
+            vocab = cached_tokenizer_from_config(
+                model_config=self.model_config
+            ).get_vocab()
+        except Exception:  # pragma: no cover - defensive; matches Gemma4Parser
+            vocab = {}
+        self._channel_start_id = vocab.get("<|channel>", 0)
+        self._channel_end_id = vocab.get("<channel|>", 0)
+        self._tool_call_id = vocab.get("<|tool_call>", 0)
+        self._tool_response_id = vocab.get("<|tool_response>", 0)
+        self._turn_id = vocab.get("<|turn>", 0)
+
         # Persistent buffer for per-request causal flags, updated in-place
         # so FULL CUDA graph replay sees the latest values.
         self._causal_buf = torch.zeros(
@@ -847,6 +871,8 @@ class DiffusionGemmaModelState(ModelState):
             diffusion_config=diffusion_config,
             vocab_size=self.model_config.get_vocab_size(),
             diffusion_states=self.diffusion_states,
+            channel_start_id=self._channel_start_id,
+            channel_end_id=self._channel_end_id,
             t_min=gen["t_min"],
             t_max=gen["t_max"],
             entropy_bound=entropy_bound,
@@ -862,9 +888,35 @@ class DiffusionGemmaModelState(ModelState):
     def apply_staged_writes(self) -> None:
         pass
 
+    def _prompt_ends_in_open_reasoning(self, prompt_token_ids) -> bool:
+        """Mirror Gemma4Parser: prompt tail inside an open ``<|channel>`` block.
+
+        A backward scan is sufficient here because the chat template either
+        ends the prompt inside ``<|channel>thought\n`` (post-tool-response
+        continuation) or outside any thinking block (fresh model turn).
+        """
+        start_id = self._channel_start_id
+        if start_id == 0:
+            return False
+        boundary = {
+            self._channel_end_id,
+            self._tool_call_id,
+            self._tool_response_id,
+            self._turn_id,
+        } - {0}
+        for tid in reversed(prompt_token_ids):
+            if tid == start_id:
+                return True
+            if tid in boundary:
+                return False
+        return False
+
     def add_request(self, req_index: int, new_req_data: Any) -> None:
         self._req_id_to_index[new_req_data.req_id] = req_index
-        self.diffusion_states.add_request(req_index)
+        self.diffusion_states.add_request(
+            req_index,
+            self._prompt_ends_in_open_reasoning(new_req_data.prompt_token_ids),
+        )
         if not new_req_data.req_id.startswith("_warmup_"):
             prompt_len = len(new_req_data.prompt_token_ids)
             self.diffusion_states.prompt_len[req_index].fill_(prompt_len)
@@ -1053,6 +1105,8 @@ class DiffusionSampler:
         vocab_size: int,
         diffusion_states: DiffusionGemmaRequestStates,
         *,
+        channel_start_id: int = 0,
+        channel_end_id: int = 0,
         confidence_threshold: float,
         t_min: float,
         t_max: float,
@@ -1087,8 +1141,26 @@ class DiffusionSampler:
         self.vocab_size = vocab_size
         self.diffusion_states = diffusion_states
         self.entropy_bound = entropy_bound
-
+        self._channel_start_id = channel_start_id
+        self._channel_end_id = channel_end_id
+        # Budget enforcement needs the Gemma-4 thinking delimiters; without
+        # them it is a no-op.
+        self._thinking_budget_supported = (
+            channel_start_id != 0 and channel_end_id != 0
+        )
+        logger.debug(
+            "DiffusionSampler thinking budget: start=%s end=%s supported=%s",
+            channel_start_id,
+            channel_end_id,
+            self._thinking_budget_supported,
+        )
         max_num_reqs = diffusion_states.max_num_reqs
+        # Per-slot CPU thinking-budget state (mirrors ThinkingBudgetState).
+        # -1 = no budget for this request.
+        self._thinking_budget = np.full(max_num_reqs, -1, dtype=np.int64)
+        self._thinking_emitted = np.zeros(max_num_reqs, dtype=np.int64)
+        self._thinking_open = np.zeros(max_num_reqs, dtype=bool)
+
         device = diffusion_states.device
         self._sampled = torch.zeros(
             max_num_reqs,
@@ -1121,6 +1193,101 @@ class DiffusionSampler:
         # that was aborted between its converging denoise and commit steps.
         self._pending_logprobs.pop(req_idx, None)
         self.sampling_states.add_request(req_idx, sampling_params)
+
+        budget = getattr(sampling_params, "thinking_token_budget", None)
+        if (
+            self._thinking_budget_supported
+            and budget is not None
+            and int(budget) >= 0
+        ):
+            self._thinking_budget[req_idx] = int(budget)
+            self._thinking_emitted[req_idx] = 0
+            self._thinking_open[req_idx] = self.diffusion_states.prompt_open_reasoning[
+                req_idx
+            ]
+        else:
+            self._thinking_budget[req_idx] = -1
+
+    def _apply_thinking_budgets(
+        self,
+        num_reqs: int,
+        slots_np: np.ndarray,
+        sampled: torch.Tensor,
+        num_sampled: torch.Tensor,
+    ) -> None:
+        """Enforce per-request ``thinking_token_budget`` at canvas-commit time.
+
+        Diffusion decoding commits whole canvases, so the model cannot be
+        stopped mid-canvas. When the accumulated reasoning tokens for a
+        request would exceed its budget, the committed canvas is truncated at
+        the budget boundary and the Gemma-4 reasoning-end token (``<channel|>``)
+        is force-injected. The model reconditions on the truncated context on
+        the following decode steps, so subsequent commits are final-answer
+        tokens. Requests that are not thinking (no ``<|channel>`` emitted,
+        e.g. ``enable_thinking=false``) are left untouched.
+        """
+        if not self._thinking_budget_supported:
+            return
+        budget_slots = self._thinking_budget[slots_np[:num_reqs]] >= 0
+        if not budget_slots.any():
+            return
+        sampled_cpu = sampled[:num_reqs].cpu().numpy()
+        num_cpu = num_sampled[:num_reqs].cpu().numpy()
+        start_id = self._channel_start_id
+        end_id = self._channel_end_id
+        changed = False
+        for i in budget_slots.nonzero()[0]:
+            slot = int(slots_np[i])
+            n = int(num_cpu[i])
+            if n <= 0:
+                continue
+            if not self._thinking_open[slot]:
+                # Not thinking yet: skip unless the model opens a thinking
+                # block in this committed canvas (pure-content canvases are
+                # left alone so non-thinking answers stay uncorrupted).
+                begin = None
+                for j in range(n):
+                    if sampled_cpu[i, j] == start_id:
+                        begin = j + 1
+                        break
+                if begin is None:
+                    continue
+                self._thinking_open[slot] = True
+            else:
+                begin = 0
+            emitted = int(self._thinking_emitted[slot])
+            budget = int(self._thinking_budget[slot])
+            # Reasoning segment is [begin, n). A natural reasoning-end marker
+            # only counts if it occurs at or before the budget boundary (this
+            # model may commit the whole generation as ONE giant canvas, with
+            # the end marker far beyond the budget).
+            limit = begin + max(budget - emitted, 0)  # last allowed reason idx
+            natural_end = -1
+            for j in range(begin, min(n, limit + 1)):
+                if sampled_cpu[i, j] == end_id:
+                    natural_end = j
+                    break
+            if natural_end >= 0:
+                self._thinking_emitted[slot] = emitted + (natural_end - begin)
+                self._thinking_open[slot] = False
+                continue
+            if limit < n:
+                # Committing this canvas would exceed the budget: truncate it
+                # at the budget boundary and force-close thinking. (``limit``
+                # is the position of the injected end token; reasoning tokens
+                # occupy [begin, limit).)
+                pos = max(limit, begin)
+                sampled_cpu[i, pos] = end_id
+                num_cpu[i] = pos + 1
+                self._thinking_emitted[slot] = emitted + (pos - begin)
+                self._thinking_open[slot] = False
+                changed = True
+                continue
+            # Within budget and no end marker yet: commit all as reasoning.
+            self._thinking_emitted[slot] = emitted + (n - begin)
+        if changed:
+            sampled[:num_reqs].copy_(torch.from_numpy(sampled_cpu))
+            num_sampled[:num_reqs].copy_(torch.from_numpy(num_cpu))
 
     def apply_staged_writes(self) -> None:
         self.sampling_states.apply_staged_writes()
@@ -1414,6 +1581,10 @@ class DiffusionSampler:
                     selected_token_ranks=torch.cat(parts_ranks),
                     cu_num_generated_tokens=cu_gen,
                 )
+
+        # Enforce any per-request thinking-token budgets on this step's
+        # committed canvases (no-op when no request carries a budget).
+        self._apply_thinking_budgets(num_reqs, slots_np, sampled, num_sampled)
 
         return self._build_output(
             input_batch,
