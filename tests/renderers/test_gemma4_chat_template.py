@@ -47,6 +47,40 @@ class TestGemma4ChatTemplate:
         assert "How are you?" in result
         assert result.rstrip("\n").endswith("<|channel>thought\n<channel|>")
 
+    def test_multiturn_thinking_disabled_reasoning_supplied(self, gemma4_template):
+        """With enable_thinking=False, if history already rendered a reasoning
+        block (thought channel closed with <channel|>), no empty thought-close
+        is appended to the generation prompt."""
+        messages = [
+            {"role": "user", "content": "Hello"},
+            {
+                "role": "assistant",
+                "content": "Hi there!",
+                "reasoning": "internal thought",
+            },
+        ]
+        result = _render(gemma4_template, messages, add_generation_prompt=True)
+        assert "<|channel>thought\ninternal thought\n<channel|>" in result
+        assert not result.rstrip("\n").endswith("<|channel>thought\n<channel|>")
+        assert result.rstrip("\n").endswith("<|turn>model")
+
+    def test_inject_reasoning_no_think(self, gemma4_template):
+        """enable_thinking=False must still render supplied reasoning (the
+        injection use case: seed hidden thought in no-think mode) and must not
+        append the empty thought-close over it."""
+        messages = [
+            {"role": "user", "content": "What is the capital of France?"},
+            {
+                "role": "assistant",
+                "content": None,
+                "reasoning": "injected hidden reasoning",
+            },
+        ]
+        result = _render(gemma4_template, messages, add_generation_prompt=True)
+        assert "<|channel>thought\ninjected hidden reasoning\n<channel|>" in result
+        assert not result.rstrip("\n").endswith("<|channel>thought\n<channel|>")
+        assert result.rstrip("\n").endswith("<|turn>model")
+
     def test_basic_multiturn_thinking_enabled(self, gemma4_template):
         """With enable_thinking=True, generation prompt ends with model
         turn opener (no thought suppression)."""
