@@ -1,14 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Gemma4 reasoning-leak repair for post-tool-response continuations.
+"""Gemma4 reasoning-leak detector for post-tool-response continuations.
 
 After a tool response the chat template PRE-OPENS the thought channel
 (prompt ends with ``<|channel>thought\\n``). A malformed continuation can
 emit ``<channel|>`` at token 0 — closing an *empty* thought — and then write
 its chain-of-thought, which the parser (correctly, on that stream) labels
-content, and a voice driver speaks verbatim. The parser absorbs those
-leading close tags so the stream stays REASONING (CoT never reaches the
-content channel), and logs the signature at ERROR level.
+content. The detector logs that signature at ERROR level and must NOT modify
+the stream.
 """
 
 from unittest.mock import patch
@@ -60,22 +59,19 @@ def test_fresh_turn_does_not_arm_detector():
     assert parser._guarded_leading_close is False
 
 
-def test_leading_close_absorbed_when_only_token():
-    """A lone spurious close is dropped; the stream stays armed (still
-    watching for more leading closes)."""
+def test_leading_close_logs_error_and_passes_stream_through():
     parser, _ = _make_parser()
     parser.adjust_initial_state_from_prompt(_open_channel_prompt())
 
     with patch("vllm.parser.gemma4.logger.error") as mock_err:
         text, ids = parser._preprocess_feed(CHANNEL_END, [CHANNEL_END_ID])
         assert mock_err.call_count == 1
-        assert text == ""
-        assert not ids
-        assert parser._guarded_leading_close is True
+        # stream untouched
+        assert text == CHANNEL_END
+        assert list(ids) == [CHANNEL_END_ID]
 
 
-def test_leading_close_stripped_from_text_and_ids():
-    """Close tag stripped from both channels; the rest flows; guard disarms."""
+def test_leading_close_with_text_logs_and_passes_both_through():
     parser, _ = _make_parser()
     parser.adjust_initial_state_from_prompt(_open_channel_prompt())
 
@@ -84,25 +80,12 @@ def test_leading_close_stripped_from_text_and_ids():
     with patch("vllm.parser.gemma4.logger.error") as mock_err:
         text, ids = parser._preprocess_feed(text_in, ids_in)
         assert mock_err.call_count == 1
-        assert text == MONOLOGUE
-        assert list(ids) == [6000, 6001, 6002]
-        assert parser._guarded_leading_close is False
+        assert text == text_in
+        assert list(ids) == ids_in
+        assert parser._guarded_leading_close is False  # disarmed after output
 
 
-def test_multiple_leading_closes_all_absorbed():
-    parser, _ = _make_parser()
-    parser.adjust_initial_state_from_prompt(_open_channel_prompt())
-
-    text_in = CHANNEL_END + CHANNEL_END + "answer"
-    ids_in = [CHANNEL_END_ID, CHANNEL_END_ID, 7000]
-    with patch("vllm.parser.gemma4.logger.error") as mock_err:
-        text, ids = parser._preprocess_feed(text_in, ids_in)
-        assert mock_err.call_count == 1
-        assert text == "answer"
-        assert list(ids) == [7000]
-
-
-def test_real_reasoning_first_is_untouched():
+def test_real_reasoning_first_does_not_log():
     parser, _ = _make_parser()
     parser.adjust_initial_state_from_prompt(_open_channel_prompt())
 
@@ -111,7 +94,6 @@ def test_real_reasoning_first_is_untouched():
         assert mock_err.call_count == 0
         assert text == MONOLOGUE
         assert list(ids) == [6000, 6001]
-        assert parser._guarded_leading_close is False
 
 
 def test_empty_delta_keeps_detector_armed():
@@ -124,14 +106,15 @@ def test_empty_delta_keeps_detector_armed():
         assert parser._guarded_leading_close is True  # still watching
 
 
-def test_parse_delta_leak_is_reclassified_to_reasoning():
-    """End-to-end: a leaked monologue after an empty close stays reasoning;
-    content is empty; the error fires exactly once."""
+def test_parse_delta_leak_path_is_log_only():
+    """End-to-end: the leaked monologue still streams as content (unchanged),
+    and the error fires exactly once for the leading close."""
     parser, tok = _make_parser()
     request = ChatCompletionRequest(
         model="test-model",
         messages=[{"role": "user", "content": "hi"}],
     )
+    # prompt tail in an open channel -> detector armed via parse_delta path
     prompt_ids = _open_channel_prompt()
 
     seq = [CHANNEL_END_ID, 6000, 6001, 6002, 6003]
@@ -153,7 +136,9 @@ def test_parse_delta_leak_is_reclassified_to_reasoning():
     assert mock_err.call_count == 1
     reasoning = "".join(r.reasoning for r in results if r and r.reasoning)
     content = "".join(r.content for r in results if r and r.content)
-    # the CoT is captured on the reasoning channel; nothing reaches content
-    assert content == ""
-    # mock tokenizer renders unknown ids as <6000>...; reasoning is non-empty
-    assert reasoning != ""
+    # the stream is not modified: the monologue after the close is content
+    # (the mock tokenizer renders unknown ids as <id>, so just assert the
+    # trailing tokens streamed as content and none as reasoning)
+    assert reasoning == ""
+    assert content != ""
+    assert CHANNEL_END not in content
