@@ -414,68 +414,18 @@ class Gemma4Parser(ParserEngine):
         self._reasoning_text: str = ""
         self._prefix_stripped: bool = False
         self._is_first_feed: bool = True
-        # Armed when the prompt tail leaves us inside a pre-opened thought
-        # channel (post-tool-response continuation). Repairs the reasoning-leak
-        # signature: the model closing an *empty* channel at the very start of
-        # its turn, which would stream its CoT as content. Absorbs the spurious
-        # close so the CoT stays on the reasoning channel, and logs the event.
-        self._guarded_leading_close: bool = False
 
     def _reset(self, initial_state=None) -> None:
         super()._reset(initial_state=initial_state)
         self._reasoning_text = ""
         self._prefix_stripped = False
         self._is_first_feed = True
-        self._guarded_leading_close = False
 
     def _preprocess_feed(
         self,
         delta_text: str,
         delta_token_ids: Sequence[int],
     ) -> tuple[str, Sequence[int]]:
-        if self._guarded_leading_close:
-            # Post-tool continuation inside a pre-opened ``<|channel>``: the
-            # model sometimes emits ``<channel|>`` at token 0 (closing an
-            # *empty* thought) and then writes its chain-of-thought, which the
-            # parser would otherwise label content and a voice driver would
-            # speak verbatim (reasoning leak). Absorb those leading close
-            # tags so the stream stays REASONING; log the signature; the first
-            # real token disarms the guard so a genuine close (after actual
-            # reasoning text) still ends thinking normally.
-            stripped = False
-            end_id = self._reasoning_end_token_id
-            in_text = delta_text
-            if delta_token_ids:
-                ids = list(delta_token_ids)
-                i = 0
-                while i < len(ids) and ids[i] == end_id:
-                    i += 1
-                if i:
-                    stripped = True
-                    delta_token_ids = ids[i:]
-            if delta_text:
-                text = delta_text.lstrip()
-                while text.startswith(CHANNEL_END):
-                    text = text[len(CHANNEL_END):]
-                    stripped = True
-                delta_text = text
-            if stripped:
-                logger.error(
-                    "Gemma4 reasoning leak: post-tool-response continuation "
-                    "closed an empty thought channel at token 0 "
-                    "(`<|channel>` open in prompt, `<channel|>` emitted with "
-                    "no reasoning). Absorbed the leading close(s) so the CoT "
-                    "stays on the reasoning channel.\n"
-                    f"delta text: {in_text!r}"
-                )
-            if delta_token_ids or delta_text:
-                # Real output is flowing; stop watching (a genuine close after
-                # reasoning text is handled normally by the state machine).
-                self._guarded_leading_close = False
-            if stripped and not delta_text and not delta_token_ids:
-                # The whole delta was the spurious close; drop it entirely.
-                return "", ()
-
         if not self._is_first_feed:
             return delta_text, delta_token_ids
         self._is_first_feed = False
@@ -579,11 +529,6 @@ class Gemma4Parser(ParserEngine):
         # ``ParserEngineReasoningAdapter.extract_reasoning_streaming``) from
         # clobbering this with ``CONTENT``.
         self._streaming_initialized = True
-        # Post-tool continuation: the prompt tail is already inside the thought
-        # channel, so a turn that starts with ``<channel|>`` closes an *empty*
-        # thought and dumps its CoT into content (reasoning leak). Arm the
-        # detector until we have seen real output.
-        self._guarded_leading_close = True
 
     def _events_to_delta(
         self,
