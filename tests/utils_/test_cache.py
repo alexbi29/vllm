@@ -141,7 +141,7 @@ def test_lru_cache_put_if_fits():
 
 
 def test_lru_cache_touch_missing_key_does_not_corrupt_order():
-    cache = _TrackingLRUCache(3)
+    cache = LRUCache(3)
 
     cache.touch(99)
 
