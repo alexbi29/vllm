@@ -44,6 +44,84 @@ def test_nvidia_dspark_exposes_v2_speculator_hooks():
         )
 
 
+def test_dspark_layer_forwards_hash_boundary_to_moe(monkeypatch):
+    captured = {}
+
+    class FakeAttention(torch.nn.Module):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+            self.n_local_heads = 1
+
+    class FakeMoE(torch.nn.Module):
+        def __init__(
+            self,
+            vllm_config,
+            prefix="",
+            use_sequence_parallel=False,
+            *,
+            num_hash_layers,
+        ):
+            super().__init__()
+            captured.update(
+                prefix=prefix,
+                use_sequence_parallel=use_sequence_parallel,
+                num_hash_layers=num_hash_layers,
+            )
+
+    class FakeNorm(torch.nn.Module):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+
+    monkeypatch.setattr(
+        nvidia_dspark,
+        "_select_dsv4_attn_cls",
+        lambda _vllm_config: FakeAttention,
+    )
+    monkeypatch.setattr(nvidia_dspark, "DeepseekV4MoE", FakeMoE)
+    monkeypatch.setattr(nvidia_dspark, "RMSNorm", FakeNorm)
+    monkeypatch.setattr(
+        nvidia_dspark,
+        "triton_sparse_mla_head_block_size",
+        lambda: 1,
+    )
+
+    config = SimpleNamespace(
+        hidden_size=2,
+        rms_norm_eps=1e-6,
+        hc_mult=1,
+        hc_sinkhorn_iters=1,
+        hc_eps=1e-6,
+        num_hidden_layers=4,
+        num_hash_layers=2,
+        sliding_window=2,
+        head_dim=2,
+    )
+    spec = SimpleNamespace(
+        enable_adaptive_verification=False,
+        num_speculative_tokens=5,
+        draft_model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(dspark_block_size=5)
+        ),
+    )
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=config, dtype=torch.bfloat16),
+        scheduler_config=SimpleNamespace(max_num_seqs=1),
+        speculative_config=spec,
+    )
+
+    nvidia_dspark.DeepSeekV4DSparkLayer(
+        vllm_config,
+        dspark_layer_idx=1,
+        prefix="draft",
+    )
+
+    assert captured == {
+        "prefix": "draft.layers.5.ffn",
+        "use_sequence_parallel": False,
+        "num_hash_layers": 2,
+    }
+
+
 @pytest.mark.parametrize("adaptive", [False, True])
 def test_adaptive_logits_normalize_without_mutating_confidence_input(adaptive):
     hidden = torch.tensor([[2.0, 4.0]])

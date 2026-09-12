@@ -186,6 +186,7 @@ class DeepSeekV4DSparkLayer(nn.Module):
             vllm_config,
             prefix=f"{runtime_prefix}.ffn",
             use_sequence_parallel=_DSPARK_USE_SEQUENCE_PARALLEL,
+            num_hash_layers=config.num_hash_layers,
         )
         self.attn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
         self.ffn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
