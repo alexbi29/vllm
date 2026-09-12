@@ -179,6 +179,7 @@ def test_dspark_sequential_sampling_writes_persistent_draft_logits(monkeypatch):
     # the test fails with AttributeError from production code that is in fact
     # correct -- __init__ always sets it. False alarm, not a defect.
     speculator.enable_adaptive_verification = False
+    speculator.draft_watermarker = None
     speculator._d2t_scatter_index = None
     speculator.draft_tokens = torch.empty(
         max_num_reqs,

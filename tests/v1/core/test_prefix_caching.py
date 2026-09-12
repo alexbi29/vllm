@@ -174,7 +174,6 @@ def make_mla_kv_cache_config(block_size: int, num_blocks: int) -> KVCacheConfig:
                     head_size=512,
                     dtype=torch.float8_e4m3fn,
                     cache_dtype_str="fp8_ds_mla",
-                    compress_ratio=2,
                     model_version="deepseek_v4",
                 ),
             )

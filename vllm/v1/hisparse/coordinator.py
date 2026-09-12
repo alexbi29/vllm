@@ -42,6 +42,7 @@ class _PendingPublication:
     request: Request
     num_computed_tokens: int
     num_pages: int
+    alignment_tokens: int | None
     retention_interval: int | None
     replay_boundaries: Sequence[int]
 
@@ -427,6 +428,7 @@ class HiSparseCoordinator:
         self,
         request: Request,
         num_computed_tokens: int,
+        alignment_tokens: int | None,
         retention_interval: int | None,
         *,
         replay_boundaries: Sequence[int],
@@ -442,6 +444,7 @@ class HiSparseCoordinator:
             manager.publish_blocks(
                 request,
                 num_computed_tokens,
+                alignment_tokens=alignment_tokens,
                 retention_interval=retention_interval,
                 replay_boundaries=replay_boundaries,
             )
@@ -452,6 +455,7 @@ class HiSparseCoordinator:
             request=request,
             num_computed_tokens=num_computed_tokens,
             num_pages=num_pages,
+            alignment_tokens=alignment_tokens,
             retention_interval=retention_interval,
             replay_boundaries=replay_boundaries,
         )
@@ -467,6 +471,7 @@ class HiSparseCoordinator:
         self.host_manager.publish_blocks(
             publication.request,
             publication.num_computed_tokens,
+            alignment_tokens=publication.alignment_tokens,
             retention_interval=publication.retention_interval,
             replay_boundaries=publication.replay_boundaries,
         )

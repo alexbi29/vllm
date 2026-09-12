@@ -853,7 +853,11 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         for manager in self.single_type_managers:
             if not manager.enable_caching:
                 continue
-            num_tokens_to_cache = cached_num_computed_tokens
+            # Each manager caches every complete block at its own block size.
+            # Prefix hits are still reconciled at the hybrid alignment, but
+            # rounding here would permanently discard a complete tail block
+            # from groups whose block size is smaller than that alignment.
+            num_tokens_to_cache = num_computed_tokens
             # EAGLE groups match one block past each aligned boundary and drop
             # it, so make that lookahead block eligible to be cached.
             if manager.use_eagle and cached_num_computed_tokens > 0:

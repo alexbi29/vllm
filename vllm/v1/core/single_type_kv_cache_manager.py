@@ -1099,12 +1099,15 @@ class MLAAttentionManager(FullAttentionManager):
         num_tokens: int,
         alignment_tokens: int | None = None,
         retention_interval: int | None = None,
+        *,
+        replay_boundaries: Sequence[int],
     ) -> None:
         super().cache_blocks(
             request,
             num_tokens,
             alignment_tokens=alignment_tokens,
             retention_interval=retention_interval,
+            replay_boundaries=replay_boundaries,
         )
         if not self._should_protect_prompt_blocks() or request.num_prompt_tokens <= 1:
             return
@@ -1449,12 +1452,15 @@ class SlidingWindowMLAManager(SlidingWindowManager):
         num_tokens: int,
         alignment_tokens: int | None = None,
         retention_interval: int | None = None,
+        *,
+        replay_boundaries: Sequence[int],
     ) -> None:
         super().cache_blocks(
             request,
             num_tokens,
             alignment_tokens=alignment_tokens,
             retention_interval=retention_interval,
+            replay_boundaries=replay_boundaries,
         )
         if not self.enable_caching or request.num_prompt_tokens <= 1:
             return
@@ -2628,6 +2634,7 @@ class HiSparseSourceManager(FullAttentionManager):
         self,
         request: Request,
         num_tokens: int,
+        alignment_tokens: int | None = None,
         retention_interval: int | None = None,
         *,
         replay_boundaries: Sequence[int],
@@ -2636,6 +2643,7 @@ class HiSparseSourceManager(FullAttentionManager):
         self.coordinator.publish_when_ready(
             request,
             num_tokens,
+            alignment_tokens,
             retention_interval,
             replay_boundaries=replay_boundaries,
         )
@@ -2644,6 +2652,7 @@ class HiSparseSourceManager(FullAttentionManager):
         self,
         request: Request,
         num_tokens: int,
+        alignment_tokens: int | None = None,
         retention_interval: int | None = None,
         *,
         replay_boundaries: Sequence[int],
@@ -2651,6 +2660,7 @@ class HiSparseSourceManager(FullAttentionManager):
         super().cache_blocks(
             request,
             num_tokens,
+            alignment_tokens=alignment_tokens,
             retention_interval=retention_interval,
             replay_boundaries=replay_boundaries,
         )
@@ -2676,6 +2686,7 @@ class _HiSparseAuxiliaryManager(SingleTypeKVCacheManager):
         self,
         request: Request,
         num_tokens: int,
+        alignment_tokens: int | None = None,
         retention_interval: int | None = None,
         *,
         replay_boundaries: Sequence[int],
@@ -2848,6 +2859,7 @@ class HiSparseResidentManager(_HiSparseAuxiliaryManager):
         self,
         request: Request,
         num_tokens: int,
+        alignment_tokens: int | None = None,
         retention_interval: int | None = None,
         *,
         replay_boundaries: Sequence[int],

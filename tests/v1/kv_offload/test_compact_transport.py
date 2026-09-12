@@ -147,8 +147,9 @@ def _make_vllm_config(
     config.cache_config.get_resolved_kv_cache_layout.return_value = KVCacheLayout.LBNHC
     config.cache_config.kv_cache_layout = "LBNHC"
     config.model_config.model = "test-model"
-    config.model_config.original_max_model_len = -1
+    config.model_config.original_max_model_len = 10000
     config.model_config.max_model_len = 10000
+    config.attention_config.hisparse_config = None
     config.kv_events_config = None
     config.use_v2_model_runner = False
     config.scheduler_config = MagicMock()
