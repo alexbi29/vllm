@@ -196,6 +196,20 @@ def _canonical_block_sizes(
     return canonical_bytes_per_block
 
 
+def _drain_latched_cuda_error() -> None:
+    """Clear a failed host-registration status before another kernel launches."""
+    for _ in range(2):
+        try:
+            # PyTorch's launch check calls cudaGetLastError, clearing its latch.
+            torch.empty(1, device="cuda").zero_()
+            return
+        except Exception:
+            continue
+    logger.warning(
+        "CUDA context still reports an error after host-registration failure"
+    )
+
+
 def pin_mmap_region(region: SharedOffloadRegion) -> None:
     """Register the entire mmap as CUDA pinned memory via cudaHostRegister."""
     if not current_platform.is_cuda_alike():
@@ -211,6 +225,7 @@ def pin_mmap_region(region: SharedOffloadRegion) -> None:
     base_ptr = region._base.data_ptr()
     result = torch.cuda.cudart().cudaHostRegister(base_ptr, region.total_size_bytes, 0)
     if result.value != 0:
+        _drain_latched_cuda_error()
         logger.warning(
             "cudaHostRegister failed for rank=%d (code=%d) — "
             "transfers will still work but may be slower (unpinned DMA)",
