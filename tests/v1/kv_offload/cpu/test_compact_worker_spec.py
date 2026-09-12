@@ -290,6 +290,7 @@ def _make_offloading_config(
             OffloadingGroupConfig(
                 tokens_per_block=256,
                 layer_names=("layer0",),
+                group_id=0,
                 compact_bytes_per_native_block_per_worker=(
                     compact_slice_accounting[0].compact_real_bytes_per_rank
                     if compact_slice_accounting
@@ -375,7 +376,7 @@ def test_compact_manager_prepare_store_returns_compact_spec() -> None:
     from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 
     manager = CPUOffloadingManager(
-        num_blocks=8,
+        num_chunks=8,
         cache_policy="lru",
         enable_events=False,
         store_threshold=1,

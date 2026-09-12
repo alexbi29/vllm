@@ -55,6 +55,8 @@ class OffloadingGroupConfig:
     tokens_per_block: int
     # Layer names belonging to this group.
     layer_names: tuple[str, ...]
+    # Original KVCacheConfig group index.
+    group_id: int
     # Compact layout: real bytes per worker per native block.
     # None when compact layout is disabled.
     compact_bytes_per_native_block_per_worker: int | None = None

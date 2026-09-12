@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import numpy as np
+
 from vllm.v1.kv_offload.base import BlockIDsLoadStoreSpec, LoadStoreSpec
 
 
@@ -28,7 +30,11 @@ class CPUOffloadingMetrics:
 
 
 class CPULoadStoreSpec(BlockIDsLoadStoreSpec):
-    """Spec for loading/storing a KV block to CPU memory (legacy packed rows)."""
+    """Spec for loading/storing packed KV chunks to/from CPU memory."""
+
+    @property
+    def chunk_ids(self) -> np.ndarray:
+        return self.block_ids
 
 
 @dataclass(frozen=True)

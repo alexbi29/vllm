@@ -12,7 +12,7 @@ import pytest
 
 from vllm.v1.kv_offload.base import OffloadKey, ReqContext, make_offload_key
 from vllm.v1.kv_offload.cpu.policies.arc import ARCCachePolicy
-from vllm.v1.kv_offload.cpu.policies.base import BlockStatus, CachePolicy
+from vllm.v1.kv_offload.cpu.policies.base import CachePolicy, ChunkStatus
 from vllm.v1.kv_offload.cpu.policies.lru import LRUCachePolicy
 
 
@@ -20,17 +20,17 @@ def _k(i: int) -> OffloadKey:
     return make_offload_key(f"k{i:04d}".encode(), 0)
 
 
-def _block(block_id: int, ref_cnt: int = 0) -> BlockStatus:
-    b = BlockStatus(block_id)
+def _block(block_id: int, ref_cnt: int = 0) -> ChunkStatus:
+    b = ChunkStatus(block_id)
     b.ref_cnt = ref_cnt
     return b
 
 
 def _block_ids(policy):
-    if hasattr(policy, "blocks"):
-        return frozenset((b.block_id, b.ref_cnt) for b in policy.blocks.values())
-    return frozenset((b.block_id, b.ref_cnt) for b in policy.t1.values()) | frozenset(
-        (b.block_id, b.ref_cnt) for b in policy.t2.values()
+    if hasattr(policy, "chunks"):
+        return frozenset((b.chunk_id, b.ref_cnt) for b in policy.chunks.values())
+    return frozenset((b.chunk_id, b.ref_cnt) for b in policy.t1.values()) | frozenset(
+        (b.chunk_id, b.ref_cnt) for b in policy.t2.values()
     )
 
 
@@ -45,7 +45,7 @@ def _save_state(policy):
             "target_t1_size": policy.target_t1_size,
         }
     else:
-        meta = {"evictable_keys": list(policy.evictable_blocks.keys())}
+        meta = {"evictable_keys": list(policy.evictable_chunks.keys())}
     return blocks, meta
 
 
@@ -58,7 +58,7 @@ def _assert_unchanged(before_blocks, before_meta, policy):
         assert list(policy.b2.keys()) == before_meta["b2_keys"]
         assert policy.target_t1_size == before_meta["target_t1_size"]
     else:
-        assert list(policy.evictable_blocks.keys()) == before_meta["evictable_keys"]
+        assert list(policy.evictable_chunks.keys()) == before_meta["evictable_keys"]
 
 
 @pytest.fixture(params=["lru", "arc"])
@@ -218,41 +218,41 @@ def test_legacy_evict_only_subclass_instantiable():
 
         def __init__(self, cache_capacity: int):
             self.capacity = cache_capacity
-            self._blocks: dict[OffloadKey, BlockStatus] = {}
+            self._chunks: dict[OffloadKey, ChunkStatus] = {}
             self._order: list[OffloadKey] = []
 
-        def get(self, key: OffloadKey) -> BlockStatus | None:
-            return self._blocks.get(key)
+        def get(self, key: OffloadKey) -> ChunkStatus | None:
+            return self._chunks.get(key)
 
-        def insert(self, key: OffloadKey, block: BlockStatus) -> None:
-            self._blocks[key] = block
+        def insert(self, key: OffloadKey, chunk: ChunkStatus) -> None:
+            self._chunks[key] = chunk
             self._order.append(key)
 
         def remove(self, key: OffloadKey) -> None:
-            self._blocks.pop(key, None)
+            self._chunks.pop(key, None)
             self._order[:] = [k for k in self._order if k != key]
 
         def touch(self, keys: Iterable[OffloadKey], req_context: ReqContext) -> None:
             pass
 
         def clear(self) -> None:
-            self._blocks.clear()
+            self._chunks.clear()
             self._order.clear()
 
         def evict(
             self, n: int, protected: set[OffloadKey]
-        ) -> list[tuple[OffloadKey, BlockStatus]] | None:
-            result: list[tuple[OffloadKey, BlockStatus]] = []
+        ) -> list[tuple[OffloadKey, ChunkStatus]] | None:
+            result: list[tuple[OffloadKey, ChunkStatus]] = []
             for key in list(self._order):
-                if key in protected or key not in self._blocks:
+                if key in protected or key not in self._chunks:
                     continue
-                if self._blocks[key].ref_cnt != 0:
+                if self._chunks[key].ref_cnt != 0:
                     continue
-                result.append((key, self._blocks[key]))
+                result.append((key, self._chunks[key]))
                 if len(result) >= n:
                     break
             for key, _ in result:
-                del self._blocks[key]
+                del self._chunks[key]
                 self._order.remove(key)
             return result or None
 

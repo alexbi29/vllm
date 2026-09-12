@@ -121,7 +121,7 @@ def make_compact_manager(
     if group_slice_configs is None:
         group_slice_configs = _single_group_cfg(real_bytes=80)
     return CPUOffloadingManager(
-        num_blocks=num_blocks,
+        num_chunks=num_blocks,
         cache_policy=cache_policy,
         compact_group_payload_map={
             cfg.group_idx: cfg.compact_real_bytes_per_rank
@@ -136,7 +136,7 @@ def make_compact_manager(
 def make_legacy_manager(
     num_blocks: int = 4, cache_policy: str = "lru"
 ) -> CPUOffloadingManager:
-    return CPUOffloadingManager(num_blocks=num_blocks, cache_policy=cache_policy)
+    return CPUOffloadingManager(num_chunks=num_blocks, cache_policy=cache_policy)
 
 
 # ---------------------------------------------------------------------------
@@ -148,7 +148,7 @@ def test_compact_partial_args_raises() -> None:
     """Partial compact args must raise."""
     with pytest.raises(ValueError, match="all four compact args"):
         CPUOffloadingManager(
-            num_blocks=4,
+            num_chunks=4,
             compact_group_payload_map={0: 80},
             blocks_per_chunk=1,
             # missing compact_cpu_budget_bytes, compact_page_size
@@ -159,7 +159,7 @@ def test_compact_supported_policy_accepted() -> None:
     """LRU and ARC policies are accepted with compact layout."""
     for policy in ("lru", "arc"):
         mgr = CPUOffloadingManager(
-            num_blocks=4,
+            num_chunks=4,
             cache_policy=policy,
             compact_group_payload_map={0: 80},
             blocks_per_chunk=1,
@@ -190,16 +190,16 @@ def test_compact_negative_payload_raises() -> None:
         make_compact_manager(cpu_budget=1024, page_size=256, group_slice_configs=cfg)
 
 
-def test_compact_non_contiguous_group_idx_raises() -> None:
-    """Aggregate payload map must use contiguous group indices from zero."""
-    with pytest.raises(ValueError, match="contiguous"):
-        CPUOffloadingManager(
-            num_blocks=4,
-            compact_group_payload_map={1: 80},
-            blocks_per_chunk=1,
-            compact_cpu_budget_bytes=1024,
-            compact_page_size=256,
-        )
+def test_compact_non_contiguous_group_idx_is_supported() -> None:
+    """Original cache-group IDs need not be renumbered after group filtering."""
+    manager = CPUOffloadingManager(
+        num_chunks=4,
+        compact_group_payload_map={1: 80},
+        blocks_per_chunk=1,
+        compact_cpu_budget_bytes=1024,
+        compact_page_size=256,
+    )
+    assert manager._group_payload_bytes == {1: 80}
 
 
 # ---------------------------------------------------------------------------
@@ -874,18 +874,18 @@ def test_compact_prepare_load_removes_from_evictable() -> None:
     block = manager._policy.get(key)
     assert block is not None
     assert block.ref_cnt == 0
-    assert manager._num_evictable_cache_blocks == 1
-    assert manager._num_write_pending_blocks == 0
+    assert manager._num_evictable_cache_chunks == 1
+    assert manager._num_write_pending_chunks == 0
 
     # prepare_load: removes from evictable, increments ref_cnt.
     manager.prepare_load([key], _EMPTY_REQ)
     assert block.ref_cnt == 1
-    assert manager._num_evictable_cache_blocks == 0
+    assert manager._num_evictable_cache_chunks == 0
     # complete_load restores evictable.
     manager.complete_load([key], _EMPTY_REQ)
     assert block.ref_cnt == 0
-    assert manager._num_evictable_cache_blocks == 1
-    assert manager._num_write_pending_blocks == 0
+    assert manager._num_evictable_cache_chunks == 1
+    assert manager._num_write_pending_chunks == 0
 
 
 def test_compact_load_active_prevents_eviction() -> None:
@@ -912,11 +912,11 @@ def test_compact_load_active_prevents_eviction() -> None:
     r2 = manager.prepare_store([key2], _EMPTY_REQ)
     assert r2 is not None
     manager.complete_store([key2], _EMPTY_REQ, success=True)
-    assert manager._num_evictable_cache_blocks == 2
+    assert manager._num_evictable_cache_chunks == 2
 
     # Start a load on key1 — removes it from evictable set.
     manager.prepare_load([key1], _EMPTY_REQ)
-    assert manager._num_evictable_cache_blocks == 1
+    assert manager._num_evictable_cache_chunks == 1
 
     # Try to store key3. Only key1 (loaded, ref_cnt=1) and key2 (ref_cnt=0)
     # exist. key1 is protected by ref_cnt, leaving key2 alone with 1 page.
@@ -937,7 +937,7 @@ def test_compact_load_active_prevents_eviction() -> None:
 
     # complete_load on key1 restores evictable.
     manager.complete_load([key1], _EMPTY_REQ)
-    assert manager._num_evictable_cache_blocks == 2
+    assert manager._num_evictable_cache_chunks == 2
 
 
 def test_compact_load_active_store_no_free_space() -> None:
@@ -959,11 +959,11 @@ def test_compact_load_active_store_no_free_space() -> None:
     r1 = manager.prepare_store([key1], _EMPTY_REQ)
     assert r1 is not None
     manager.complete_store([key1], _EMPTY_REQ, success=True)
-    assert manager._num_evictable_cache_blocks == 1
+    assert manager._num_evictable_cache_chunks == 1
 
     # Start load on key1 — removes it from evictable.
     manager.prepare_load([key1], _EMPTY_REQ)
-    assert manager._num_evictable_cache_blocks == 0
+    assert manager._num_evictable_cache_chunks == 0
 
     # key2 cannot fit: key1 is loaded (ref_cnt > 0, not evictable).
     r2 = manager.prepare_store([key2], _EMPTY_REQ)
@@ -1027,29 +1027,29 @@ def test_compact_counters_exact() -> None:
     key4 = _key(4, group_idx=0)
 
     # --- Initial: all zeros ---
-    assert manager._num_write_pending_blocks == 0
-    assert manager._num_evictable_cache_blocks == 0
+    assert manager._num_write_pending_chunks == 0
+    assert manager._num_evictable_cache_chunks == 0
 
     # --- prepare_store: increment write_pending ---
     r1 = manager.prepare_store([key1], _EMPTY_REQ)
     assert r1 is not None
-    assert manager._num_write_pending_blocks == 1
-    assert manager._num_evictable_cache_blocks == 0
+    assert manager._num_write_pending_chunks == 1
+    assert manager._num_evictable_cache_chunks == 0
 
     # --- complete_store success: decrement write_pending, increment evictable ---
     manager.complete_store([key1], _EMPTY_REQ, success=True)
-    assert manager._num_write_pending_blocks == 0
-    assert manager._num_evictable_cache_blocks == 1
+    assert manager._num_write_pending_chunks == 0
+    assert manager._num_evictable_cache_chunks == 1
 
     # --- Failed store: prepare then fail ---
     r2 = manager.prepare_store([key2], _EMPTY_REQ)
     assert r2 is not None
-    assert manager._num_write_pending_blocks == 1
-    assert manager._num_evictable_cache_blocks == 1
+    assert manager._num_write_pending_chunks == 1
+    assert manager._num_evictable_cache_chunks == 1
 
     manager.complete_store([key2], _EMPTY_REQ, success=False)
-    assert manager._num_write_pending_blocks == 0
-    assert manager._num_evictable_cache_blocks == 1  # unchanged (key1 still)
+    assert manager._num_write_pending_chunks == 0
+    assert manager._num_evictable_cache_chunks == 1  # unchanged (key1 still)
 
     # key2 should not be in committed allocations.
     assert key2 not in manager._compact_allocations
@@ -1060,13 +1060,13 @@ def test_compact_counters_exact() -> None:
     # key3 uses 1 page. Store key2 (retry) and key3 together.
     r3 = manager.prepare_store([key2, key3], _EMPTY_REQ)
     assert r3 is not None
-    assert manager._num_write_pending_blocks == 2  # 2 new pending
-    assert manager._num_evictable_cache_blocks == 1  # key1 still evictable
+    assert manager._num_write_pending_chunks == 2  # 2 new pending
+    assert manager._num_evictable_cache_chunks == 1  # key1 still evictable
 
     # Commit both.
     manager.complete_store([key2, key3], _EMPTY_REQ, success=True)
-    assert manager._num_write_pending_blocks == 0
-    assert manager._num_evictable_cache_blocks == 3  # key1, key2, key3
+    assert manager._num_write_pending_chunks == 0
+    assert manager._num_evictable_cache_chunks == 3  # key1, key2, key3
 
     # --- Eviction via overfill ---
     # Budget is 3 pages, all 3 are used (key1+key2+key3).
@@ -1076,25 +1076,25 @@ def test_compact_counters_exact() -> None:
     assert r4 is not None
     assert len(r4.evicted_keys) == 1
     assert r4.evicted_keys[0] == key1
-    assert manager._num_evictable_cache_blocks == 2  # key1 evicted, key2, key3 remain
-    assert manager._num_write_pending_blocks == 1  # key4 pending
+    assert manager._num_evictable_cache_chunks == 2  # key1 evicted, key2, key3 remain
+    assert manager._num_write_pending_chunks == 1  # key4 pending
 
     manager.complete_store([key4], _EMPTY_REQ, success=True)
-    assert manager._num_write_pending_blocks == 0
-    assert manager._num_evictable_cache_blocks == 3  # key2, key3, key4
+    assert manager._num_write_pending_chunks == 0
+    assert manager._num_evictable_cache_chunks == 3  # key2, key3, key4
 
     # --- prepare_load / complete_load counters ---
     manager.prepare_load([key2], _EMPTY_REQ)
-    assert manager._num_evictable_cache_blocks == 2  # key2 removed from evictable
-    assert manager._num_write_pending_blocks == 0
+    assert manager._num_evictable_cache_chunks == 2  # key2 removed from evictable
+    assert manager._num_write_pending_chunks == 0
 
     manager.complete_load([key2], _EMPTY_REQ)
-    assert manager._num_evictable_cache_blocks == 3  # key2 restored
-    assert manager._num_write_pending_blocks == 0
+    assert manager._num_evictable_cache_chunks == 3  # key2 restored
+    assert manager._num_write_pending_chunks == 0
 
     # --- Reset zeros all counters ---
     manager.reset_cache()
-    assert manager._num_write_pending_blocks == 0
-    assert manager._num_evictable_cache_blocks == 0
+    assert manager._num_write_pending_chunks == 0
+    assert manager._num_evictable_cache_chunks == 0
     assert len(manager._compact_allocations) == 0
     assert len(manager._compact_pending) == 0

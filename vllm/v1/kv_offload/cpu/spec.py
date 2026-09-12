@@ -80,7 +80,7 @@ class CPUOffloadingSpec(OffloadingSpec):
             ),
             CPUOffloadingMetrics.CPU_ALLOCATION_SIZE: OffloadingHistogramMetadata(
                 documentation=(
-                    "Histogram of the number of CPU blocks requested by each "
+                    "Histogram of the number of CPU chunks requested by each "
                     "KV offload prepare_store call."
                 ),
                 buckets=(1, 4, 16, 64, 256, 1024, 4096, 16384, 65536, 262144),
@@ -108,7 +108,7 @@ class CPUOffloadingSpec(OffloadingSpec):
             )
 
         world_size = config.parallel.world_size
-        self.num_blocks = 0
+        self.num_chunks = 0
         self.kv_bytes_per_chunk = 0
         self.cpu_page_size_per_worker = 0
         self.replicated_layout = config.replicated_layout and self._uses_shared_region()
@@ -120,17 +120,17 @@ class CPUOffloadingSpec(OffloadingSpec):
             # calculate cpu_page_size_per_worker
             self.cpu_page_size_per_worker = kv_bytes_per_chunk // num_copies
 
-            # calculate num_blocks
+            # calculate num_chunks
             aligned_kv_bytes_per_chunk = round_up(
                 kv_bytes_per_chunk, self.BLOCK_SIZE_ALIGNMENT
             )
-            self.num_blocks = int(cpu_bytes_to_use) // aligned_kv_bytes_per_chunk
+            self.num_chunks = int(cpu_bytes_to_use) // aligned_kv_bytes_per_chunk
 
             # Expose aligned_kv_bytes_per_chunk as
             # kv_bytes_per_chunk. Note that this might contain
-            # some padding. i.e. each offloaded block is of the form,
-            # |--- W0-B0---|---- W1-B0---| ... |---- Wn-B0---| *** maybe-pad *** |
-            # or |--- B0 (single copy) ---| *** maybe-pad *** |
+            # some padding. i.e. each offloaded chunk is of the form,
+            # |--- W0-C0---|---- W1-C0---| ... |---- Wn-C0---| *** maybe-pad *** |
+            # or |--- C0 (single copy) ---| *** maybe-pad *** |
             self.kv_bytes_per_chunk = aligned_kv_bytes_per_chunk
 
         # scheduler-side
@@ -187,21 +187,14 @@ class CPUOffloadingSpec(OffloadingSpec):
             per_rank_budget -= per_rank_budget % _COMPACT_PAGE_SIZE
 
             payload_map: dict[int, int] = {}
-            for group_idx, payload in enumerate(compact_group_payloads):
+            for group, payload in zip(config.groups, compact_group_payloads):
                 assert payload is not None
                 if payload <= 0:
                     raise ValueError(
-                        f"compact group {group_idx} has non-positive "
+                        f"compact group {group.group_id} has non-positive "
                         f"compact_real_bytes_per_rank ({payload})"
                     )
-                payload_map[group_idx] = payload
-
-            expected_group_ids = list(range(len(config.groups)))
-            if sorted(payload_map) != expected_group_ids:
-                raise ValueError(
-                    "compact group indices must be contiguous from zero: "
-                    f"expected {expected_group_ids}, got {sorted(payload_map)}"
-                )
+                payload_map[group.group_id] = payload
 
             policy_capacity = per_rank_budget // min(payload_map.values())
             if policy_capacity <= 0:
@@ -224,7 +217,7 @@ class CPUOffloadingSpec(OffloadingSpec):
     @override
     def get_manager(self) -> OffloadingManager:
         if not self._manager:
-            # store_threshold: how many times a block must be offered for
+            # store_threshold: how many times a chunk must be offered for
             # storage before it is eligible for CPU offloading.  Values < 2
             # disable filtering (a threshold of 1 equals no filter; 0 is the
             # default).
@@ -243,7 +236,7 @@ class CPUOffloadingSpec(OffloadingSpec):
                 # free-page count stays bounded.
                 compact_page_size = _COMPACT_PAGE_SIZE
                 self._manager = CPUOffloadingManager(
-                    num_blocks=self._compact_policy_capacity,
+                    num_chunks=self._compact_policy_capacity,
                     cache_policy=self.eviction_policy,  # type: ignore[arg-type]
                     cache_policy_module_path=self.cache_policy_module_path,
                     enable_events=self.kv_events_config.enable_kv_cache_events,
@@ -256,7 +249,7 @@ class CPUOffloadingSpec(OffloadingSpec):
                 )
             else:
                 self._manager = CPUOffloadingManager(
-                    num_blocks=self.num_blocks,
+                    num_chunks=self.num_chunks,
                     cache_policy=self.eviction_policy,
                     cache_policy_module_path=self.cache_policy_module_path,
                     enable_events=self.kv_events_config.enable_kv_cache_events,
@@ -279,15 +272,15 @@ class CPUOffloadingSpec(OffloadingSpec):
             return CPUOffloadingWorker(
                 kv_caches=kv_caches,
                 blocks_per_chunk=self.blocks_per_chunk,
-                num_cpu_blocks=self.num_blocks,
+                num_cpu_chunks=self.num_chunks,
                 compact_slice_accounting=self._compact_slice_accounting,
                 compact_cpu_budget_bytes_per_rank=self._compact_per_rank_budget,
             )
 
         mmap_region: SharedOffloadRegion | None = None
-        # num_blocks == 0 would size the region to zero bytes, which cannot be
+        # num_chunks == 0 would size the region to zero bytes, which cannot be
         # mmap'd; fall back to the tensor path (empty tensors) as before.
-        if self._uses_shared_region() and self.num_blocks > 0:
+        if self._uses_shared_region() and self.num_chunks > 0:
             # Replicated layout puts all ranks on slot 0 (single MLA copy);
             # otherwise each rank takes its own slot by physical device index.
             if self.replicated_layout:
@@ -297,9 +290,9 @@ class CPUOffloadingSpec(OffloadingSpec):
                 rank = torch.accelerator.current_device_index() % world_size
             mmap_region = SharedOffloadRegion(
                 engine_id=self.config.engine_id,
-                num_blocks=self.num_blocks,
+                num_chunks=self.num_chunks,
                 rank=rank,
-                kv_bytes_per_block=self.kv_bytes_per_chunk,
+                kv_bytes_per_chunk=self.kv_bytes_per_chunk,
                 cpu_page_size=self.cpu_page_size_per_worker,
                 barrier=_all_workers_barrier,
             )
@@ -307,7 +300,7 @@ class CPUOffloadingSpec(OffloadingSpec):
             return CPUOffloadingWorker(
                 kv_caches=kv_caches,
                 blocks_per_chunk=self.blocks_per_chunk,
-                num_cpu_blocks=self.num_blocks,
+                num_cpu_chunks=self.num_chunks,
                 mmap_region=mmap_region,
             )
         except Exception:

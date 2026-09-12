@@ -13,8 +13,8 @@ PyNvVideoCodec==2.0.4
 # FlashInfer should be updated together with the Dockerfile
 # Keep the TVM FFI pin compatible with the TileLang build.
 --extra-index-url https://flashinfer.ai/whl/
-flashinfer-python==0.6.18
-flashinfer-cubin==0.6.18
+flashinfer-python==0.6.18.post1
+flashinfer-cubin==0.6.18.post1
 apache-tvm-ffi==0.1.11
 tilelang==0.1.12
 nvidia-cudnn-frontend>=1.19.1
@@ -25,8 +25,8 @@ fastsafetensors >= 0.3.3
 instanttensor >= 0.1.9
 
 # QuACK and Cutlass DSL for FA4 (cute-DSL implementation)
-nvidia-cutlass-dsl[cu13]==4.6.2
-quack-kernels==0.6.4  # Required for CUTLASS DSL 4.6 by MSA
+nvidia-cutlass-dsl[cu13]==4.7.1
+quack-kernels==0.6.5  # Required by MSA
 
 # Tokenspeed_MLA for faster mla with spec decode
 tokenspeed-mla==0.1.8; platform_system == "Linux"
