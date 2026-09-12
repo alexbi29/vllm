@@ -68,23 +68,28 @@ def build_offloading_config(
             f"Group count {len(kv_cache_config.kv_cache_groups)} "
             f"does not match signature count {len(signature)}"
         )
+        for group_id, charge in enumerate(signature):
+            assert charge.group_idx == group_id, (
+                f"Signature group index {charge.group_idx} "
+                f"does not match builder group index {group_id}"
+            )
 
     groups = tuple(
-            OffloadingGroupConfig(
-                group_id=group_id,
-                tokens_per_block=resolve_dcp_kv_block_size(
-                    group.kv_cache_spec,
-                    parallel_config.decode_context_parallel_size,
-                ),
-                layer_names=tuple(group.layer_names),
-                compact_bytes_per_native_block_per_worker=(
-                    None
-                    if signature is None
-                    else signature[
-                        group_id
-                    ].compact_bytes_per_native_block_per_worker
-                ),
-            )
+        OffloadingGroupConfig(
+            group_id=group_id,
+            tokens_per_block=resolve_dcp_kv_block_size(
+                group.kv_cache_spec,
+                parallel_config.decode_context_parallel_size,
+            ),
+            layer_names=tuple(group.layer_names),
+            compact_bytes_per_native_block_per_worker=(
+                None
+                if signature is None
+                else signature[
+                    group_id
+                ].compact_bytes_per_native_block_per_worker
+            ),
+        )
         for group_id, group in selected_groups
     )
 
