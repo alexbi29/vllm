@@ -143,6 +143,14 @@ def _apply_rope_gptj_last(
 _DSPARK_USE_SEQUENCE_PARALLEL = False
 
 
+def _dspark_runtime_block_size(vllm_config: VllmConfig) -> int:
+    spec = vllm_config.speculative_config
+    assert spec is not None
+    if spec.enable_adaptive_verification:
+        return spec.num_speculative_tokens
+    return int(getattr(spec.draft_model_config.hf_config, "dspark_block_size", 0))
+
+
 class DeepSeekV4DSparkLayer(nn.Module):
     def __init__(
         self,
@@ -160,7 +168,7 @@ class DeepSeekV4DSparkLayer(nn.Module):
         self.hc_sinkhorn_iters = config.hc_sinkhorn_iters
         self.hc_eps = config.hc_eps
         self.hc_post_alpha = 2.0
-        self.block_size = int(getattr(config, "dspark_block_size", 0))
+        self.block_size = _dspark_runtime_block_size(vllm_config)
         runtime_layer_idx = config.num_hidden_layers + dspark_layer_idx
         runtime_prefix = (
             f"{prefix}.layers.{runtime_layer_idx}"
@@ -712,9 +720,12 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         assert vllm_config.speculative_config is not None
+        self.enable_adaptive_verification = (
+            vllm_config.speculative_config.enable_adaptive_verification
+        )
         config = vllm_config.speculative_config.draft_model_config.hf_config
         self.config = config
-        self.block_size = int(getattr(config, "dspark_block_size", 0))
+        self.block_size = _dspark_runtime_block_size(vllm_config)
         self.target_layer_ids = tuple(getattr(config, "dspark_target_layer_ids", ()))
         if self.block_size <= 0:
             raise ValueError("DSpark requires dspark_block_size > 0")
@@ -976,7 +987,10 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             self.rms_norm_eps,
             self.hc_eps,
         )
-        x = self.norm(x)
+        # The confidence head consumes pre-norm hidden states. Keep the fixed
+        # path unchanged; adaptive drafting normalizes only for vocabulary logits.
+        if not self.enable_adaptive_verification:
+            x = self.norm(x)
         if x.shape[0] < num_input_rows:
             x = torch.cat(
                 [
@@ -988,6 +1002,8 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         return x[:num_input_rows]
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        if self.enable_adaptive_verification:
+            hidden_states = self.norm(hidden_states)
         return self.logits_processor(self.head, hidden_states)
 
     def compute_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:

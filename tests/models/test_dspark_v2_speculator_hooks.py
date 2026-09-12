@@ -11,10 +11,28 @@ vllm-project/vllm#41834)."""
 import inspect
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from vllm.models.deepseek_v4.nvidia import dspark as nvidia_dspark
 from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
+
+
+@pytest.mark.parametrize("adaptive,num_tokens,expected", [(False, 5, 5), (True, 3, 3)])
+def test_runtime_block_matches_adaptive_draft_batch(adaptive, num_tokens, expected):
+    spec = SimpleNamespace(
+        enable_adaptive_verification=adaptive,
+        num_speculative_tokens=num_tokens,
+        draft_model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(dspark_block_size=5)
+        ),
+    )
+    block = nvidia_dspark._dspark_runtime_block_size(
+        SimpleNamespace(speculative_config=spec)
+    )
+    assert block == expected
+    # Two requests must remain separate groups of num_tokens, not groups of 5.
+    assert torch.arange(2 * expected).view(2, block).shape == (2, expected)
 
 
 def test_nvidia_dspark_exposes_v2_speculator_hooks():
@@ -24,6 +42,20 @@ def test_nvidia_dspark_exposes_v2_speculator_hooks():
             f"{cls.__name__} lacks {hook}; the V2 DSpark speculator dies in "
             "profile_run on the first cold boot"
         )
+
+
+@pytest.mark.parametrize("adaptive", [False, True])
+def test_adaptive_logits_normalize_without_mutating_confidence_input(adaptive):
+    hidden = torch.tensor([[2.0, 4.0]])
+    model = SimpleNamespace(
+        enable_adaptive_verification=adaptive,
+        norm=lambda x: x / 2,
+        head=None,
+        logits_processor=lambda head, x: x,
+    )
+    logits = nvidia_dspark.DSparkDeepseekV4ForCausalLM.compute_logits(model, hidden)
+    torch.testing.assert_close(logits, hidden / 2 if adaptive else hidden)
+    torch.testing.assert_close(hidden, torch.tensor([[2.0, 4.0]]))
 
 
 def test_map_draft_to_target_is_identity_for_full_vocab():

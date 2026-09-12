@@ -23,6 +23,96 @@ from vllm.v1.kv_cache_interface import MLAAttentionSpec
 from vllm.v1.worker.block_table import get_block_table_width
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_compressed_decode_lengths_keep_capture_address():
+    """Capture uses four single-token rows; replay uses one four-token row."""
+    config = create_vllm_config(
+        model_name="Qwen/Qwen3-0.6B",
+        max_num_seqs=4,
+        max_num_batched_tokens=16,
+    )
+    config.speculative_config = SimpleNamespace(
+        num_speculative_tokens=3,
+        enable_adaptive_verification=True,
+    )
+    spec = MLAAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.bfloat16,
+        tokens_per_state=4,
+    )
+    builder = DeepseekV32IndexerMetadataBuilder(
+        kv_cache_spec=spec,
+        layer_names=["dummy"],
+        vllm_config=config,
+        device=torch.device("cuda"),
+        block_table_width=4,
+    )
+
+    def build(starts, seq_lens):
+        cpu_starts = torch.tensor(starts, dtype=torch.int32)
+        metadata = CommonAttentionMetadata(
+            query_start_loc=cpu_starts.cuda(),
+            query_start_loc_cpu=cpu_starts,
+            seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device="cuda"),
+            num_reqs=4,
+            num_actual_tokens=4,
+            max_query_len=int(cpu_starts.diff().max()),
+            max_seq_len=128,
+            block_table_tensor=torch.ones((4, 4), dtype=torch.int32, device="cuda"),
+            slot_mapping=torch.arange(4, dtype=torch.int64, device="cuda"),
+        )
+        return builder.build(0, metadata).decode.seq_lens
+
+    captured = build([0, 1, 2, 3, 4], [128, 128, 128, 128])
+    replay = build([0, 4, 4, 4, 4], [128, 0, 0, 0])
+    assert captured.data_ptr() == replay.data_ptr()
+    assert captured.flatten().tolist() == [31, 31, 31, 32]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_adaptive_flatten_replay_uses_device_query_lengths():
+    """Reallocate a fixed token budget without updating the CPU boundaries."""
+    builder = object.__new__(DeepseekV32IndexerMetadataBuilder)
+    builder.vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(enable_adaptive_verification=True)
+    )
+    builder.supports_varlen = False
+    builder.decode_seq_lens_buffer = torch.zeros(8, dtype=torch.int32, device="cuda")
+    builder.expanded_block_table_buffer = torch.zeros(
+        (8, 2), dtype=torch.int32, device="cuda"
+    )
+    builder.decode_lens_buffer = torch.zeros(8, dtype=torch.int32, device="cuda")
+    builder.arange_buffer = torch.arange(8, dtype=torch.int32, device="cuda")
+    lens = torch.tensor([3, 3], dtype=torch.int32, device="cuda")
+    starts = torch.tensor([0, 3], dtype=torch.int32, device="cuda")
+    seq = torch.tensor([13, 23], dtype=torch.int32, device="cuda")
+    blocks = torch.tensor([[5, 6], [7, 8]], dtype=torch.int32, device="cuda")
+    cpu_lens = torch.tensor([3, 3], dtype=torch.int32)
+
+    def prepare():
+        return builder._prepare_decode_tensors(
+            seq, blocks, lens, cpu_lens, starts, 2, 6, False, 4, 3
+        )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        prepare()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out_seq, out_blocks, _, batch_size, padded = prepare()
+    lens.copy_(torch.tensor([1, 5], device="cuda"))
+    starts.copy_(torch.tensor([0, 1], device="cuda"))
+    seq.copy_(torch.tensor([11, 25], device="cuda"))
+    graph.replay()
+    assert batch_size == 6 and not padded
+    assert out_seq.tolist() == [11, 21, 22, 23, 24, 25]
+    assert out_blocks.tolist() == [[5, 6]] + [[7, 8]] * 5
+
+
 @pytest.mark.parametrize(
     ("is_prefilling", "expected_treat_short_extends_as_decodes"),
     [

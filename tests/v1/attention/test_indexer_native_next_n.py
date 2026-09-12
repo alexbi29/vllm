@@ -7,6 +7,8 @@ asserts both that the architecture implements the requested `next_n` and that
 the schedule metadata was sized for the matching slot count.
 """
 
+from types import SimpleNamespace
+
 import pytest
 
 from vllm.platforms import current_platform
@@ -14,6 +16,18 @@ from vllm.utils.deep_gemm import _paged_mqa_logits_schedule_slots
 from vllm.v1.attention.backends.mla import indexer
 
 NUM_SMS = 114  # H100 PCIe
+
+
+def test_sm120_adaptive_uses_flattening_without_deepgemm(monkeypatch):
+    _set_arch(monkeypatch, 12, deep_gemm=False)
+    config = SimpleNamespace(
+        num_speculative_tokens=1,
+        speculative_config=SimpleNamespace(enable_adaptive_verification=True),
+    )
+    assert indexer.DeepseekV4IndexerBackend.supports_device_cpu_query_lens_mismatch()
+    assert indexer._use_flattening(config)
+    config.speculative_config.enable_adaptive_verification = False
+    assert not indexer._use_flattening(config)
 
 
 def _set_arch(monkeypatch, family: int, *, cuda: bool = True, deep_gemm: bool = True):

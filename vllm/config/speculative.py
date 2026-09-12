@@ -1534,7 +1534,9 @@ class SpeculativeConfig:
                     #   nst < block  -- the drafter emits one block per pass;
                     #                   fewer tokens feed the block / Markov-head
                     #                   machinery an unsupported layout and
-                    #                   garble output. Still an error.
+                    #                   garble output. Still an error for the
+                    #                   fixed-block path; adaptive drafting sizes
+                    #                   its query groups from the runtime budget.
                     #   nst > block  -- works, but drafts tokens that are never
                     #                   accepted. Measured on 2x GB10 (SM121a),
                     #                   DeepSeek-V4-Flash-0731, block_size=5:
@@ -1548,7 +1550,10 @@ class SpeculativeConfig:
                         None,
                     )
                     if dspark_block_size is not None:
-                        if self.num_speculative_tokens < dspark_block_size:
+                        if (
+                            self.num_speculative_tokens < dspark_block_size
+                            and not self.enable_adaptive_verification
+                        ):
                             raise ValueError(
                                 "DSpark requires num_speculative_tokens >= "
                                 f"dspark_block_size ({dspark_block_size}); got "

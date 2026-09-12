@@ -399,6 +399,17 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
     supports_draft_decode_metadata_update = True
 
+    @classmethod
+    def get_cudagraph_support(
+        cls, vllm_config: VllmConfig, kv_cache_spec: KVCacheSpec
+    ) -> AttentionCGSupport:
+        spec = vllm_config.speculative_config
+        if spec is not None and spec.enable_adaptive_verification:
+            # Decode indices are computed per token from device request IDs
+            # and query boundaries, including non-uniform verification rows.
+            return AttentionCGSupport.ALWAYS
+        return cls._cudagraph_support
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         assert isinstance(self.kv_cache_spec, SlidingWindowMLASpec | MLAAttentionSpec)
@@ -439,9 +450,14 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         # visible bidirectionally, so prefill index rows widen from
         # window_size to window_size + max_image_tokens. Text-only models keep
         # max_image_tokens == 0 and take the original code paths everywhere.
+        # Respect runtime image limits even when the checkpoint has a vision tower.
+        mm_config = self.vllm_config.model_config.multimodal_config
+        images_enabled = (
+            mm_config is None or mm_config.get_limit_per_prompt("image") > 0
+        )
         self.max_image_tokens = (
             getattr(hf_config, "vision_max_n_token", 0)
-            if getattr(hf_config, "vision_n_layers", 0) > 0
+            if getattr(hf_config, "vision_n_layers", 0) > 0 and images_enabled
             else 0
         )
         self.prefill_index_width = self.window_size + self.max_image_tokens

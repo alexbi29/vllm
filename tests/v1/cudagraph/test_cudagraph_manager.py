@@ -201,6 +201,8 @@ def _make_spec_decode_manager(
     capture_sizes: list[int] | None = None,
     num_speculative_tokens: int = 0,
     dynamic_spec_schedule: list[tuple[int, int, int]] | None = None,
+    cudagraph_mode: CUDAGraphMode = CUDAGraphMode.FULL_AND_PIECEWISE,
+    varlen_decode: bool = False,
 ) -> gpu_cudagraph_utils.CudaGraphManager:
     monkeypatch.setattr(
         gpu_cudagraph_utils,
@@ -219,11 +221,31 @@ def _make_spec_decode_manager(
             dynamic_spec_schedule=dynamic_spec_schedule,
         ),
         device=torch.device("cpu"),
-        cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+        cudagraph_mode=cudagraph_mode,
         decode_query_len=decode_query_len,
+        varlen_decode=varlen_decode,
     )
     manager._graphs_captured = True
     return manager
+
+
+def test_varlen_decode_only_needs_no_piecewise_graphs(monkeypatch):
+    manager = _make_spec_decode_manager(
+        monkeypatch,
+        decode_query_len=4,
+        cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
+        varlen_decode=True,
+    )
+    desc = manager.dispatch(
+        num_reqs=2,
+        num_tokens=5,
+        uniform_token_count=None,
+        num_active_loras=0,
+        max_query_len=4,
+    )
+    assert desc.cg_mode == CUDAGraphMode.FULL
+    assert desc.uniform_token_count is None
+    assert CUDAGraphMode.PIECEWISE not in manager._capture_descs
 
 
 def test_uniform_decode_pads_up_to_full_graph(monkeypatch):

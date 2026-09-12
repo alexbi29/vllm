@@ -3,6 +3,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from vllm.config.speculative import SpeculativeConfig
@@ -106,7 +107,10 @@ def _dspark_configs(block_size: int):
     return draft_model_config, target_model_config, target_parallel_config
 
 
-def test_dspark_block_size_is_independent_of_draft_depth(monkeypatch):
+@pytest.mark.parametrize("adaptive,num_tokens", [(False, 5), (True, 3)])
+def test_dspark_block_size_is_independent_of_draft_depth(
+    monkeypatch, adaptive, num_tokens
+):
     draft, target, parallel = _dspark_configs(5)
     # Vision-Exp has three draft layers but drafts a five-token block.
     draft.hf_config.n_predict = 3
@@ -115,11 +119,12 @@ def test_dspark_block_size_is_independent_of_draft_depth(monkeypatch):
     config = SpeculativeConfig(
         method="dspark",
         model="deepseek-ai/DeepSeek-V4-Flash-Vision-Exp",
-        num_speculative_tokens=5,
+        num_speculative_tokens=num_tokens,
+        enable_adaptive_verification=adaptive,
         target_model_config=target,
         target_parallel_config=parallel,
     )
-    assert config.num_speculative_tokens == 5
+    assert config.num_speculative_tokens == num_tokens
     assert config.parallel_drafting
     assert config.draft_model_config.hf_config.n_predict == 3
 

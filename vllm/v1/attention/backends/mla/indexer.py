@@ -256,8 +256,8 @@ class DeepseekV32IndexerBackend(AttentionBackend):
     @classmethod
     def supports_device_cpu_query_lens_mismatch(cls) -> bool:
         # Only the varlen paged MQA logits kernel takes per-request query
-        # lengths from device tensors natively. Hopper can instead flatten each
-        # query into a single-token row using device-built metadata.
+        # lengths from device tensors natively. Hopper and SM120 can instead
+        # flatten each query into a single-token row using device-built metadata.
         return _supports_varlen_paged_mqa_logits() or (
             _supports_flattened_device_query_lens()
         )
@@ -683,10 +683,11 @@ def _supports_varlen_paged_mqa_logits() -> bool:
 
 
 def _supports_flattened_device_query_lens() -> bool:
-    return (
-        current_platform.is_cuda()
-        and current_platform.is_device_capability_family(90)
-        and has_deep_gemm()
+    return current_platform.is_cuda() and (
+        (current_platform.is_device_capability_family(90) and has_deep_gemm())
+        # SM120 uses the single-query paged-MQA fallback. Flattening is
+        # built from device query lengths and needs no DeepGEMM kernel.
+        or current_platform.is_device_capability_family(120)
     )
 
 
@@ -1262,9 +1263,10 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     )
                     block_table = self.indexer_decode_block_table_buffer[:rows, :cols]
 
-            seq_lens_is_buffer_view = (use_native and next_n > 1) or (
-                not use_native and max_decode_len > 1
-            )
+            # Flattening always returns decode_seq_lens_buffer, even for
+            # single-token rows. Keep its address when compressing: varlen
+            # graphs capture single-token rows but replay multi-token requests.
+            seq_lens_is_buffer_view = (use_native and next_n > 1) or not use_native
 
             # DCP: localize the now-expanded per-token global bounds to this
             # rank's owned KV. Done here (after expansion) so each token's global

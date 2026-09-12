@@ -659,7 +659,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.kv_cache_config,
             use_replayssm=self.vllm_config.cache_config.use_replayssm,
         )
-        if self.adaptive_verification is not None:
+        if (
+            self.adaptive_verification is not None
+            and self.compilation_config.cudagraph_mode != CUDAGraphMode.FULL_DECODE_ONLY
+        ):
             self.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE
         cudagraph_mode = self.compilation_config.resolve_cudagraph_mode_and_sizes(
             attn_cg_support.min_cg_support,
