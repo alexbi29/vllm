@@ -35,7 +35,8 @@ def _uses_mhc_tilelang(vllm_config) -> bool:
     hf_config = vllm_config.model_config.hf_config
     return (
         current_platform.is_cuda_alike()
-        and getattr(hf_config, "model_type", None) == "deepseek_v4"
+        and getattr(hf_config, "model_type", None)
+        in ("deepseek_v4", "deepseek_v41")
         and all(hasattr(hf_config, attr) for attr in _MHC_HF_CONFIG_ATTRS)
     )
 

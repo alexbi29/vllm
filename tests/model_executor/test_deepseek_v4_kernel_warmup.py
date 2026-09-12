@@ -86,6 +86,12 @@ def test_mhc_warmup_gates_on_config_alone():
         assert runner.ran == []
 
 
+@pytest.mark.parametrize("model_type", ["deepseek_v4", "deepseek_v41"])
+def test_mhc_warmup_accepts_deepseek_v4_model_types(monkeypatch, model_type):
+    monkeypatch.setattr(mhc_warmup.current_platform, "is_cuda_alike", lambda: True)
+    assert mhc_warmup._uses_mhc_tilelang(_dsv4_vllm_config(model_type=model_type))
+
+
 @requires_gpu
 def test_mhc_warmup_token_sizes_cover_the_compile_key_thresholds():
     """tile_n switches below 8, n_splits at 16; a power-of-two ladder misses
