@@ -64,6 +64,12 @@ _DEEPSEEK_V4_SLOT_MAPPING_WARMUP_TOKENS = tuple(range(1, 17)) + (
 )
 
 
+def _paged_mqa_fallback_block_table_width(runner: "GPUModelRunner") -> int:
+    shard_count = runner.parallel_config.decode_context_parallel_size
+    denominator = runner.cache_config.block_size * shard_count
+    return (runner.max_model_len + denominator - 1) // denominator
+
+
 def _is_deepseek_v4_mtp_spec_decode(runner: "GPUModelRunner") -> bool:
     spec_config = getattr(runner, "speculative_config", None)
     return (
@@ -704,7 +710,7 @@ def _deepseek_v4_paged_mqa_rowwise_decode_warmup(runner: "GPUModelRunner") -> No
 
     Fidelity notes: ``stride_btb`` is a constexpr, so the block-table row width
     is taken from the live ``DeepseekV32IndexerMetadataBuilder`` buffer rather
-    than recomputed (the builder's width carries ``get_kv_cache_shard_count()``
+    than recomputed (the builder's width carries the DCP KV shard count
     under DCP; a formula that drops it would bake a stride production never
     uses and silently warm the wrong cubin). The KV strides likewise come from
     the bound cache tensor, which is a PADDED strided view (page stride 8640,
@@ -718,11 +724,9 @@ def _deepseek_v4_paged_mqa_rowwise_decode_warmup(runner: "GPUModelRunner") -> No
         from vllm.models.deepseek_v4.nvidia.ops.sm12x_mqa import (
             fp8_paged_mqa_logits_triton,
         )
-        from vllm.utils.math_utils import cdiv
         from vllm.v1.attention.backends.mla.indexer import (
             DeepseekV32IndexerMetadataBuilder,
         )
-        from vllm.v1.worker.cp_utils import get_kv_cache_shard_count
     except ImportError as exc:
         # A failed import here is a renamed symbol, not a benign "kernels
         # unavailable" case; surface it so a rename cannot silently no-op the
@@ -766,12 +770,7 @@ def _deepseek_v4_paged_mqa_rowwise_decode_warmup(runner: "GPUModelRunner") -> No
                         bt_widths.add(
                             int(builder.expanded_block_table_buffer.stride(0))
                         )
-        bt_widths.add(
-            cdiv(
-                runner.max_model_len,
-                runner.cache_config.block_size * get_kv_cache_shard_count(),
-            )
-        )
+        bt_widths.add(_paged_mqa_fallback_block_table_width(runner))
         bt_widths = {w for w in bt_widths if w > 0}
         if not bt_widths:
             return

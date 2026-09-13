@@ -23,6 +23,16 @@ def _mtp_runner(query_len: int = 3):
     )
 
 
+def test_paged_mqa_fallback_width_uses_configured_dcp_shards():
+    runner = SimpleNamespace(
+        max_model_len=1025,
+        cache_config=SimpleNamespace(block_size=64),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=2),
+    )
+
+    assert sm12x_warmup._paged_mqa_fallback_block_table_width(runner) == 9
+
+
 def test_deepseek_v4_mtp_uniform_decode_warmup_covers_c256():
     requests = sm12x_warmup._deepseek_v4_mtp_uniform_decode_warmup_requests(
         _mtp_runner(),
