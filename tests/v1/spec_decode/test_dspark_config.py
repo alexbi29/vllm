@@ -162,7 +162,17 @@ def test_dspark_sequential_sampling_writes_persistent_draft_logits(monkeypatch):
 
     speculator = object.__new__(DSparkSpeculator)
     speculator.num_speculative_steps = num_speculative_steps
-    speculator.sample_indices = torch.arange(num_reqs * num_speculative_steps)
+    speculator.max_num_reqs = max_num_reqs
+    # Fixed-stride step-major layout. Active entries still point at the
+    # request-major rows emitted by the draft backbone.
+    speculator.sample_indices = torch.zeros(
+        max_num_reqs * num_speculative_steps, dtype=torch.int64
+    )
+    for step in range(num_speculative_steps):
+        for req in range(num_reqs):
+            speculator.sample_indices[step * max_num_reqs + req] = (
+                req * num_speculative_steps + step
+            )
     speculator.sample_idx_mapping = state_ids.repeat_interleave(num_speculative_steps)
     speculator.sample_pos = torch.arange(10, 10 + num_reqs * num_speculative_steps)
     speculator.input_buffers = SimpleNamespace(
@@ -193,10 +203,9 @@ def test_dspark_sequential_sampling_writes_persistent_draft_logits(monkeypatch):
 
     class FakeModel:
         def compute_draft_logits(self, hidden_states):
-            return torch.arange(
-                hidden_states.shape[0] * vocab_size,
-                dtype=torch.float32,
-            ).view(hidden_states.shape[0], vocab_size)
+            return hidden_states * vocab_size + torch.arange(
+                vocab_size, dtype=torch.float32
+            )
 
         def markov_embed(self, previous_tokens):
             return previous_tokens.to(torch.float32).unsqueeze(-1)
@@ -235,7 +244,7 @@ def test_dspark_sequential_sampling_writes_persistent_draft_logits(monkeypatch):
     DSparkSpeculator._sample_sequential(
         speculator,
         num_reqs,
-        torch.zeros(num_reqs * num_speculative_steps, 1),
+        torch.arange(num_reqs * num_speculative_steps, dtype=torch.float32).view(-1, 1),
     )
 
     for col in range(num_speculative_steps):
@@ -263,6 +272,6 @@ def test_dspark_sequential_sampling_writes_persistent_draft_logits(monkeypatch):
     DSparkSpeculator._sample_sequential(
         speculator,
         num_reqs,
-        torch.zeros(num_reqs * num_speculative_steps, 1),
+        torch.arange(num_reqs * num_speculative_steps, dtype=torch.float32).view(-1, 1),
     )
     assert speculator.draft_logits is draft_logits

@@ -30,7 +30,7 @@ from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.model_executor.layers.linear import ReplicatedLinear, UnquantizedLinearMethod
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -1022,6 +1022,30 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
 
     def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
         return _linear_output(self.markov_w2(markov_embed))
+
+    def add_markov_bias(
+        self,
+        base_logits: torch.Tensor,
+        markov_embed: torch.Tensor,
+    ) -> torch.Tensor:
+        """Add the dense Markov projection, fusing it into the logits buffer."""
+        can_fuse = (
+            self.use_markov_inplace_add
+            and base_logits.is_cuda
+            and isinstance(self.markov_w2.quant_method, UnquantizedLinearMethod)
+            and base_logits.is_contiguous()
+            and base_logits.dtype == markov_embed.dtype
+            and markov_embed.dtype == self.markov_w2.weight.dtype
+            and base_logits.shape[-1] == self.markov_w2.weight.shape[0]
+        )
+        if can_fuse:
+            return base_logits.addmm_(markov_embed, self.markov_w2.weight.t())
+
+        markov_bias = _linear_output(self.markov_w2(markov_embed))
+        if self.use_markov_inplace_add and markov_bias.dtype == base_logits.dtype:
+            markov_bias.add_(base_logits)
+            return markov_bias
+        return base_logits + markov_bias
 
     def apply_dspark_markov_bias(
         self,

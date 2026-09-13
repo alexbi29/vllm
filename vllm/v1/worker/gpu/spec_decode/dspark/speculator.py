@@ -63,6 +63,7 @@ class DSparkSpeculator(DFlashSpeculator):
             self.num_query_per_req = self.num_speculative_steps
         else:
             self.num_query_per_req = 1 + self.num_speculative_steps
+        self.sample_step_major = True
 
         self._anchor_idx = (
             torch.arange(self.max_num_reqs, dtype=torch.int64, device=device)
@@ -169,11 +170,15 @@ class DSparkSpeculator(DFlashSpeculator):
         # Sequential Markov sampling over the backbone's output hidden states.
         n_spec = self.num_speculative_steps
         num_sample = num_reqs * n_spec
-        # Per-(req, position) head hidden, ordered (req, step).
-        sample_hidden = head_hidden[self.sample_indices[:num_sample]]
+        # sample_indices uses a fixed max_num_reqs stride, so select only the
+        # active columns. The LM head then emits contiguous rows per draft step.
+        sample_indices = self.sample_indices.view(n_spec, self.max_num_reqs)[
+            :, :num_reqs
+        ].reshape(num_sample)
+        sample_hidden = head_hidden[sample_indices]
         base_logits = self.model.compute_draft_logits(sample_hidden)
         vocab_size = base_logits.shape[-1]
-        base_logits = base_logits.view(num_reqs, n_spec, vocab_size)
+        base_logits = base_logits.view(n_spec, num_reqs, vocab_size)
 
         idx_map = self.sample_idx_mapping[:num_sample].view(num_reqs, n_spec)
         sample_pos = self.sample_pos[:num_sample].view(num_reqs, n_spec)
@@ -188,8 +193,11 @@ class DSparkSpeculator(DFlashSpeculator):
             markov_embed = self.model.markov_embed(prev)
             if self.enable_adaptive_verification:
                 confidence_markov_embeds.append(markov_embed)
-            bias = self.model.markov_bias(markov_embed)
-            logits_i = base_logits[:, i] + bias
+            add_markov_bias = getattr(self.model, "add_markov_bias", None)
+            if add_markov_bias is None:
+                logits_i = base_logits[i] + self.model.markov_bias(markov_embed)
+            else:
+                logits_i = add_markov_bias(base_logits[i], markov_embed)
             draft_sampled_i = self._sample_logits(
                 logits_i, idx_map[:, i], sample_pos[:, i], i
             )
@@ -197,8 +205,15 @@ class DSparkSpeculator(DFlashSpeculator):
             prev = draft_sampled_i
 
         if self.enable_adaptive_verification:
+            # Confidence rows remain request-major even though the LM head was
+            # evaluated step-major.
+            confidence_hidden = (
+                sample_hidden.view(n_spec, num_reqs, -1)
+                .transpose(0, 1)
+                .reshape(num_sample, -1)
+            )
             confidence = self.model.compute_confidence(
-                sample_hidden,
+                confidence_hidden,
                 torch.stack(confidence_markov_embeds, dim=1).flatten(0, 1),
             )
             self.draft_token_confidence_probs[:num_reqs] = confidence.view(
@@ -216,7 +231,14 @@ class DSparkSpeculator(DFlashSpeculator):
         assert self._draft_topk is not None
         n_spec = self.num_speculative_steps
         num_sample = num_reqs * n_spec
-        sample_hidden = head_hidden[self.sample_indices[:num_sample]]
+        # The sparse path consumes request-major rows. Convert the active
+        # columns from the shared step-major sample-index buffer.
+        sample_indices = (
+            self.sample_indices.view(n_spec, self.max_num_reqs)[:, :num_reqs]
+            .transpose(0, 1)
+            .reshape(num_sample)
+        )
+        sample_hidden = head_hidden[sample_indices]
         base_logits = self.model.compute_draft_logits(sample_hidden)
         base_logits = base_logits.view(num_reqs, n_spec, -1)
         base_values, draft_indices = base_logits.topk(self._draft_topk, dim=-1)

@@ -24,6 +24,7 @@ def _run_prepare(
     cp_rank: int = 0,
     cp_size: int = 1,
     cp_interleave: int = 1,
+    sample_step_major: bool = False,
 ):
     device = torch.device("cuda")
     max_num_reqs = 4
@@ -103,6 +104,7 @@ def _run_prepare(
         max_num_tokens,
         128,
         sample_from_anchor=True,
+        sample_step_major=sample_step_major,
     )
     torch.accelerator.synchronize()
     return SimpleNamespace(
@@ -116,6 +118,17 @@ def _run_prepare(
         temperature=temperature.cpu(),
         seeds=seeds.cpu(),
     )
+
+
+def test_prepare_dflash_inputs_step_major_sample_indices():
+    out = _run_prepare(
+        target_positions=[10, 11, 12, 13],
+        block_table_values=[0, 0, 7, 8, 9, 10, 11, 12],
+        sample_step_major=True,
+    )
+
+    # One active request occupies column zero of each max_num_reqs-wide step.
+    assert out.sample_indices.tolist() == [0, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0]
 
 
 def test_prepare_dflash_inputs_excludes_rejected_context_suffix():
