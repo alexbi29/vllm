@@ -253,6 +253,16 @@ class SamplingParams(
     """Controls the randomness of the sampling. Lower values make the model
     more deterministic, while higher values make the model more random. Zero
     means greedy sampling."""
+    watermarking: bool = True
+    """Whether to apply the engine's configured watermark to this request."""
+    reasoning_temperature: float | None = None
+    """Temperature used during the reasoning/thinking phase.
+    When set and different from ``temperature``, reasoning/thinking tokens are
+    sampled at ``reasoning_temperature`` while the answer is sampled at
+    ``temperature``. For example ``temperature=0.0, reasoning_temperature=0.7``
+    gives a greedy answer with stochastic reasoning. Leave unset (``None``,
+    the default) to use ``temperature`` for both phases — no split, no
+    overhead."""
     top_p: float = 1.0
     """Controls the cumulative probability of the top tokens to consider. Must
     be in (0, 1]. Set to 1 to consider all tokens."""
@@ -385,6 +395,8 @@ class SamplingParams(
         frequency_penalty: float | None = 0.0,
         repetition_penalty: float | None = 1.0,
         temperature: float | None = 1.0,
+        watermarking: bool = True,
+        reasoning_temperature: float | None = None,
         top_p: float | None = 1.0,
         top_k: int = 0,
         min_p: float = 0.0,
@@ -450,6 +462,8 @@ class SamplingParams(
             if repetition_penalty is None
             else repetition_penalty,
             temperature=1.0 if temperature is None else temperature,
+            watermarking=watermarking,
+            reasoning_temperature=reasoning_temperature,
             top_p=1.0 if top_p is None else top_p,
             top_k=top_k,
             min_p=min_p,
@@ -491,6 +505,19 @@ class SamplingParams(
             )
             self.temperature = max(self.temperature, _MAX_TEMP)
 
+        if self.reasoning_temperature is not None and (
+            0 < self.reasoning_temperature < _MAX_TEMP
+        ):
+            logger.warning(
+                "reasoning_temperature %s is less than %s, which may cause "
+                "numerical errors nan or inf in tensors. We have maxed it "
+                "out to %s.",
+                self.reasoning_temperature,
+                _MAX_TEMP,
+                _MAX_TEMP,
+            )
+            self.reasoning_temperature = max(self.reasoning_temperature, _MAX_TEMP)
+
         if self.seed == -1:
             self.seed = None
 
@@ -526,8 +553,16 @@ class SamplingParams(
 
         self._verify_args()
 
-        if self.temperature < _SAMPLING_EPS:
-            # Zero temperature means greedy sampling.
+        # ``reasoning_temperature is None`` means the reasoning phase mirrors
+        # ``temperature``, so the request is fully greedy iff ``temperature``
+        # is. A set, non-greedy reasoning_temperature keeps top_p/top_k/min_p
+        # alive for the (random) reasoning phase even when the answer is greedy.
+        reasoning_temp_greedy = (
+            self.reasoning_temperature is None
+            or self.reasoning_temperature < _SAMPLING_EPS
+        )
+        if self.temperature < _SAMPLING_EPS and reasoning_temp_greedy:
+            # Both phases are effectively zero -> fully greedy sampling.
             self.top_p = 1.0
             self.top_k = 0
             self.min_p = 0.0
@@ -544,6 +579,8 @@ class SamplingParams(
 
     def _verify_args(self) -> None:
         _verify_num_sequences(self.n, "n")
+        if self.extra_args:
+            self._verify_extra_args()
         if not -2.0 <= self.presence_penalty <= 2.0:
             raise VLLMValidationError(
                 f"presence_penalty must be in [-2, 2], got {self.presence_penalty}."
@@ -579,6 +616,13 @@ class SamplingParams(
                 f"temperature must be in [0, 2], got {self.temperature}.",
                 parameter="temperature",
                 value=self.temperature,
+            )
+        if self.reasoning_temperature is not None and self.reasoning_temperature < 0.0:
+            raise VLLMValidationError(
+                f"reasoning_temperature must be non-negative, got "
+                f"{self.reasoning_temperature}.",
+                parameter="reasoning_temperature",
+                value=self.reasoning_temperature,
             )
         if not 0.0 < self.top_p <= 1.0:
             raise VLLMValidationError(
@@ -655,6 +699,26 @@ class SamplingParams(
                 f"Got bad_words={self.bad_words}"
             )
 
+    def _verify_extra_args(self) -> None:
+        # JSON accepts arbitrary integers, but the engine's MessagePack
+        # transport only supports signed/unsigned 64-bit integers.
+        pending: list[Any] = [self.extra_args]
+        visited: set[int] = set()
+        while pending:
+            value = pending.pop()
+            if isinstance(value, int) and not -(2**63) <= value < 2**64:
+                raise VLLMValidationError(
+                    "extra_args integers must be between -2**63 and 2**64 - 1.",
+                    parameter="extra_args",
+                )
+            if isinstance(value, (dict, list, tuple)) and id(value) not in visited:
+                visited.add(id(value))
+                if isinstance(value, dict):
+                    pending.extend(value.keys())
+                    pending.extend(value.values())
+                else:
+                    pending.extend(value)
+
     def _verify_greedy_sampling(self) -> None:
         if self.n > 1:
             raise VLLMValidationError(
@@ -707,6 +771,17 @@ class SamplingParams(
                     text=prompt, add_special_tokens=False
                 )
 
+                if not prompt_token_ids:
+                    if not add_prefix_space:
+                        raise VLLMValidationError(
+                            "bad_words entries must tokenize to at least one token.",
+                            parameter="bad_words",
+                            value=self.bad_words,
+                        )
+                    # The unprefixed form is still enforceable when only the
+                    # optional space-prefixed form tokenizes to nothing.
+                    continue
+
                 # If no space at the beginning
                 # or if prefix space produces a new word token
                 if (not add_prefix_space) or (
@@ -743,7 +818,15 @@ class SamplingParams(
 
     @cached_property
     def sampling_type(self) -> SamplingType:
-        if self.temperature < _SAMPLING_EPS:
+        reasoning_temperature = (
+            self.temperature
+            if self.reasoning_temperature is None
+            else self.reasoning_temperature
+        )
+        if (
+            self.temperature < _SAMPLING_EPS
+            and reasoning_temperature < _SAMPLING_EPS
+        ):
             return SamplingType.GREEDY
         if self.seed is not None:
             return SamplingType.RANDOM_SEED
@@ -789,8 +872,9 @@ class SamplingParams(
         self._validate_logprobs(model_config)
         self._validate_logit_bias(model_config)
         self._validate_trace_replay(model_config, speculative_config)
+        self._validate_stop_token_ids(model_config)
         self._validate_logits_processors(model_config)
-        self._validate_allowed_token_ids(tokenizer)
+        self._validate_allowed_token_ids(model_config)
         self._validate_spec_decode(speculative_config)
         self._validate_diffusion(model_config)
         self._validate_structured_outputs(
@@ -858,6 +942,31 @@ class SamplingParams(
                     parameter="prompt_logprobs",
                     value=num_prompt_logprobs,
                 )
+
+    def _validate_stop_token_ids(self, model_config: ModelConfig) -> None:
+        """Validate stop_token_ids are within vocabulary range."""
+        if not self.stop_token_ids:
+            return
+
+        # stop_token_ids are used as column indices into the logits tensor,
+        # whose width is the model's vocab size (LogitsProcessor is built from
+        # config.vocab_size, InputBatch.vocab_size comes from
+        # model_config.get_vocab_size()), so use the same bound here — like
+        # _validate_logit_bias, which indexes the same tensor.
+        vocab_size = model_config.get_vocab_size()
+        invalid_token_ids = [
+            token_id
+            for token_id in self.stop_token_ids
+            if token_id < 0 or token_id >= vocab_size
+        ]
+
+        if invalid_token_ids:
+            raise VLLMValidationError(
+                f"token_id(s) {invalid_token_ids} in stop_token_ids contain "
+                f"out-of-vocab token ids. Vocabulary size: {vocab_size}",
+                parameter="stop_token_ids",
+                value=invalid_token_ids,
+            )
 
     def _validate_logit_bias(self, model_config: ModelConfig) -> None:
         """Validate logit_bias token IDs are within vocabulary range."""
@@ -941,7 +1050,7 @@ class SamplingParams(
 
         validate_logits_processors_parameters(model_config.logits_processors, self)
 
-    def _validate_allowed_token_ids(self, tokenizer: TokenizerLike | None) -> None:
+    def _validate_allowed_token_ids(self, model_config: ModelConfig) -> None:
         allowed_token_ids = self.allowed_token_ids
         if allowed_token_ids is None:
             return
@@ -953,19 +1062,24 @@ class SamplingParams(
                 value=allowed_token_ids,
             )
 
-        if tokenizer is not None:
-            vocab_size = len(tokenizer)
-            invalid_token_ids = [
-                token_id
-                for token_id in allowed_token_ids
-                if token_id < 0 or token_id >= vocab_size
-            ]
-            if invalid_token_ids:
-                raise VLLMValidationError(
-                    "allowed_token_ids contains out-of-vocab token id!",
-                    parameter="allowed_token_ids",
-                    value=invalid_token_ids,
-                )
+        # allowed_token_ids are client-supplied ids used as column indices
+        # into the logits tensor (the mask in InputBatch is sized by
+        # model_config.get_vocab_size(), and the ids are written as
+        # mask[req_index][allowed_token_ids]), so use the same bound here —
+        # like _validate_stop_token_ids and _validate_logit_bias, which
+        # index the same tensor.
+        vocab_size = model_config.get_vocab_size()
+        invalid_token_ids = [
+            token_id
+            for token_id in allowed_token_ids
+            if token_id < 0 or token_id >= vocab_size
+        ]
+        if invalid_token_ids:
+            raise VLLMValidationError(
+                "allowed_token_ids contains out-of-vocab token id!",
+                parameter="allowed_token_ids",
+                value=invalid_token_ids,
+            )
 
     def _validate_spec_decode(
         self,
@@ -974,19 +1088,22 @@ class SamplingParams(
         if speculative_config is None:
             return
 
-        # Adaptive verification compacts logits after the forward pass, while
-        # compute_topk_scores uses the scheduled layout in cu_num_logits_np.
-        # TODO(lucas): lift this restriction. The true boundaries exist on device as
-        # cu_num_logits; cu_num_generated_tokens is only read host-side after
-        # the logprobs D2H, so it could ride along on that copy.
         if (
-            speculative_config.enable_adaptive_verification
-            and self.num_logprobs is not None
+            self.reasoning_temperature is not None
+            and self.reasoning_temperature != self.temperature
         ):
-            raise ValueError(
-                "Output logprobs are not supported with DSpark confidence-based "
-                "verification."
+            logger.warning_once(
+                "reasoning_temperature is not supported with speculative "
+                "decoding yet. Ignoring reasoning_temperature and using "
+                "temperature for all generated tokens."
             )
+            self.reasoning_temperature = None
+            self.__dict__.pop("sampling_type", None)
+            if self.temperature < _SAMPLING_EPS:
+                self.top_p = 1.0
+                self.top_k = 0
+                self.min_p = 0.0
+                self._verify_greedy_sampling()
 
         # Some sampling parameters are not yet compatible with spec decoding.
         if self.min_p > _SAMPLING_EPS or self.logit_bias:
@@ -1203,6 +1320,8 @@ class SamplingParams(
             f"frequency_penalty={self.frequency_penalty}, "
             f"repetition_penalty={self.repetition_penalty}, "
             f"temperature={self.temperature}, "
+            f"watermarking={self.watermarking}, "
+            f"reasoning_temperature={self.reasoning_temperature}, "
             f"top_p={self.top_p}, "
             f"top_k={self.top_k}, "
             f"min_p={self.min_p}, "
@@ -1258,6 +1377,7 @@ class BeamSearchParams(
     length_penalty: float = 1.0
     include_stop_str_in_output: bool = False
     structured_outputs: StructuredOutputsParams | None = None
+    skip_special_tokens: bool = True
 
     def __post_init__(self) -> None:
         _verify_num_sequences(self.beam_width, "beam_width")
