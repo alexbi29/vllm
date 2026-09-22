@@ -20,6 +20,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.utils.torch_utils import current_stream
 from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.attention.backends.gemma4_compact import share_compact_kv_with_draft
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheSpec,
@@ -370,21 +371,7 @@ class Gemma4Proposer(SpecDecodeBaseProposer):
                     AttentionLayerBase,  # type: ignore[type-abstract]
                 )
                 target_attn = cast("Attention", all_layers[target_layer_name])
-                if hasattr(target_attn.impl, "compact_k_norm"):
-                    if (
-                        attn.head_size != target_attn.head_size
-                        or attn.num_kv_heads != target_attn.num_kv_heads
-                        or attn.kv_cache_dtype != target_attn.kv_cache_dtype
-                    ):
-                        raise ValueError("Gemma4 MTP compact KV geometry mismatch")
-                    attn.attn_backend = target_attn.attn_backend
-                    attn.backend = target_attn.backend
-                    draft_scale = attn.impl.scale
-                    attn.impl = copy(target_attn.impl)
-                    attn.impl.num_heads = attn.num_heads
-                    attn.impl.num_queries_per_kv = attn.num_heads // attn.num_kv_heads
-                    attn.impl.scale = draft_scale
-                    attn.impl.kv_sharing_target_layer_name = target_layer_name
+                share_compact_kv_with_draft(attn, target_attn, target_layer_name)
             logger.info(
                 "Gemma4 MTP: draft layer %d (%s) -> %s",
                 draft_idx,
