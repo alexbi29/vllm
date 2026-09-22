@@ -7,6 +7,7 @@ are packed along the last dim in the logical shape
 ``[num_blocks, num_kv_heads, block_size, head_size_qk + head_size_v]``.
 """
 
+import os
 from typing import ClassVar
 
 import torch
@@ -50,6 +51,27 @@ class TritonAttentionDiffKVMetadataBuilder(TritonAttentionMetadataBuilder):
         device: torch.device,
     ):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+
+        # thor patch: full-attention groups get more split-KV segments. The spec-verify launch covers a whole
+        # request per program (BLOCK_M = q_len x GQA group), so the segment axis must supply the CTAs:
+        # 64 segments = 1.3-1.5x (q=4) / 1.8-2.6x (q=8) per layer vs stock 16 on 46K-180K contexts.
+        # SWA groups keep the stock count (their loops are window-bounded).
+        full_attn_segments = int(os.environ.get("VLLM_DIFFKV_FULL_ATTN_SEGMENTS", "64"))
+        if (
+            getattr(kv_cache_spec, "sliding_window", None) is None
+            and full_attn_segments > self.num_par_softmax_segments
+        ):
+            self.num_par_softmax_segments = full_attn_segments
+            self.softmax_segm_max = torch.empty(
+                (self.seq_threshold_3D, self.num_heads_q, full_attn_segments),
+                dtype=torch.float32,
+                device=device,
+            )
+            self.softmax_segm_expsum = torch.empty(
+                (self.seq_threshold_3D, self.num_heads_q, full_attn_segments),
+                dtype=torch.float32,
+                device=device,
+            )
 
         head_size_v = TritonAttentionDiffKVBackend.head_size_v
         head_size_v_padded = next_power_of_2(head_size_v)
@@ -114,6 +136,8 @@ class TritonAttentionDiffKVImpl(TritonAttentionImpl):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        # Preserve the validated SM120 overlay query precision.
+        self.supports_quant_query_input = False
         if (
             is_quantized_kv_cache(self.kv_cache_dtype)
             and self.kv_cache_dtype
