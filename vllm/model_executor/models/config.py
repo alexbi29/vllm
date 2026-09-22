@@ -220,6 +220,10 @@ class Gemma4Config(VerifyAndUpdateConfig):
         to Triton.
         """
         model_config = vllm_config.model_config
+        # The multimodal wrapper builds the language model with text_config as
+        # its HF config. Preserve the opt-in there, including its compile hash.
+        if getattr(model_config.hf_config, "gemma4_compact_kv", False):
+            model_config.hf_text_config.gemma4_compact_kv = True
         arch_config = model_config.model_arch_config
         layer_types = getattr(model_config.hf_text_config, "layer_types", None) or []
         head_dims = {
