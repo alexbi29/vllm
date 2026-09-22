@@ -2,9 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Opt-in BF16 compact global KV for Gemma4 26B/31B; no dense cache expansion."""
 
+from copy import copy
 from dataclasses import replace
 from math import lcm
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar, cast
 
 import torch
 
@@ -16,6 +17,32 @@ from vllm.v1.attention.backends.triton_attn import (
 )
 from vllm.v1.attention.ops.gemma4_compact_cache import write_compact_cache
 from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec, KVQuantMode
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.attention import Attention
+
+
+def share_compact_kv_with_draft(
+    draft: "Attention", target: "Attention", target_layer_name: str
+) -> None:
+    """Give either model runner's MTP reader the target's cache representation."""
+    if not hasattr(target.impl, "compact_k_norm"):
+        return
+    if (
+        draft.head_size != target.head_size
+        or draft.num_kv_heads != target.num_kv_heads
+        or draft.kv_cache_dtype != target.kv_cache_dtype
+    ):
+        raise ValueError("Gemma4 MTP compact KV geometry mismatch")
+    draft.attn_backend = target.attn_backend
+    draft.backend = target.backend
+    draft_scale = draft.impl.scale
+    draft_impl = copy(cast("Gemma4CompactImpl", target.impl))
+    draft_impl.num_heads = draft.num_heads
+    draft_impl.num_queries_per_kv = draft.num_heads // draft.num_kv_heads
+    draft_impl.scale = draft_scale
+    draft_impl.kv_sharing_target_layer_name = target_layer_name
+    draft.impl = draft_impl
 
 
 def validate_compact_kv_dtype(
