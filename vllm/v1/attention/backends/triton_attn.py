@@ -660,7 +660,12 @@ class TritonAttentionImpl(AttentionImpl):
         # Per-token-head quantized KV cache: handled by the core unified
         # kernel, which dequantizes per-(token, head) inline via constexpr
         # branches (INT8 / FP8) and dispatches to the packed INT4 kernel.
-        if self._is_per_token_head_quant:
+        compact_k_norm = getattr(self, "compact_k_norm", None)
+        if compact_k_norm is not None:
+            key_cache, value_cache = kv_cache.transpose(1, 2).split([128, 512], dim=-1)
+            q_descale = k_descale = v_descale = None
+            k_scale_cache = v_scale_cache = None
+        elif self._is_per_token_head_quant:
             key_cache, value_cache = self._pth_key_value_caches(kv_cache)
             k_scale_cache = self._k_scale_cache
             v_scale_cache = self._v_scale_cache
@@ -744,6 +749,7 @@ class TritonAttentionImpl(AttentionImpl):
             mm_prefix_clamp_sliding_window=getattr(
                 layer, "mm_prefix_clamp_sliding_window", False
             ),
+            compact_k_norm=compact_k_norm,
         )
 
         return output

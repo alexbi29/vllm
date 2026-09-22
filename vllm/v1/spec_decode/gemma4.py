@@ -9,6 +9,7 @@ with the target model via cross-model KV sharing.
 
 from collections import defaultdict
 from copy import copy
+from typing import TYPE_CHECKING, cast
 
 import torch
 import torch.nn as nn
@@ -25,6 +26,9 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
 from vllm.v1.worker.utils import AttentionGroup
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.attention import Attention
 
 logger = init_logger(__name__)
 
@@ -356,6 +360,29 @@ class Gemma4Proposer(SpecDecodeBaseProposer):
             target_idx = candidates[-1]
             target_layer_name = f"{target_prefix}.{target_idx}.self_attn.attn"
             attn.kv_sharing_target_layer_name = target_layer_name
+            # The assistant must use the target's physical cache representation
+            # and KNorm weight, not its independently selected dense backend.
+            if getattr(target_config, "gemma4_compact_kv", False):
+                all_layers = get_layers_from_vllm_config(
+                    self.vllm_config,
+                    AttentionLayerBase,  # type: ignore[type-abstract]
+                )
+                target_attn = cast("Attention", all_layers[target_layer_name])
+                if hasattr(target_attn.impl, "compact_k_norm"):
+                    if (
+                        attn.head_size != target_attn.head_size
+                        or attn.num_kv_heads != target_attn.num_kv_heads
+                        or attn.kv_cache_dtype != target_attn.kv_cache_dtype
+                    ):
+                        raise ValueError("Gemma4 MTP compact KV geometry mismatch")
+                    attn.attn_backend = target_attn.attn_backend
+                    attn.backend = target_attn.backend
+                    draft_scale = attn.impl.scale
+                    attn.impl = copy(target_attn.impl)
+                    attn.impl.num_heads = attn.num_heads
+                    attn.impl.num_queries_per_kv = attn.num_heads // attn.num_kv_heads
+                    attn.impl.scale = draft_scale
+                    attn.impl.kv_sharing_target_layer_name = target_layer_name
             logger.info(
                 "Gemma4 MTP: draft layer %d (%s) -> %s",
                 draft_idx,
