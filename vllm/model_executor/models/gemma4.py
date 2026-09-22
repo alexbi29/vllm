@@ -400,6 +400,18 @@ def _validate_compact_weight_quantization(quant_config, qkv_proj) -> None:
     )
 
 
+def _compact_local_geometry_supported(config, global_kv_heads: int) -> bool:
+    local_layers = [
+        gemma4_layer_config(config, idx)
+        for idx, layer_type in enumerate(config.layer_types)
+        if layer_type == "sliding_attention"
+    ]
+    return bool(local_layers) and all(
+        layer.num_key_value_heads == 4 * global_kv_heads and layer.head_dim == 256
+        for layer in local_layers
+    )
+
+
 class Gemma4Attention(nn.Module):
     def __init__(
         self,
@@ -569,8 +581,7 @@ class Gemma4Attention(nn.Module):
                 or rope_parameters.get("rope_type") != "proportional"
                 or rope_parameters.get("partial_rotary_factor") != 0.25
                 or num_kv_shared_layers != 0
-                or config.num_key_value_heads != 4 * config.num_global_key_value_heads
-                or config.head_dim != 256
+                or not _compact_local_geometry_supported(config, num_kv_heads)
                 or vllm_config.lora_config is not None
             ):
                 raise ValueError(
