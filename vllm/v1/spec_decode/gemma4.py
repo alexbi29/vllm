@@ -9,6 +9,7 @@ with the target model via cross-model KV sharing.
 
 from collections import defaultdict
 from copy import copy
+from typing import TYPE_CHECKING, cast
 
 import torch
 import torch.nn as nn
@@ -19,6 +20,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.utils.torch_utils import current_stream
 from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.attention.backends.gemma4_compact import share_compact_kv_with_draft
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheSpec,
@@ -26,6 +28,9 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
 from vllm.v1.worker.utils import AttentionGroup
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.attention import Attention
 
 logger = init_logger(__name__)
 
@@ -358,6 +363,15 @@ class Gemma4Proposer(SpecDecodeBaseProposer):
             target_idx = candidates[-1]
             target_layer_name = f"{target_prefix}.{target_idx}.self_attn.attn"
             attn.kv_sharing_target_layer_name = target_layer_name
+            # The assistant must use the target's physical cache representation
+            # and KNorm weight, not its independently selected dense backend.
+            if getattr(target_config, "gemma4_compact_kv", False):
+                all_layers = get_layers_from_vllm_config(
+                    self.vllm_config,
+                    AttentionLayerBase,  # type: ignore[type-abstract]
+                )
+                target_attn = cast("Attention", all_layers[target_layer_name])
+                share_compact_kv_with_draft(attn, target_attn, target_layer_name)
             logger.info(
                 "Gemma4 MTP: draft layer %d (%s) -> %s",
                 draft_idx,

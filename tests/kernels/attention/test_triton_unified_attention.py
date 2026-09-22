@@ -121,6 +121,121 @@ def test_clamped_mm_prefix_preserves_noncausal_right_window(
     assert bounds.tolist() == [3, 68, 4096]
 
 
+@pytest.mark.parametrize("query_len,segments", [(1, 1), (1, 4), (5, 1)])
+@pytest.mark.parametrize("kv_heads", [1, 2])
+@pytest.mark.parametrize("layout", ["HND", "NHD"])
+@pytest.mark.parametrize("block_size", [16, 256])
+def test_gemma4_compact_kv(
+    query_len, segments, kv_heads, layout, block_size, monkeypatch
+):
+    """Compact paged attention agrees with explicit BF16 K reconstruction.
+
+    TRITON_INTERPRET=1 runs the same kernels on CPU without a GPU allocation.
+    Covers TP1/TP2 head counts, page indirection, a partial page, masked
+    cache writes, chunked prefill and segmented decode.
+    """
+    import os
+
+    from vllm.v1.attention.ops.gemma4_compact_cache import write_compact_cache
+
+    device = "cpu" if os.environ.get("TRITON_INTERPRET") == "1" else DEVICE_TYPE
+    if device == "cpu":
+        # Triton 3.7.1's interpreter feeds BF16 uint16 storage directly to
+        # numpy.matmul. Decode BF16 operands for the CPU-only test runner.
+        import numpy as np
+        from triton.runtime.interpreter import TensorHandle, interpreter_builder
+
+        from vllm.triton_utils import tl
+
+        original_dot = interpreter_builder.create_dot
+        original_cast = interpreter_builder.cast_impl
+
+        def bf16_cast(src, dst):
+            if src.dtype.scalar == tl.float32 and dst.scalar == tl.bfloat16:
+                # Its default FP32->BF16 cast also truncates instead of RNE.
+                data = torch.from_numpy(src.data).to(torch.bfloat16)
+                return TensorHandle(data.view(torch.uint16).numpy(), tl.bfloat16)
+            return original_cast(src, dst)
+
+        def bf16_dot(a, b, d, precision, max_imprecise):
+            def decode(x):
+                if x.dtype == tl.bfloat16:
+                    data = (x.data.astype(np.uint32) << 16).view(np.float32)
+                    return TensorHandle(data, tl.float32)
+                return x
+
+            return original_dot(decode(a), decode(b), d, precision, max_imprecise)
+
+        monkeypatch.setattr(interpreter_builder, "create_dot", bf16_dot)
+        monkeypatch.setattr(interpreter_builder, "cast_impl", bf16_cast)
+    torch.manual_seed(17)
+    dtype = torch.bfloat16
+    heads, length = kv_heads * 8, 37
+    key = torch.randn(length + 1, kv_heads, 512, dtype=dtype, device=device)
+    value = torch.randn_like(key)
+    norm = torch.randn(512, dtype=dtype, device=device)
+    query = torch.randn(query_len, heads, 512, dtype=dtype, device=device) * 0.1
+    cache = torch.full((4, kv_heads, block_size, 640), -7, dtype=dtype, device=device)
+    if layout == "NHD":
+        cache = cache.transpose(1, 2).contiguous().transpose(1, 2)
+    block_table = torch.tensor([[2, 0, 3, 1]], dtype=torch.int32, device=device)
+    positions = torch.arange(length, device=device)
+    slots = (
+        block_table[0, positions // block_size] * block_size + positions % block_size
+    )
+    slots = torch.cat((slots, torch.tensor([-1], device=device))).long()
+    write_compact_cache(key, value, cache, slots)
+    # Padding writes must not touch an unused page.
+    torch.testing.assert_close(cache[1], torch.full_like(cache[1], -7))
+    packed = cache[block_table[0, :3].long()].transpose(1, 2).reshape(-1, kv_heads, 640)
+    packed = packed[:length]
+    torch.testing.assert_close(packed[..., :64], key[:length, ..., :64])
+    torch.testing.assert_close(packed[..., 64:128], key[:length, ..., 256:320])
+    torch.testing.assert_close(packed[..., 128:], value[:length])
+
+    reconstructed = (value[:length].float() * norm.float()).to(dtype)
+    reconstructed[..., :64] = key[:length, ..., :64]
+    reconstructed[..., 256:320] = key[:length, ..., 256:320]
+    dense_k = reconstructed.repeat_interleave(8, dim=1).float()
+    dense_v = value[:length].repeat_interleave(8, dim=1).float()
+    logits = torch.einsum("qhd,khd->hqk", query.float(), dense_k)
+    mask = (
+        positions[None, :]
+        > (length - query_len + torch.arange(query_len, device=device))[:, None]
+    )
+    logits.masked_fill_(mask, -float("inf"))
+    expected = torch.einsum(
+        "hqk,khd->qhd", logits.softmax(-1).to(dtype).float(), dense_v
+    ).to(dtype)
+    output = torch.empty_like(query)
+    k, v = cache.transpose(1, 2).split([128, 512], dim=-1)
+    unified_attention(
+        q=query,
+        k=k,
+        v=v,
+        out=output,
+        cu_seqlens_q=torch.tensor([0, query_len], dtype=torch.int32, device=device),
+        max_seqlen_q=query_len,
+        seqused_k=torch.tensor([length], dtype=torch.int32, device=device),
+        max_seqlen_k=length,
+        softmax_scale=1.0,
+        causal=True,
+        window_size=(-1, -1),
+        block_table=block_table,
+        softcap=0.0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        seq_threshold_3D=8 if segments > 1 else None,
+        num_par_softmax_segments=segments,
+        softmax_segm_output=torch.empty((8, heads, segments, 512), device=device),
+        softmax_segm_max=torch.empty((8, heads, segments), device=device),
+        softmax_segm_expsum=torch.empty((8, heads, segments), device=device),
+        compact_k_norm=norm,
+    )
+    torch.testing.assert_close(output, expected, atol=0.016, rtol=0.02)
+
+
 def ref_paged_attn(
     query: torch.Tensor,
     key_cache: torch.Tensor,

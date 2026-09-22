@@ -3084,6 +3084,49 @@ def _grouping_config():
     )
 
 
+@pytest.mark.parametrize("tp_size", [1, 2])
+def test_gemma4_compact_global_pages_keep_storage_saving(tp_size):
+    """Hybrid grouping must not pad the 640-value global rows back to 1024."""
+    from vllm.v1.attention.backends.gemma4_compact import Gemma4CompactBackend
+
+    global_spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=2 // tp_size,
+        head_size=512,
+        dtype=torch.bfloat16,
+    )
+    compact_spec = Gemma4CompactBackend.customize_spec(global_spec)
+    local_spec = SlidingWindowSpec(
+        block_size=16,
+        num_kv_heads=8 // tp_size,
+        head_size=256,
+        dtype=torch.bfloat16,
+        sliding_window=1024,
+    )
+    specs = {
+        f"layer.{i}": compact_spec if i % 6 == 5 else local_spec for i in range(30)
+    }
+    groups = get_kv_cache_groups(_grouping_config(), specs)
+    seen = 0
+    for group in groups:
+        spec = group.kv_cache_spec
+        layer_specs = (
+            spec.kv_cache_specs.values()
+            if isinstance(spec, UniformTypeKVCacheSpecs)
+            else [spec]
+        )
+        for layer_spec in layer_specs:
+            if isinstance(layer_spec, FullAttentionSpec):
+                assert layer_spec.state_content_size_bytes == 1280
+                assert layer_spec.page_size_padded is None
+                seen += 1
+    assert seen
+    assert (
+        compact_spec.page_size_bytes // compact_spec.block_size * 8
+        == global_spec.page_size_bytes // global_spec.block_size * 5
+    )
+
+
 def test_hidden_state_group_preserves_hybrid_prefix_cache_granularity():
     block_size = 544
     full_spec = FullAttentionSpec(

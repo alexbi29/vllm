@@ -3,6 +3,7 @@
 
 from dataclasses import dataclass
 from enum import Enum
+from types import SimpleNamespace
 
 import pytest
 
@@ -11,6 +12,37 @@ from vllm.config.scheduler import SchedulerConfig
 from vllm.config.utils import get_hash_factors, hash_factors, normalize_value
 
 # Helpers
+
+
+@pytest.mark.parametrize("omit_v", [False, True])
+def test_gemma4_compact_kv_reaches_text_model_and_compilation_cache(omit_v):
+    from transformers import Gemma4Config
+
+    from vllm.config.model import ModelConfig
+    from vllm.model_executor.models.config import Gemma4Config as ModelVerifier
+
+    # Hashing needs config fields, not checkpoint loading or a device.
+    config = object.__new__(ModelConfig)
+    parent = Gemma4Config()
+    config.hf_config = parent.text_config
+    config.multimodal_config = None
+    standard = config.compute_hash()
+    parent.gemma4_compact_kv = True
+    parent.gemma4_compact_no_v_proj = omit_v
+    wrapper = SimpleNamespace(
+        hf_config=parent,
+        hf_text_config=parent.text_config,
+        model_arch_config=SimpleNamespace(total_num_hidden_layers=0),
+    )
+    ModelVerifier.verify_and_update_config(
+        SimpleNamespace(model_config=wrapper)  # type: ignore[arg-type]
+    )
+    assert config.hf_config.gemma4_compact_kv is True
+    assert config.hf_config.gemma4_compact_no_v_proj is omit_v
+    assert config.compute_hash() != standard
+    compact_hash = config.compute_hash()
+    config.hf_config.gemma4_compact_no_v_proj = not omit_v
+    assert config.compute_hash() != compact_hash
 
 
 def endswith_fqname(obj, suffix: str) -> bool:

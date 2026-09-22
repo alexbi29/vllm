@@ -26,7 +26,7 @@ import torch
 from torch import nn
 
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import CacheConfig, VllmConfig
+from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.config.utils import getattr_iter
 from vllm.distributed import (
     get_pp_group,
@@ -105,7 +105,13 @@ def _gemma4_layer_weights_mapper(config) -> WeightsMapper:
         else set()
     )
     qkv_shards: tuple[tuple[str, ShardIds], ...] = (("q", "q"), ("k", "k"), ("v", "v"))
-    k_eq_v_shards: tuple[tuple[str, ShardIds], ...] = (("q", "q"), ("k", ["k", "v"]))
+    omit_v_proj = getattr(config, "gemma4_compact_kv", False) and getattr(
+        config, "gemma4_compact_no_v_proj", False
+    )
+    k_eq_v_shards: tuple[tuple[str, ShardIds], ...] = (
+        ("q", "q"),
+        ("k", "k" if omit_v_proj else ["k", "v"]),
+    )
     stacked: dict[str, tuple[str, ShardIds]] = {
         ".mlp.gate_proj.": (".mlp.gate_up_proj.", 0),
         ".mlp.up_proj.": (".mlp.gate_up_proj.", 1),
@@ -363,6 +369,49 @@ class Gemma4Router(nn.Module):
         return router_logits
 
 
+def _validate_compact_weight_quantization(quant_config, qkv_proj) -> None:
+    if quant_config is None:
+        return
+    name = quant_config.get_name()
+    if name in ("fp8", "modelopt", "modelopt_fp4"):
+        return
+    if name == "compressed-tensors":
+        from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+        from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
+            CompressedTensorsW4A4Fp4,
+            CompressedTensorsW8A8Fp8,
+            CompressedTensorsW8A16Fp8,
+        )
+
+        if isinstance(qkv_proj.quant_method, UnquantizedLinearMethod) or isinstance(
+            getattr(qkv_proj, "scheme", None),
+            (
+                CompressedTensorsW8A8Fp8,
+                CompressedTensorsW8A16Fp8,
+                CompressedTensorsW4A4Fp4,
+            ),
+        ):
+            return
+    scheme_name = type(getattr(qkv_proj, "scheme", None)).__name__
+    raise ValueError(
+        "gemma4_compact_kv supports BF16, FP8, and NVFP4 attention weights "
+        "through fp8, modelopt, modelopt_fp4, or compatible compressed-tensors "
+        f"schemes; got {name!r} with {scheme_name}."
+    )
+
+
+def _compact_local_geometry_supported(config, global_kv_heads: int) -> bool:
+    local_layers = [
+        gemma4_layer_config(config, idx)
+        for idx, layer_type in enumerate(config.layer_types)
+        if layer_type == "sliding_attention"
+    ]
+    return bool(local_layers) and all(
+        layer.num_key_value_heads == 4 * global_kv_heads and layer.head_dim == 256
+        for layer in local_layers
+    )
+
+
 class Gemma4Attention(nn.Module):
     def __init__(
         self,
@@ -380,6 +429,20 @@ class Gemma4Attention(nn.Module):
         super().__init__()
         self.config = config
         self.hidden_size = hidden_size
+
+        vllm_config = get_current_vllm_config()
+        hf_config = vllm_config.model_config.hf_config
+        compact_enabled = getattr(hf_config, "gemma4_compact_kv", False)
+        if compact_enabled:
+            from vllm.v1.attention.backends.gemma4_compact import (
+                validate_compact_kv_dtype,
+            )
+
+            validate_compact_kv_dtype(
+                cache_config.cache_dtype if cache_config is not None else "auto",
+                torch.get_default_dtype(),
+                quant_config,
+            )
 
         tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
@@ -401,6 +464,13 @@ class Gemma4Attention(nn.Module):
         self.scaling = 1.0
 
         layer_idx = extract_layer_index(prefix)
+        self.is_sliding = config.layer_types[layer_idx] == "sliding_attention"
+        self.use_compact_kv = compact_enabled and not self.is_sliding
+        self.omit_v_proj = self.use_compact_kv and getattr(
+            hf_config, "gemma4_compact_no_v_proj", False
+        )
+        if self.omit_v_proj:
+            logger.info_once("Gemma4 compact global attention omits V projection")
         num_kv_shared_layers = getattr(config, "num_kv_shared_layers", 0)
         first_kv_shared_layer_idx = config.num_hidden_layers - num_kv_shared_layers
         self.is_kv_shared_layer = (
@@ -418,9 +488,7 @@ class Gemma4Attention(nn.Module):
                 prefix=f"{prefix}.q_proj",
             )
         else:
-            # QKVParallelLinear handles GQA correctly for all layer types.
-            # k_eq_v layers load K weights into both K and V slots via
-            # hf_to_vllm_mapper — no structural difference needed.
+            # Compact global attention derives V from K; omit its duplicate GEMM.
             self.qkv_proj = QKVParallelLinear(
                 hidden_size,
                 self.head_dim,
@@ -429,6 +497,7 @@ class Gemma4Attention(nn.Module):
                 bias=config.attention_bias,
                 quant_config=quant_config,
                 prefix=f"{prefix}.qkv_proj",
+                v_head_size=0 if self.omit_v_proj else None,
             )
             self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
             # V norm: no learnable scale (pure normalization only)
@@ -448,7 +517,6 @@ class Gemma4Attention(nn.Module):
 
         # Determine layer type and sliding window
         layer_type = config.layer_types[layer_idx]
-        self.is_sliding = layer_type == "sliding_attention"
         sliding_window = config.sliding_window if self.is_sliding else None
 
         # Initialize RoPE based on layer type.
@@ -499,6 +567,34 @@ class Gemma4Attention(nn.Module):
             is_neox_style=True,
         )
 
+        compact_args = {}
+        if self.use_compact_kv:
+            from vllm.v1.attention.backends.gemma4_compact import Gemma4CompactBackend
+
+            logger.info_once(
+                "Gemma4 compact BF16 global KV enabled (640 values/token/head)"
+            )
+
+            if (
+                not getattr(config, "attention_k_eq_v", False)
+                or self.head_dim != 512
+                or rope_parameters.get("rope_type") != "proportional"
+                or rope_parameters.get("partial_rotary_factor") != 0.25
+                or num_kv_shared_layers != 0
+                or not _compact_local_geometry_supported(config, num_kv_heads)
+                or vllm_config.lora_config is not None
+            ):
+                raise ValueError(
+                    "gemma4_compact_kv requires K=V global 512-d heads, "
+                    "proportional 25% RoPE, 256-d local heads with a 4:1 KV-head "
+                    "ratio, and no LoRA or target KV sharing"
+                )
+            _validate_compact_weight_quantization(quant_config, self.qkv_proj)
+            compact_args = {
+                "attn_backend": Gemma4CompactBackend,
+                "compact_k_norm": self.k_norm.weight,
+            }
+
         self.attn = Attention(
             self.num_heads,
             self.head_dim,
@@ -517,6 +613,7 @@ class Gemma4Attention(nn.Module):
             # per-query here.
             mm_prefix_clamp_sliding_window=self.is_sliding,
             prefix=f"{prefix}.attn",
+            **compact_args,
         )
 
     def forward(
@@ -534,10 +631,13 @@ class Gemma4Attention(nn.Module):
             q, _ = self.rotary_emb(positions, q, None)
             attn_output = self.attn(q, None, None)
         else:
-            # For k_eq_v, K weights are loaded into both K and V slots of
-            # qkv_proj, so V == K automatically.
+            # Compact global layers can omit the duplicate V projection.
             qkv, _ = self.qkv_proj(hidden_states)
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            v_size = 0 if self.omit_v_proj else self.kv_size
+            q, k, v = qkv.split([self.q_size, self.kv_size, v_size], dim=-1)
+            if self.use_compact_kv:
+                # Use canonical pre-norm K for both branches, including quantized GEMMs.
+                v = k
 
             q = q.unflatten(-1, (self.num_heads, self.head_dim))
             q = self.q_norm(q)
