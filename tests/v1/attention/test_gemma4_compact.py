@@ -239,7 +239,9 @@ def test_gemma4_loader_duplicates_shared_quantized_weights_and_scales(
     monkeypatch.setattr(
         gemma4,
         "AutoWeightsLoader",
-        lambda *a, **k: SimpleNamespace(load_weights=lambda iterator: dict(iterator)),
+        lambda *a, **k: SimpleNamespace(
+            load_weights=lambda iterator, **kwargs: dict(iterator)
+        ),
     )
     model = SimpleNamespace(
         config=SimpleNamespace(
@@ -311,9 +313,13 @@ def test_compact_cache_rejects_incompatible_storage(dtype, mode, head_size):
         Gemma4CompactBackend.customize_spec(spec)
 
 
-def test_gemma4_mtp_reads_target_compact_norm(monkeypatch):
+@pytest.mark.parametrize("runner", ["v1", "v2"])
+def test_gemma4_mtp_reads_target_compact_norm(monkeypatch, runner):
     """A draft's independent dense backend must not misinterpret compact KV."""
-    from vllm.v1.spec_decode import gemma4
+    if runner == "v1":
+        from vllm.v1.spec_decode import gemma4 as runner_module
+    else:
+        from vllm.v1.worker.gpu.spec_decode.gemma4 import speculator as runner_module
 
     norm = torch.randn(512, dtype=torch.bfloat16)
     target_impl = SimpleNamespace(
@@ -350,9 +356,16 @@ def test_gemma4_mtp_reads_target_compact_norm(monkeypatch):
     )
     target_name = "model.layers.0.self_attn.attn"
     monkeypatch.setattr(
-        gemma4, "get_layers_from_vllm_config", lambda *args: {target_name: target}
+        runner_module,
+        "get_layers_from_vllm_config",
+        lambda *args: {target_name: target},
     )
-    gemma4.Gemma4Proposer._setup_gemma4_kv_sharing(proposer, {target_name})
+    if runner == "v1":
+        runner_module.Gemma4Proposer._setup_gemma4_kv_sharing(proposer, {target_name})
+    else:
+        runner_module.Gemma4Speculator._setup_gemma4_kv_sharing(
+            proposer, proposer.model, {target_name}
+        )
     assert draft.attn_backend is Gemma4CompactBackend
     assert draft.impl.compact_k_norm is norm
     assert draft.impl.num_heads == 8

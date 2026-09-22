@@ -460,7 +460,7 @@ class TritonAttentionImpl(AttentionImpl):
         kv_cache_dtype: str,
         logits_soft_cap: float | None = None,
         attn_type: AttentionType = AttentionType.DECODER,
-        kv_sharing_target_layer_name: int | None = None,
+        kv_sharing_target_layer_name: str | None = None,
         sinks: torch.Tensor | None = None,
         use_alibi_sqrt: bool = False,
         chunk_lookback: int = -1,
