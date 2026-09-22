@@ -454,9 +454,15 @@ class Gemma4Attention(nn.Module):
         # Q/K norms with learnable weights handle scaling implicitly.
         self.scaling = 1.0
 
-        # QKVParallelLinear handles GQA correctly for all layer types.
-        # k_eq_v layers load K weights into both K and V slots via
-        # _weight_iterator remapping — no structural difference needed.
+        layer_idx = extract_layer_index(prefix)
+        self.is_sliding = config.layer_types[layer_idx] == "sliding_attention"
+        self.use_compact_kv = compact_enabled and not self.is_sliding
+        self.omit_v_proj = self.use_compact_kv and getattr(
+            hf_config, "gemma4_compact_no_v_proj", False
+        )
+        if self.omit_v_proj:
+            logger.info_once("Gemma4 compact global attention omits V projection")
+        # Compact global attention derives V from K; omit its duplicate GEMM.
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
             self.head_dim,
@@ -465,6 +471,7 @@ class Gemma4Attention(nn.Module):
             bias=config.attention_bias,
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
+            v_head_size=0 if self.omit_v_proj else None,
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
@@ -481,10 +488,7 @@ class Gemma4Attention(nn.Module):
         self.v_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps, has_weight=False)
 
         # Determine layer type and sliding window
-        layer_idx = extract_layer_index(prefix)
         layer_type = config.layer_types[layer_idx]
-        self.is_sliding = layer_type == "sliding_attention"
-        self.use_compact_kv = compact_enabled and not self.is_sliding
         sliding_window = config.sliding_window if self.is_sliding else None
 
         # Initialize RoPE based on layer type.
@@ -596,11 +600,11 @@ class Gemma4Attention(nn.Module):
         hidden_states: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
-        # Unified QKV path (works for both k_eq_v and standard layers).
-        # For k_eq_v, K weights are loaded into both K and V slots of
-        # qkv_proj, so V == K automatically.
+        # Compact global layers can omit V; otherwise K=V layers retain
+        # duplicate projection weights for the standard QKV interface.
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        v_size = 0 if self.omit_v_proj else self.kv_size
+        q, k, v = qkv.split([self.q_size, self.kv_size, v_size], dim=-1)
         if self.use_compact_kv:
             # The model has one global K/V projection. Use its canonical K
             # output for both branches, including quantized GEMM backends.
@@ -1692,7 +1696,10 @@ class Gemma4ForCausalLM(
             # when attention_k_eq_v is enabled). These layers have k_proj
             # but no v_proj in checkpoint — we duplicate k_proj as v_proj.
             k_eq_v_layer_indices: set[int] = set()
-            if use_k_eq_v:
+            omit_v_proj = getattr(self.config, "gemma4_compact_kv", False) and getattr(
+                self.config, "gemma4_compact_no_v_proj", False
+            )
+            if use_k_eq_v and not omit_v_proj:
                 for idx, lt in enumerate(self.config.layer_types):
                     if lt == "full_attention":
                         k_eq_v_layer_indices.add(idx)
