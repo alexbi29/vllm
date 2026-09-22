@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Iterable
+from copy import copy
 from itertools import islice
 
 import torch
@@ -270,11 +272,20 @@ class MiMoV2Attention(nn.Module):
             v_head_size=self.v_head_dim,
         )
 
+        # thor patch: VLLM_MIMO_OPROJ_FP8=1 quantizes the checkpoint's bf16 o_proj to FP8 at load (per-tensor W,
+        # dynamic activations). o_proj is ~1.25 ms/pass of bf16 GEMM at decode (profile 2026-09-22).
+        o_proj_quant_config = quant_config
+        if os.environ.get("VLLM_MIMO_OPROJ_FP8", "0") == "1":
+            from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+
+            o_proj_quant_config = Fp8Config(
+                is_checkpoint_fp8_serialized=False, activation_scheme="dynamic"
+            )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.v_head_dim,
             hidden_size,
             bias=False,
-            quant_config=quant_config if "mtp.layers" not in prefix else None,
+            quant_config=o_proj_quant_config if "mtp.layers" not in prefix else None,
             reduce_results=True,
             prefix=f"{prefix}.o_proj",
         )
@@ -296,6 +307,15 @@ class MiMoV2Attention(nn.Module):
         )
 
         sliding_window = sliding_window_size if sliding_window_size > -1 else None
+        if (
+            sliding_window is None
+            and cache_config is not None
+            and cache_config.sliding_window is not None
+        ):
+            # MiMo declares each layer's window explicitly. Do not let the
+            # model-wide SWA default turn a global layer into sliding attention.
+            cache_config = copy(cache_config)
+            cache_config.sliding_window = None
 
         # Use DiffKV backend when V has a different head dim than K.
         # Auto-pick FA-DiffKV when FA3/4 is usable on this device, else fall
@@ -389,6 +409,7 @@ class MiMoV2FlashDecoderLayer(nn.Module):
                 layer_id=layer_id,
                 rope_theta=getattr(config, "swa_rope_theta", rope_theta),
                 max_position_embeddings=max_position_embeddings,
+                cache_config=vllm_config.cache_config,
                 quant_config=quant_config,
                 partial_rotary_factor=getattr(config, "partial_rotary_factor", 1.0),
                 prefix=f"{prefix}.self_attn",
@@ -406,6 +427,7 @@ class MiMoV2FlashDecoderLayer(nn.Module):
                 layer_id=layer_id,
                 rope_theta=rope_theta,
                 max_position_embeddings=max_position_embeddings,
+                cache_config=vllm_config.cache_config,
                 quant_config=quant_config,
                 partial_rotary_factor=getattr(config, "partial_rotary_factor", 1.0),
                 prefix=f"{prefix}.self_attn",
