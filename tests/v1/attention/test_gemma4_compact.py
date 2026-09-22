@@ -30,6 +30,31 @@ def _weight_config(name):
     return compressed_tensors.CompressedTensorsConfig({}, [], "float-quantized")
 
 
+@pytest.mark.parametrize(
+    "local_kv_heads,local_head_dim,expected",
+    [(8, 256, True), (4, 256, False), (8, 128, False)],
+)
+def test_compact_geometry_resolves_per_layer_transformers_config(
+    local_kv_heads, local_head_dim, expected
+):
+    """New Transformers forbids reading heterogeneous head fields globally."""
+    from transformers.models.gemma4.configuration_gemma4 import Gemma4TextConfig
+
+    from vllm.model_executor.models.gemma4 import _compact_local_geometry_supported
+
+    config = Gemma4TextConfig(
+        num_hidden_layers=2,
+        num_kv_shared_layers=0,
+        layer_types=["sliding_attention", "full_attention"],
+        num_key_value_heads=local_kv_heads,
+        num_global_key_value_heads=2,
+        head_dim=local_head_dim,
+        global_head_dim=512,
+        attention_k_eq_v=True,
+    )
+    assert _compact_local_geometry_supported(config, 2) is expected
+
+
 @pytest.mark.parametrize("name", ["fp8", "modelopt", "modelopt_fp4"])
 def test_compact_accepts_quantized_weights_with_bf16_cache(name):
     from vllm.model_executor.models.gemma4 import _validate_compact_weight_quantization
