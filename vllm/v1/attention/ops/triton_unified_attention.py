@@ -289,6 +289,8 @@ def kernel_unified_attention(
     # instead of letting them override it. Default False preserves the
     # original (causal AND SW) OR mm_prefix behavior for all other models.
     MM_PREFIX_CLAMP_SW: tl.constexpr = False,
+    COMPACT_GEMMA4_KV: tl.constexpr = False,
+    compact_k_norm_ptr=None,
 ):
     # Per-(token, head) scale caches: used iff KV_QUANT_MODE in {2, 3}.
     USE_PER_TOKEN_HEAD_SCALES: tl.constexpr = (KV_QUANT_MODE >= 2) and (
@@ -430,7 +432,36 @@ def kernel_unified_attention(
             block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
         ).to(tl.int64)
 
-        if USE_TD:
+        if COMPACT_GEMMA4_KV:
+            tl.static_assert(HEAD_SIZE == 512 and KV_QUANT_MODE == 0)
+            v_offset = (
+                physical_block_idx[:, None] * stride_v_cache_0
+                + kv_head_idx * stride_v_cache_2
+                + offs_d[None, :] * stride_v_cache_3
+                + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
+            )
+            V_load = tl.load(
+                value_cache_ptr + v_offset,
+                mask=dim_mask[None, :] & tile_mask[:, None],
+                other=0.0,
+            )
+            rotated = (offs_d % 256) < 64
+            compact_dim = (offs_d // 256) * 64 + offs_d % 256
+            k_offset = (
+                physical_block_idx[None, :] * stride_k_cache_0
+                + kv_head_idx * stride_k_cache_2
+                + compact_dim[:, None] * stride_k_cache_3
+                + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+            )
+            rotated_k = tl.load(
+                key_cache_ptr + k_offset,
+                mask=rotated[:, None] & tile_mask[None, :],
+                other=0.0,
+            )
+            norm = tl.load(compact_k_norm_ptr + offs_d, dim_mask, other=0.0)
+            reconstructed = (V_load.T.to(tl.float32) * norm[:, None]).to(tl.bfloat16)
+            K_load = tl.where(rotated[:, None], rotated_k, reconstructed)
+        elif USE_TD:
             # All TILE_SIZE slots within a single KV tile map to one
             # physical block (guaranteed by ``BLOCK_SIZE % TILE_SIZE == 0``
             # from the static_assert above), so load the block index as
@@ -852,7 +883,21 @@ def unified_attention(
     # Gemma4: clamp mm_prefix bidirectional ranges by the sliding window.
     # Default False keeps the original behavior for every other model.
     mm_prefix_clamp_sliding_window: bool = False,
+    compact_k_norm=None,
 ):
+    if compact_k_norm is not None and (
+        q.shape[-1] != 512
+        or k.shape[-1] != 128
+        or v.shape[-1] != 512
+        or q.dtype != torch.bfloat16
+        or k.dtype != torch.bfloat16
+        or v.dtype != torch.bfloat16
+        or kv_quant_mode != KVQuantMode.NONE
+        or compact_k_norm.dtype != torch.bfloat16
+        or compact_k_norm.shape != (512,)
+        or use_td
+    ):
+        raise ValueError("Invalid compact Gemma4 KV layout or dtype")
     # Resolve causal: bool or per-seq tensor.
     use_per_seq_causal = isinstance(causal, torch.Tensor)
     use_causal = bool(causal) if not use_per_seq_causal else True
@@ -942,6 +987,10 @@ def unified_attention(
     # Tuned launch parameters; ``None`` lets Triton pick its defaults.
     launch_num_warps: int | None = None
     launch_num_stages: int | None = None
+    if compact_k_norm is not None:
+        # Reconstructing 512-wide K tiles needs more shared memory than the
+        # dense path. Bound pipelining to fit SM120's per-block limit.
+        launch_num_stages = 1
 
     # head_size 256 with many query rows per sequence (e.g. diffusion-gemma
     # bidirectional canvas passes) is prefill-shaped, but the decode-oriented
@@ -1168,6 +1217,8 @@ def unified_attention(
         USE_TD=use_td,
         USE_TD_QO=use_td_qo,
         MM_PREFIX_CLAMP_SW=mm_prefix_clamp_sliding_window,
+        COMPACT_GEMMA4_KV=compact_k_norm is not None,
+        compact_k_norm_ptr=compact_k_norm,
         **launch_kwargs,
     )
 
