@@ -174,12 +174,18 @@ def test_compact_auto_rejects_checkpoint_fp8_cache_but_honors_bf16(
     validate_compact_kv_dtype("bfloat16", torch.bfloat16, quant)
 
 
-@pytest.mark.parametrize("compact", [False, True])
-def test_compact_forward_uses_one_shared_projection_result(compact):
+@pytest.mark.parametrize(
+    "compact,omit_v", [(False, False), (True, False), (True, True)]
+)
+def test_compact_forward_uses_one_shared_projection_result(compact, omit_v):
     from vllm.model_executor.models.gemma4 import Gemma4Attention
 
     qkv = torch.cat(
-        [torch.full((2, 512), x, dtype=torch.bfloat16) for x in (1, 2, 9)], -1
+        [
+            torch.full((2, 512), x, dtype=torch.bfloat16)
+            for x in ((1, 2) if omit_v else (1, 2, 9))
+        ],
+        -1,
     )
     seen: dict[str, torch.Tensor] = {}
 
@@ -192,6 +198,7 @@ def test_compact_forward_uses_one_shared_projection_result(compact):
         q_size=512,
         kv_size=512,
         use_compact_kv=compact,
+        omit_v_proj=omit_v,
         num_heads=1,
         num_kv_heads=1,
         head_dim=512,
@@ -211,8 +218,10 @@ def test_compact_forward_uses_one_shared_projection_result(compact):
 
 
 @pytest.mark.parametrize("weight_dtype", [torch.float8_e4m3fn, torch.uint8])
+@pytest.mark.parametrize("omit_v", [False, True])
+@pytest.mark.parametrize("compact_enabled", [False, True])
 def test_gemma4_loader_duplicates_shared_quantized_weights_and_scales(
-    weight_dtype, monkeypatch
+    weight_dtype, omit_v, compact_enabled
 ):
     from vllm.model_executor.models import gemma4
 
@@ -220,38 +229,31 @@ def test_gemma4_loader_duplicates_shared_quantized_weights_and_scales(
     weights = [(prefix + "weight", torch.ones(2, 4).to(weight_dtype))]
     weights += [
         (prefix + field, torch.tensor([0.25]))
-        for field in (
-            "weight_scale",
-            "weight_scale_2",
-            "input_scale",
-        )
+        for field in ("weight_scale", "weight_scale_2", "input_scale")
     ]
     local_name = "model.language_model.layers.0.self_attn.k_proj.weight"
     weights.append((local_name, torch.ones(2, 4).to(weight_dtype)))
-    monkeypatch.setattr(
-        gemma4,
-        "AutoWeightsLoader",
-        lambda *a, **k: SimpleNamespace(load_weights=lambda iterator: dict(iterator)),
+    config = SimpleNamespace(
+        num_hidden_layers=2,
+        attention_k_eq_v=True,
+        gemma4_compact_kv=compact_enabled,
+        gemma4_compact_no_v_proj=omit_v,
+        layer_types=["sliding_attention", "full_attention"],
     )
-    model = SimpleNamespace(
-        config=SimpleNamespace(
-            attention_k_eq_v=True,
-            layer_types=["sliding_attention", "full_attention"],
-            tie_word_embeddings=False,
-        )
-    )
-    loaded = gemma4.Gemma4ForCausalLM.load_weights(model, weights)
+    mapper = gemma4._gemma4_layer_weights_mapper(config)
+    mapped = mapper.apply(gemma4.Gemma4ForCausalLM.hf_to_vllm_mapper.apply(weights))
+    loaded = {(name, tensor.shard_id): tensor for name, tensor in mapped}
     for name, weight in weights[:-1]:
-        k_name = name.replace("model.language_model.", "model.")
-        v_name = k_name.replace("k_proj", "v_proj")
-        torch.testing.assert_close(
-            loaded[k_name].float(), weight.float(), rtol=0, atol=0
+        packed = name.replace("model.language_model.", "model.").replace(
+            "k_proj", "qkv_proj"
         )
-        torch.testing.assert_close(
-            loaded[v_name].float(), weight.float(), rtol=0, atol=0
-        )
-        assert loaded[v_name].dtype == weight.dtype
-    assert "model.layers.0.self_attn.v_proj.weight" not in loaded
+        torch.testing.assert_close(loaded[packed, "k"].float(), weight.float())
+        if compact_enabled and omit_v:
+            assert (packed, "v") not in loaded
+        else:
+            torch.testing.assert_close(loaded[packed, "v"].float(), weight.float())
+            assert loaded[packed, "v"].dtype == weight.dtype
+    assert ("model.layers.0.self_attn.qkv_proj.weight", "v") not in loaded
 
 
 def test_compact_metadata_uses_global_head_width():
