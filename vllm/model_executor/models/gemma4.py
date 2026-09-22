@@ -107,7 +107,13 @@ def _gemma4_layer_weights_mapper(config) -> WeightsMapper:
         else set()
     )
     qkv_shards: tuple[tuple[str, ShardIds], ...] = (("q", "q"), ("k", "k"), ("v", "v"))
-    k_eq_v_shards: tuple[tuple[str, ShardIds], ...] = (("q", "q"), ("k", ["k", "v"]))
+    omit_v_proj = getattr(config, "gemma4_compact_kv", False) and getattr(
+        config, "gemma4_compact_no_v_proj", False
+    )
+    k_eq_v_shards: tuple[tuple[str, ShardIds], ...] = (
+        ("q", "q"),
+        ("k", "k" if omit_v_proj else ["k", "v"]),
+    )
     stacked: dict[str, tuple[str, ShardIds]] = {
         ".mlp.gate_proj.": (".mlp.gate_up_proj.", 0),
         ".mlp.up_proj.": (".mlp.gate_up_proj.", 1),
@@ -472,6 +478,12 @@ class Gemma4Attention(nn.Module):
             num_kv_shared_layers > 0 and layer_idx >= first_kv_shared_layer_idx
         )
         self.is_sliding = layer_type == "sliding_attention"
+        self.use_compact_kv = compact_enabled and not self.is_sliding
+        self.omit_v_proj = self.use_compact_kv and getattr(
+            hf_config, "gemma4_compact_no_v_proj", False
+        )
+        if self.omit_v_proj:
+            logger.info_once("Gemma4 compact global attention omits V projection")
 
         if self.is_kv_shared_layer:
             # K/V come from the target layer's cache, so like HF this layer
@@ -484,9 +496,7 @@ class Gemma4Attention(nn.Module):
                 prefix=f"{prefix}.q_proj",
             )
         else:
-            # QKVParallelLinear handles GQA correctly for all layer types.
-            # k_eq_v layers load K weights into both K and V slots via
-            # hf_to_vllm_mapper — no structural difference needed.
+            # Compact global attention derives V from K; omit its duplicate GEMM.
             self.qkv_proj = QKVParallelLinear(
                 hidden_size,
                 self.head_dim,
@@ -495,8 +505,9 @@ class Gemma4Attention(nn.Module):
                 bias=config.attention_bias,
                 quant_config=quant_config,
                 prefix=f"{prefix}.qkv_proj",
+                v_head_size=0 if self.omit_v_proj else None,
             )
-            if attention_k_eq_v and not self.is_sliding:
+            if attention_k_eq_v and not self.is_sliding and not self.omit_v_proj:
                 # k_proj LoRA must be applied to the V slice
                 self.qkv_proj.lora_packed_modules = ["q_proj", "k_proj", "k_proj"]
             self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
@@ -515,7 +526,6 @@ class Gemma4Attention(nn.Module):
         # Q norm: output = norm(x) * weight (learnable per-head scale)
         self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
-        self.use_compact_kv = compact_enabled and not self.is_sliding
         sliding_window = config.sliding_window if self.is_sliding else None
 
         # Initialize RoPE based on layer type.
@@ -631,10 +641,10 @@ class Gemma4Attention(nn.Module):
             q, _ = self.rotary_emb(positions, q, None)
             attn_output = self.attn(q, None, None)
         else:
-            # For k_eq_v, K weights are loaded into both K and V slots of
-            # qkv_proj, so V == K automatically.
+            # Compact global layers can omit the duplicate V projection.
             qkv, _ = self.qkv_proj(hidden_states)
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            v_size = 0 if self.omit_v_proj else self.kv_size
+            q, k, v = qkv.split([self.q_size, self.kv_size, v_size], dim=-1)
             if self.use_compact_kv:
                 # Use canonical pre-norm K for both branches, including quantized GEMMs.
                 v = k
