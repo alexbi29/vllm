@@ -19,7 +19,8 @@ from vllm.config.utils import (
 # Helpers
 
 
-def test_gemma4_compact_kv_reaches_text_model_and_compilation_cache():
+@pytest.mark.parametrize("omit_v", [False, True])
+def test_gemma4_compact_kv_reaches_text_model_and_compilation_cache(omit_v):
     from transformers import Gemma4Config
 
     from vllm.config.model import ModelConfig
@@ -32,6 +33,7 @@ def test_gemma4_compact_kv_reaches_text_model_and_compilation_cache():
     config.multimodal_config = None
     standard = config.compute_hash()
     parent.gemma4_compact_kv = True
+    parent.gemma4_compact_no_v_proj = omit_v
     wrapper = SimpleNamespace(
         hf_config=parent,
         hf_text_config=parent.text_config,
@@ -41,7 +43,11 @@ def test_gemma4_compact_kv_reaches_text_model_and_compilation_cache():
         SimpleNamespace(model_config=wrapper)  # type: ignore[arg-type]
     )
     assert config.hf_config.gemma4_compact_kv is True
+    assert config.hf_config.gemma4_compact_no_v_proj is omit_v
     assert config.compute_hash() != standard
+    compact_hash = config.compute_hash()
+    config.hf_config.gemma4_compact_no_v_proj = not omit_v
+    assert config.compute_hash() != compact_hash
 
 
 def endswith_fqname(obj, suffix: str) -> bool:
