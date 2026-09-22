@@ -224,6 +224,9 @@ class Gemma4Config(VerifyAndUpdateConfig):
         # its HF config. Preserve the opt-in there, including its compile hash.
         if getattr(model_config.hf_config, "gemma4_compact_kv", False):
             model_config.hf_text_config.gemma4_compact_kv = True
+            model_config.hf_text_config.gemma4_compact_no_v_proj = getattr(
+                model_config.hf_config, "gemma4_compact_no_v_proj", False
+            )
         arch_config = model_config.model_arch_config
         layer_types = getattr(model_config.hf_text_config, "layer_types", None) or []
         head_dims = {

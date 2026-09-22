@@ -1035,6 +1035,10 @@ def unified_attention(
     TILE_SIZE_DECODE = _get_tile_size(
         head_size, sliding_window_val, q.element_size(), is_prefill=False
     )
+    if compact_k_norm is not None and current_platform.is_device_capability(120):
+        # The 32-token compact tile fits SM120 with one pipeline stage and
+        # amortizes reconstruction better than the dense BF16 decode default.
+        TILE_SIZE_DECODE = 32
 
     # Wider KV tile for the tuned large-head path (see above). Only the 2D
     # path (used when max_seqlen_q > 1) reads TILE_SIZE_PREFILL.
