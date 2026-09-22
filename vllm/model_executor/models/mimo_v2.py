@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Iterable
 from itertools import islice
 
@@ -292,11 +293,20 @@ class MiMoV2Attention(nn.Module):
                 v_head_size=self.v_head_dim,
             )
 
+        # thor patch: VLLM_MIMO_OPROJ_FP8=1 quantizes the checkpoint's bf16 o_proj to FP8 at load (per-tensor W,
+        # dynamic activations). o_proj is ~1.25 ms/pass of bf16 GEMM at decode (profile 2026-09-22).
+        o_proj_quant_config = quant_config
+        if os.environ.get("VLLM_MIMO_OPROJ_FP8", "0") == "1":
+            from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+
+            o_proj_quant_config = Fp8Config(
+                is_checkpoint_fp8_serialized=False, activation_scheme="dynamic"
+            )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.v_head_dim,
             hidden_size,
             bias=False,
-            quant_config=quant_config if "mtp.layers" not in prefix else None,
+            quant_config=o_proj_quant_config if "mtp.layers" not in prefix else None,
             reduce_results=True,
             prefix=f"{prefix}.o_proj",
         )
