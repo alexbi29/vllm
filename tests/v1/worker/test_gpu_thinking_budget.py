@@ -299,3 +299,109 @@ def test_v2_thinking_budget_continues_end_prefix_from_prompt():
 
     assert out[0, END_B] == pytest.approx(1.0e9)
     assert out[0, END_A] == 0
+
+
+START_A = 94
+START_B = 95
+
+
+class MockBlockReentryReasoningConfig(MockReasoningConfig):
+    block_reasoning_reentry = True
+
+
+class MockBlockReentryMultiTokenStartReasoningConfig:
+    reasoning_start_token_ids = [START_A, START_B]
+    reasoning_end_token_ids = [END]
+    natural_reasoning_end_token_ids = [END]
+    block_reasoning_reentry = True
+
+
+def _block_state(tokens, prompt_len, config, budget=3):
+    req_states = _make_req_states(tokens, prompt_len=prompt_len)
+    state = ThinkingBudgetState(req_states, config)
+    state.add_request(3, SamplingParams(thinking_token_budget=budget))
+    state.apply_staged_writes()
+    return state
+
+
+def test_v2_block_reentry_masks_start_after_spent_block():
+    """A block that closed in the output after spending the whole budget
+    keeps the model from reopening one; nothing else is touched."""
+    state = _block_state(
+        [1, START, 10, 11, 12, END, 20], 1, MockBlockReentryReasoningConfig()
+    )
+    logits = torch.zeros((1, VOCAB_SIZE), device=DEVICE)
+    out = _apply(state, logits, input_ids=[20], local_pos=[0])
+
+    assert out[0, START] == -float("inf")
+    out[0, START] = 0
+    assert torch.all(out == 0)
+
+
+def test_v2_block_reentry_is_off_by_default():
+    state = _block_state([1, START, 10, 11, 12, END, 20], 1, MockReasoningConfig())
+    logits = torch.zeros((1, VOCAB_SIZE), device=DEVICE)
+    out = _apply(state, logits, input_ids=[20], local_pos=[0])
+
+    assert torch.all(out == 0)
+
+
+def test_v2_block_reentry_allows_reopen_after_short_block():
+    """A natural end inside the budget spends nothing to block on."""
+    state = _block_state([1, START, 10, END, 20], 1, MockBlockReentryReasoningConfig())
+    logits = torch.zeros((1, VOCAB_SIZE), device=DEVICE)
+    out = _apply(state, logits, input_ids=[20], local_pos=[0])
+
+    assert torch.all(out == 0)
+
+
+def test_v2_block_reentry_ignores_block_closed_in_prompt():
+    """Reasoning rendered into the prompt (an earlier turn) must never stop
+    this generation from thinking."""
+    state = _block_state(
+        [1, START, 10, 11, 12, END, 13], 7, MockBlockReentryReasoningConfig()
+    )
+    logits = torch.zeros((1, VOCAB_SIZE), device=DEVICE)
+    out = _apply(state, logits, input_ids=[13], local_pos=[0])
+
+    assert torch.all(out == 0)
+
+
+def test_v2_block_reentry_counts_block_opened_in_prompt():
+    """A template that opens the block in the prompt (a tool round) and a
+    generation that spends the budget and closes it: that is this request's
+    budget, so the block applies."""
+    state = _block_state(
+        [1, START, 10, 11, 12, END, 20], 3, MockBlockReentryReasoningConfig()
+    )
+    logits = torch.zeros((1, VOCAB_SIZE), device=DEVICE)
+    out = _apply(state, logits, input_ids=[20], local_pos=[0])
+
+    assert out[0, START] == -float("inf")
+
+
+def test_v2_block_reentry_multi_token_start_masks_only_marker_tail():
+    """For a multi-token start marker, only its last token is masked, and only
+    where the tail already holds the rest of the marker."""
+    config = MockBlockReentryMultiTokenStartReasoningConfig()
+    state = _block_state([1, START_A, START_B, 10, 11, 12, END, 20], 1, config)
+    logits = torch.zeros((2, VOCAB_SIZE), device=DEVICE)
+    out = _apply(state, logits, input_ids=[20, START_A], local_pos=[0, 1])
+
+    # position 0: tail is 20, not the marker prefix -> untouched
+    assert torch.all(out[0] == 0)
+    # position 1: draft token START_A extends the tail -> START_B masked
+    assert out[1, START_B] == -float("inf")
+    assert out[1, START_A] == 0
+
+
+def test_v2_block_reentry_applies_within_a_spec_decode_step():
+    """The forced end drafted at position 1 closes the block for position 2
+    in the same step: END is forced first, then the start marker blocked."""
+    state = _block_state([1, START, 10, 11, 12], 1, MockBlockReentryReasoningConfig())
+    logits = torch.zeros((2, VOCAB_SIZE), device=DEVICE)
+    out = _apply(state, logits, input_ids=[12, END], local_pos=[0, 1])
+
+    assert out[0, END] == pytest.approx(1.0e9)
+    assert out[0, START] == 0
+    assert out[1, START] == -float("inf")
