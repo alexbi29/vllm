@@ -49,6 +49,9 @@ class ThinkingBudgetState:
         self.enabled = bool(start_ids and end_ids and natural_end_ids)
         if not self.enabled:
             return
+        self.block_reentry = bool(
+            getattr(reasoning_config, "block_reasoning_reentry", False)
+        )
 
         self.thinking_token_budget = UvaBackedTensor(
             self.max_num_reqs, dtype=torch.int32
@@ -122,6 +125,7 @@ class ThinkingBudgetState:
             self.thinking_token_budget.gpu,
             self.req_states.all_token_ids.gpu,
             self.req_states.total_len.gpu,
+            self.req_states.prompt_len.gpu,
             ctx.input_ids,
             ctx.expanded_local_pos,
             self.cached_last_start,
@@ -130,6 +134,7 @@ class ThinkingBudgetState:
             self.reasoning_start_token_ids,
             self.natural_reasoning_end_token_ids,
             self.reasoning_end_token_ids,
+            block_reentry=self.block_reentry,
         )
 
 
@@ -259,6 +264,7 @@ def _thinking_budget_kernel(
     all_token_ids_ptr,
     all_token_ids_stride,
     total_len_ptr,
+    prompt_len_ptr,
     input_ids_ptr,
     expanded_local_pos_ptr,
     cached_last_start_ptr,
@@ -269,6 +275,7 @@ def _thinking_budget_kernel(
     START_LEN: tl.constexpr,
     NATURAL_END_LEN: tl.constexpr,
     END_LEN: tl.constexpr,
+    BLOCK_REENTRY: tl.constexpr,
 ):
     token_idx = tl.program_id(0).to(tl.int64)
     req_state_idx = tl.load(expanded_idx_mapping_ptr + token_idx)
@@ -324,7 +331,39 @@ def _thinking_budget_kernel(
         if end_match:
             last_end = i
 
-    if last_start < 0 or last_start <= last_end:
+    if last_start < 0:
+        return
+    if last_start <= last_end:
+        # Outside a reasoning block. With BLOCK_REENTRY, a block that closed
+        # in the generated output after spending the whole budget (a forced
+        # end, or a natural one exactly at it) keeps the model from opening
+        # another: mask the start marker's last token wherever the tail
+        # already holds the rest of the marker.
+        if BLOCK_REENTRY:
+            prompt_len = tl.load(prompt_len_ptr + req_state_idx)
+            spent = last_end - (last_start + START_LEN)
+            if last_end >= prompt_len and spent >= budget:
+                prefix_match = effective_len >= START_LEN - 1
+                for j in tl.static_range(0, START_LEN - 1):
+                    expected = tl.load(reasoning_start_token_ids_ptr + j)
+                    actual = _load_effective_token(
+                        all_token_ids_ptr,
+                        all_token_ids_stride,
+                        input_ids_ptr,
+                        cur_req_first_pos,
+                        req_state_idx,
+                        total_len,
+                        effective_len - (START_LEN - 1) + j,
+                    )
+                    prefix_match = prefix_match & (actual == expected)
+                if prefix_match:
+                    block_token_id = tl.load(
+                        reasoning_start_token_ids_ptr + START_LEN - 1
+                    )
+                    tl.store(
+                        logits_ptr + token_idx * logits_stride + block_token_id,
+                        float("-inf"),
+                    )
         return
 
     reasoning_start = last_start + START_LEN
@@ -372,6 +411,7 @@ def apply_thinking_budget(
     thinking_token_budget: torch.Tensor,
     all_token_ids: torch.Tensor,
     total_len: torch.Tensor,
+    prompt_len: torch.Tensor,
     input_ids: torch.Tensor,
     expanded_local_pos: torch.Tensor,
     cached_last_start: torch.Tensor,
@@ -380,6 +420,7 @@ def apply_thinking_budget(
     reasoning_start_token_ids: torch.Tensor,
     natural_reasoning_end_token_ids: torch.Tensor,
     reasoning_end_token_ids: torch.Tensor,
+    block_reentry: bool = False,
 ) -> None:
     num_tokens = logits.shape[0]
     start_len = reasoning_start_token_ids.shape[0]
@@ -411,6 +452,7 @@ def apply_thinking_budget(
         all_token_ids,
         all_token_ids.stride(0),
         total_len,
+        prompt_len,
         input_ids,
         expanded_local_pos,
         cached_last_start,
@@ -421,4 +463,5 @@ def apply_thinking_budget(
         START_LEN=start_len,
         NATURAL_END_LEN=natural_end_len,
         END_LEN=end_len,
+        BLOCK_REENTRY=block_reentry,
     )
