@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.sample.logits_processor.interface import (
@@ -15,6 +16,8 @@ from vllm.v1.sample.logits_processor.interface import (
 
 if TYPE_CHECKING:
     from vllm.config.reasoning import ReasoningConfig
+
+logger = init_logger(__name__)
 
 
 def maybe_create_thinking_budget_state_holder(
@@ -61,6 +64,11 @@ class ThinkingBudgetStateHolder:
             re = reasoning_config.reasoning_end_token_ids
             self.think_start_token_ids = rs if rs else []
             self.think_end_token_ids = re if re else []
+            if getattr(reasoning_config, "block_reasoning_reentry", False):
+                logger.warning_once(
+                    "reasoning_config.block_reasoning_reentry is implemented "
+                    "only in Model Runner V2; this runner ignores it."
+                )
 
         self.device = device
         self._state: dict[int, dict[str, Any]] = {}
