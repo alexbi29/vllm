@@ -353,6 +353,14 @@ def test_gemma4_mtp_reads_target_compact_norm(monkeypatch, runner):
         kv_cache_dtype="auto",
         attn_backend="dense",
     )
+    for name in ("_k_scale", "_v_scale"):
+        setattr(target, name, torch.tensor([0.25]))
+        setattr(draft, name, torch.tensor(1.0))
+    for name in ("_k_scale_cpu", "_v_scale_cpu"):
+        setattr(target, name, torch.tensor(0.25))
+        setattr(draft, name, torch.tensor(1.0))
+    target._k_scale_float = target._v_scale_float = 0.25
+    draft._k_scale_float = draft._v_scale_float = 1.0
     text = SimpleNamespace(layer_types=["full_attention"], num_kv_shared_layers=0)
     hf = SimpleNamespace(get_text_config=lambda: text, gemma4_compact_kv=True)
     proposer = SimpleNamespace(
@@ -367,17 +375,24 @@ def test_gemma4_mtp_reads_target_compact_norm(monkeypatch, runner):
         ),
     )
     target_name = "model.layers.0.self_attn.attn"
-    monkeypatch.setattr(
-        runner_module,
-        "get_layers_from_vllm_config",
-        lambda *args: {target_name: target},
-    )
     if runner == "v1":
+        monkeypatch.setattr(
+            runner_module,
+            "get_layers_from_vllm_config",
+            lambda *args: {target_name: target},
+        )
         runner_module.Gemma4Proposer._setup_gemma4_kv_sharing(proposer, {target_name})
     else:
+        proposer.vllm_config.compilation_config = SimpleNamespace(
+            static_forward_context={target_name: target}
+        )
         runner_module.Gemma4Speculator._setup_gemma4_kv_sharing(
             proposer, proposer.model, {target_name}
         )
+        torch.testing.assert_close(draft._k_scale, target._k_scale)
+        torch.testing.assert_close(draft._v_scale, target._v_scale)
+        assert draft._k_scale is not target._k_scale
+        assert draft._v_scale is not target._v_scale
     assert draft.attn_backend is Gemma4CompactBackend
     assert draft.impl.compact_k_norm is norm
     assert draft.impl.num_heads == 8
