@@ -288,9 +288,7 @@ def test_qwen36_template_preserve_thinking_remains_opt_in(qwen3_tokenizer):
     ]
 
     default_prompt = _render_qwen36(qwen3_tokenizer, messages)
-    preserved_prompt = _render_qwen36(
-        qwen3_tokenizer, messages, preserve_thinking=True
-    )
+    preserved_prompt = _render_qwen36(qwen3_tokenizer, messages, preserve_thinking=True)
 
     assert "private plan" not in default_prompt
     assert "<think>\nprivate plan\n</think>\n\nFirst answer" in preserved_prompt
@@ -321,9 +319,7 @@ def test_qwen36_template_preserve_thinking_skips_empty_blocks(qwen3_tokenizer):
 
 
 @pytest.mark.parametrize("role", ["system", "developer"])
-def test_qwen36_template_renders_mid_conversation_system_roles(
-    qwen3_tokenizer, role
-):
+def test_qwen36_template_renders_mid_conversation_system_roles(qwen3_tokenizer, role):
     prompt = _render_qwen36(
         qwen3_tokenizer,
         [
