@@ -912,10 +912,7 @@ class SamplingParams(
             if self.reasoning_temperature is None
             else self.reasoning_temperature
         )
-        if (
-            self.temperature < _SAMPLING_EPS
-            and reasoning_temperature < _SAMPLING_EPS
-        ):
+        if self.temperature < _SAMPLING_EPS and reasoning_temperature < _SAMPLING_EPS:
             return SamplingType.GREEDY
         if self.seed is not None:
             return SamplingType.RANDOM_SEED
