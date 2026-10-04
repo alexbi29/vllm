@@ -1657,6 +1657,22 @@ class TestGemma4IsReasoningEnd:
     def test_is_reasoning_end(self, ids, thinking, ended):
         assert self._parser(thinking).is_reasoning_end(ids) is ended
 
+    @pytest.mark.parametrize(
+        ("ids", "ended"),
+        [
+            ([CHANNEL_START_ID, TOOL_CALL_START_ID, 54], True),
+            ([CHANNEL_START_ID, CHANNEL_END_ID, 54], True),
+            ([CHANNEL_START_ID, TOOL_CALL_START_ID, 54, NEW_TURN_ID, 9100], False),
+        ],
+    )
+    def test_tool_response_preserves_reasoning_end_and_new_turn_boundary(
+        self, ids, ended
+    ):
+        tokenizer = _make_tokenizer(_PLAIN_ANSWER_TOKENS)
+        tokenizer.get_vocab.return_value["<|tool_response>"] = 54
+        parser = Gemma4Parser(tokenizer, chat_template_kwargs={"enable_thinking": True})
+        assert parser.is_reasoning_end(ids) is ended
+
 
 # ── Argument value extender ──────────────────────────────────────────
 
