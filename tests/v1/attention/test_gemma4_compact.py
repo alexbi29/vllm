@@ -281,10 +281,13 @@ def test_gemma4_loader_duplicates_shared_quantized_weights_and_scales(
     assert ("model.layers.0.self_attn.qkv_proj.weight", "v") not in loaded
 
 
-def test_compact_metadata_uses_global_head_width():
+def test_compact_metadata_uses_global_head_width(monkeypatch):
     """Segmented decode scratch must fit global heads, not local head_dim=256."""
     from vllm.config import CUDAGraphMode
     from vllm.v1.attention.backends.gemma4_compact import Gemma4CompactMetadataBuilder
+    from vllm.v1.attention.backends.triton_attn import current_platform
+
+    monkeypatch.setattr(current_platform, "num_compute_units", lambda: 128)
 
     config = SimpleNamespace(
         compilation_config=SimpleNamespace(
