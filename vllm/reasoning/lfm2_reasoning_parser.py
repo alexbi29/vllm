@@ -6,7 +6,7 @@
 Model outputs: <think>\n...reasoning...\n</think>\n...answer...
 """
 
-from vllm.entrypoints.openai.engine.protocol import DeltaMessage
+from vllm.entrypoints.generate.base.protocol import DeltaMessage
 from vllm.reasoning.abs_reasoning_parsers import ReasoningParser
 
 _START = "<think>"
