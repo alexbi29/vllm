@@ -52,9 +52,12 @@ class TritonAttentionDiffKVMetadataBuilder(TritonAttentionMetadataBuilder):
     ):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
 
-        # thor patch: full-attention groups get more split-KV segments. The spec-verify launch covers a whole
-        # request per program (BLOCK_M = q_len x GQA group), so the segment axis must supply the CTAs:
-        # 64 segments = 1.3-1.5x (q=4) / 1.8-2.6x (q=8) per layer vs stock 16 on 46K-180K contexts.
+        # thor patch: full-attention groups get more split-KV segments. The spec-verify
+        # launch covers a whole
+        # request per program (BLOCK_M = q_len x GQA group), so the segment axis must
+        # supply the CTAs:
+        # 64 segments = 1.3-1.5x (q=4) / 1.8-2.6x (q=8) per layer vs stock 16 on
+        # 46K-180K contexts.
         # SWA groups keep the stock count (their loops are window-bounded).
         full_attn_segments = int(os.environ.get("VLLM_DIFFKV_FULL_ATTN_SEGMENTS", "64"))
         if (
