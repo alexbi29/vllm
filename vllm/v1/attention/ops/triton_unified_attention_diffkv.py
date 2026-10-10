@@ -49,24 +49,31 @@ is_batch_invariant = envs.VLLM_BATCH_INVARIANT
 
 # thor patch knob: max query tokens per sequence for the split-KV path (0 = off).
 _SPEC_3D_MAX_Q = int(os.environ.get("VLLM_DIFFKV_SPEC_3D_MAX_Q", "16"))
-# thor patch knobs: prefill-shaped 2D launches (max_seqlen_q >= _PREFILL_MIN_Q) use a larger
+# thor patch knobs: prefill-shaped 2D launches (max_seqlen_q >= _PREFILL_MIN_Q) use a
+# larger
 # BLOCK_M (several query tokens per program) so K/V tiles are reused across query rows.
 # The stock BLOCK_M=16 with a GQA group of 16 means ONE query token per program.
-# Defaults (128 / 8 warps / tile 32) = 3.0x on a 4096-token chunk at 30K ctx (global layers), 2.5x SWA;
-# tile 64 exceeds SM120's 99 KB smem for BLOCK_M 128. VLLM_DIFFKV_PREFILL_BLOCK_M=16 restores stock.
+# Defaults (128 / 8 warps / tile 32) = 3.0x on a 4096-token chunk at 30K ctx (global
+# layers), 2.5x SWA;
+# tile 64 exceeds SM120's 99 KB smem for BLOCK_M 128. VLLM_DIFFKV_PREFILL_BLOCK_M=16
+# restores stock.
 _PREFILL_BLOCK_M = int(os.environ.get("VLLM_DIFFKV_PREFILL_BLOCK_M", "128"))
 _PREFILL_NUM_WARPS = int(os.environ.get("VLLM_DIFFKV_PREFILL_NUM_WARPS", "8"))
-# 2 stages: same speed as the default 3 for bf16 (11.94 vs 11.89 ms) and keeps the fp8-KV dequant under SM120 smem
+# 2 stages: same speed as the default 3 for bf16 (11.94 vs 11.89 ms) and keeps the
+# fp8-KV dequant under SM120 smem
 _PREFILL_NUM_STAGES = int(os.environ.get("VLLM_DIFFKV_PREFILL_NUM_STAGES", "2"))
 _PREFILL_TILE = int(os.environ.get("VLLM_DIFFKV_PREFILL_TILE", "32"))
-# fp8 KV on full-attention layers: tile 64 fits (fp8 K/V tiles halve smem) -> 13.4 vs 15.4 ms per 4096q@30K chunk
+# fp8 KV on full-attention layers: tile 64 fits (fp8 K/V tiles halve smem) -> 13.4 vs
+# 15.4 ms per 4096q@30K chunk
 # (bf16 cache: 12.2). SWA layers keep tile 32 (tile 64 + sinks exceeds SM120 smem).
 _PREFILL_TILE_FP8_GLOBAL = int(
     os.environ.get("VLLM_DIFFKV_PREFILL_TILE_FP8_GLOBAL", "64")
 )
 _PREFILL_MIN_Q = 64
-# thor patch knobs: split-KV spec verify covers ALL q tokens of a request in one program (BLOCK_M = q_len x GQA
-# group, capped) so each K/V tile is read once instead of once per verify token (8x for q=8). 0 = stock BLOCK_M.
+# thor patch knobs: split-KV spec verify covers ALL q tokens of a request in one program
+# (BLOCK_M = q_len x GQA
+# group, capped) so each K/V tile is read once instead of once per verify token (8x for
+# q=8). 0 = stock BLOCK_M.
 _SPEC_3D_BLOCK_M = int(os.environ.get("VLLM_DIFFKV_SPEC_3D_BLOCK_M", "128"))
 _SPEC_3D_NUM_WARPS = int(os.environ.get("VLLM_DIFFKV_SPEC_3D_NUM_WARPS", "8"))
 _SPEC_3D_TILE = int(os.environ.get("VLLM_DIFFKV_SPEC_3D_TILE", "16"))
