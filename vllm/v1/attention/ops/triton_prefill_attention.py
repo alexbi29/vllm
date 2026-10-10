@@ -245,7 +245,8 @@ def context_attention_fwd(
     """
     Lq, Lk, _ = q.shape[-1], k.shape[-1], v.shape[-1]
     BLOCK = get_block_size(q.dtype)
-    if Lk >= 512:
+    # Bidirectional Gemma embedding heads also need a smaller tile on SM120.
+    if Lk >= 512 or (not is_causal and Lk >= 256):
         BLOCK = min(BLOCK, 32)
 
     sm_scale = 1.0 / (Lq**0.5) if softmax_scale is None else softmax_scale
