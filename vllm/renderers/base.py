@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
+import os
+import threading
 import time
 import weakref
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from concurrent.futures import Executor, Future, ThreadPoolExecutor
 from contextlib import ExitStack
@@ -73,6 +76,50 @@ if TYPE_CHECKING:
     )
 
 logger = init_logger(__name__)
+
+# A long chat prompt repeats its first turn (the system prompt) on every request
+# of a conversation, and tokenizing ~10k tokens costs ~13 ms each time. Prompts
+# at least this long are split where their second turn opens: the first turn's
+# token ids come from a small LRU and only the rest is tokenized. HF tokenizers
+# cut the input at special tokens before running the model, so a split at one
+# is token-identical to tokenizing the whole text. 0 turns the cache off.
+_PREFIX_TOKEN_CACHE_MIN_CHARS = int(
+    os.getenv("VLLM_PREFIX_TOKEN_CACHE_MIN_CHARS", "16384")
+)
+_PREFIX_TOKEN_CACHE_SIZE = 32
+# Gemma4's turn opener; a tokenizer without it as a special token is never split
+_PREFIX_TOKEN_CACHE_MARKER = "<|turn>"
+_prefix_token_cache: "OrderedDict[tuple[int, str], tuple[int, ...]]" = OrderedDict()
+_prefix_token_cache_lock = threading.Lock()
+
+
+def _encode_with_prefix_cache(tokenizer: Any, text: str) -> list[int] | None:
+    """Token ids of `text` (no special tokens added), reusing the cached ids of
+    everything before its second turn; None when `text` does not qualify."""
+    marker = _PREFIX_TOKEN_CACHE_MARKER
+    if (
+        not _PREFIX_TOKEN_CACHE_MIN_CHARS
+        or len(text) < _PREFIX_TOKEN_CACHE_MIN_CHARS
+        or marker not in getattr(tokenizer, "all_special_tokens", ())
+    ):
+        return None
+    first = text.find(marker)
+    second = text.find(marker, first + len(marker)) if first >= 0 else -1
+    if second < 0:
+        return None
+    prefix, rest = text[:second], text[second:]
+    key = (id(tokenizer), prefix)
+    with _prefix_token_cache_lock:
+        ids = _prefix_token_cache.get(key)
+        if ids is not None:
+            _prefix_token_cache.move_to_end(key)
+    if ids is None:
+        ids = tuple(tokenizer(prefix, add_special_tokens=False)["input_ids"])
+        with _prefix_token_cache_lock:
+            _prefix_token_cache[key] = ids
+            while len(_prefix_token_cache) > _PREFIX_TOKEN_CACHE_SIZE:
+                _prefix_token_cache.popitem(last=False)
+    return [*ids, *tokenizer(rest, add_special_tokens=False)["input_ids"]]
 
 
 _T = TypeVar("_T", bound=TokenizerLike, default=TokenizerLike)
@@ -672,6 +719,12 @@ class BaseRenderer(ABC, Generic[_T]):
         tokenizer = self.get_tokenizer()
         want_offsets = self._wants_offsets(prompt, params)
         kwargs = params.get_encode_kwargs()
+        if not want_offsets and kwargs.get("add_special_tokens") is False:
+            ids = _encode_with_prefix_cache(tokenizer, prompt["prompt"])
+            max_length = kwargs.get("max_length") if kwargs.get("truncation") else None
+            # past the limit, the plain call truncates exactly as before
+            if ids is not None and (max_length is None or len(ids) <= max_length):
+                return self._build_tokens_prompt(ids, prompt, offset_mapping=None)
         if want_offsets:
             kwargs = {**kwargs, "return_offsets_mapping": True}
         encoding = tokenizer(prompt["prompt"], **kwargs)
