@@ -420,7 +420,7 @@ def _validate_compact_weight_quantization(quant_config, qkv_proj) -> None:
 
 def _compact_local_geometry_supported(config, global_kv_heads: int) -> bool:
     local_layers = [
-        gemma4_layer_config(config, idx)
+        config.per_layer_config[idx]
         for idx, layer_type in enumerate(config.layer_types)
         if layer_type == "sliding_attention"
     ]
