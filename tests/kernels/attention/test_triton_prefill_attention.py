@@ -315,3 +315,38 @@ def test_rdna_narrows_the_kv_tile_and_nothing_else(monkeypatch) -> None:
     assert tuned.kwargs.pop("BLOCK_N") != stock.kwargs.pop("BLOCK_N")
     assert tuned.kwargs == stock.kwargs
     assert tuned.grid == stock.grid
+
+
+@pytest.mark.parametrize("head_dim", [256, 512])
+@pytest.mark.parametrize("seq_len", [129, 513])
+@pytest.mark.parametrize("window", [0, 64])
+def test_wide_bidirectional_attention(head_dim, seq_len, window):
+    """Gemma embedding heads must fit shared memory and preserve attention."""
+    torch.manual_seed(42)
+    q = torch.randn(seq_len, 4, head_dim, device=DEVICE_TYPE, dtype=torch.bfloat16)
+    k = torch.randn(seq_len, 2, head_dim, device=DEVICE_TYPE, dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    out = torch.empty_like(q)
+    starts = torch.zeros(1, device=DEVICE_TYPE, dtype=torch.int32)
+    lengths = torch.tensor([seq_len], device=DEVICE_TYPE, dtype=torch.int32)
+    context_attention_fwd(
+        q,
+        k,
+        v,
+        out,
+        starts,
+        lengths,
+        seq_len,
+        is_causal=False,
+        sliding_window_q=window,
+        sliding_window_k=window,
+    )
+    expected = ref_masked_attention(
+        q,
+        k.repeat_interleave(2, dim=1),
+        v.repeat_interleave(2, dim=1),
+        is_causal=False,
+        sliding_window_q=window,
+        sliding_window_k=window,
+    )
+    torch.testing.assert_close(out, expected, atol=2e-2, rtol=2e-2)
