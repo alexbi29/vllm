@@ -672,7 +672,8 @@ def test_sliding_window_cache_hit_with_finer_hash_alignment():
     assert computed_blocks[0] == block_pool.blocks[10:12]
 
 
-def test_mamba_possible_cached_prefix_with_eagle_drop():
+@pytest.mark.parametrize("max_length,expected_state", [(4, 11), (6, 12)])
+def test_mamba_eagle_lookup_respects_coordinator_hit_limit(max_length, expected_state):
     block_size = 2
     mamba_spec = MambaSpec(
         block_size=block_size,
@@ -693,7 +694,7 @@ def test_mamba_possible_cached_prefix_with_eagle_drop():
 
     computed_blocks = MambaManager.find_longest_cache_hit(
         block_hashes=block_hash_list,
-        max_length=len(block_hash_list) * block_size,
+        max_length=max_length,
         kv_cache_group_ids=[0],
         block_pool=block_pool,
         kv_cache_spec=mamba_spec,
@@ -701,9 +702,9 @@ def test_mamba_possible_cached_prefix_with_eagle_drop():
         alignment_tokens=block_size,
     )[0][0]
 
-    assert len(computed_blocks) == 2
+    assert len(computed_blocks) == max_length // block_size
     assert computed_blocks[0] == block_pool.null_block
-    assert computed_blocks[1].block_id == 11
+    assert computed_blocks[-1].block_id == expected_state
 
 
 def test_chunked_local_attention_remove_skipped_blocks():
