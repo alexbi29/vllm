@@ -2490,3 +2490,54 @@ def test_sparse_indexer_topk_aiter_expands_mtp_row_ends(monkeypatch) -> None:
 
     assert recorded["next_n"] == 1
     assert recorded["row_ends"] == [99, 100, 199, 200]
+
+
+@pytest.mark.parametrize("rows", [1, 6, 12, 72, 292, 512, 8192])
+@pytest.mark.parametrize("width", [512, 544])
+@pytest.mark.parametrize("capture_graph", [False, True])
+def test_canonicalize_sparse_indexer_token_order_preserves_selection(
+    rows, width, capture_graph
+):
+    """Equivalent selections must give one layout without touching buffer tails."""
+    from vllm.model_executor.layers.sparse_attn_indexer import (
+        canonicalize_sparse_indexer_token_order_,
+    )
+
+    torch.manual_seed(93)
+    original = torch.randint(
+        0, 250000, (rows + 3, width), device="cuda", dtype=torch.int32
+    )
+    lengths = torch.arange(rows, device="cuda") % 513
+    original[:rows, :512].masked_fill_(
+        torch.arange(512, device="cuda")[None, :] >= lengths[:, None], -1
+    )
+    order = torch.rand(rows, 512, device="cuda").argsort(dim=-1)
+    original[:rows, :512] = original[:rows, :512].gather(1, order)
+    buffer = original.clone()
+
+    def expected(value):
+        result = value.clone()
+        keys = torch.where(value[:rows, :512] >= 0, value[:rows, :512], 2147483647)
+        sorted_keys = keys.sort(dim=-1).values
+        result[:rows, :512] = torch.where(sorted_keys == 2147483647, -1, sorted_keys)
+        return result
+
+    canonicalize_sparse_indexer_token_order_(buffer[:rows], 512)
+    torch.testing.assert_close(buffer, expected(original), rtol=0, atol=0)
+    if capture_graph:
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                canonicalize_sparse_indexer_token_order_(buffer[:rows], 512)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            canonicalize_sparse_indexer_token_order_(buffer[:rows], 512)
+        for replay in range(3):
+            value = torch.where(
+                original >= 0, (original + replay * 1009) % 250000, original
+            )
+            buffer.copy_(value)
+            graph.replay()
+            torch.testing.assert_close(buffer, expected(value), rtol=0, atol=0)
