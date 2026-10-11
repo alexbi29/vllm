@@ -67,6 +67,40 @@ from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
 
+
+@triton.jit
+def _canonicalize_sparse_indexer_token_order_kernel(
+    indices_ptr,
+    row_stride,
+    TOP_K: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_K)
+    values = tl.load(indices_ptr + row * row_stride + offsets, offsets < TOP_K, -1)
+    # Sort logical token positions before they are mapped to physical cache
+    # blocks. Keep the no-token sentinel after all selected positions.
+    values = tl.where(values >= 0, values, 2147483647)
+    values = tl.sort(values, descending=False)
+    values = tl.where(values == 2147483647, -1, values)
+    tl.store(indices_ptr + row * row_stride + offsets, values, offsets < TOP_K)
+
+
+def canonicalize_sparse_indexer_token_order_(indices: torch.Tensor, top_k: int) -> None:
+    """Preserve each selected multiset while fixing sparse-attention order."""
+    assert indices.ndim == 2 and indices.stride(1) == 1
+    assert top_k <= indices.shape[1]
+    if indices.shape[0] == 0:
+        return
+    _canonicalize_sparse_indexer_token_order_kernel[(indices.shape[0],)](
+        indices,
+        indices.stride(0),
+        TOP_K=top_k,
+        BLOCK_K=triton.next_power_of_2(top_k),
+        num_warps=4,
+    )
+
+
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
 
@@ -1099,6 +1133,18 @@ class SparseAttnIndexer(CustomOp):
         self.quant_block_size = quant_block_size
         self.scale_fmt = scale_fmt
         self.topk_tokens = topk_tokens
+        model_config = get_current_vllm_config().model_config
+        self._canonicalize_selected_token_order = (
+            current_platform.is_cuda()
+            and current_platform.is_device_capability_family(120)
+            and model_config is not None
+            and getattr(model_config.hf_config, "model_type", None) == "deepseek_v4"
+            and topk_tokens == 512
+        )
+        if self._canonicalize_selected_token_order:
+            logger.info_once(
+                "DeepSeek V4 SM120: canonical selected-token ordering enabled."
+            )
         self.head_dim = head_dim
         self.max_model_len = max_model_len
         self.max_total_seq_len = max_total_seq_len
@@ -1187,7 +1233,7 @@ class SparseAttnIndexer(CustomOp):
             q_values, q_scale = q_quant
         else:
             q_values, q_scale = q_quant, None
-        return torch.ops.vllm.sparse_attn_indexer(
+        result = torch.ops.vllm.sparse_attn_indexer(
             hidden_states,
             _encode_layer_name(self.k_cache.prefix),
             self.k_cache.kv_cache,
@@ -1216,6 +1262,11 @@ class SparseAttnIndexer(CustomOp):
             candidate_write=self.candidate_write,
             topk_backend=self.topk_backend,
         )
+        if self._canonicalize_selected_token_order:
+            canonicalize_sparse_indexer_token_order_(
+                result[: hidden_states.shape[0]], self.topk_tokens
+            )
+        return result
 
     def forward_xpu(
         self,

@@ -1313,7 +1313,7 @@ def test_cooperative_topk_cs2(top_k: int) -> None:
 @pytest.mark.parametrize(
     "test_config",
     [
-        # ==================== CATEGORY: Sequence Length Edge Cases ====================
+        # ==================== CATEGORY: Sequence Length Edge Cases =============
         pytest.param(
             {"seq_lens": [1, 10, 100, 2048], "top_k": 2048, "data_type": "random"},
             id="seq_len_edge_very_small_to_medium",
@@ -1330,7 +1330,7 @@ def test_cooperative_topk_cs2(top_k: int) -> None:
             {"seq_lens": [8000, 16384, 20000], "top_k": 2048, "data_type": "random"},
             id="algo_transition_filtered_radix",
         ),
-        # ==================== CATEGORY: Data Distributions ====================
+        # ==================== CATEGORY: Data Distributions =============
         pytest.param(
             {"seq_lens": [5000, 10000], "top_k": 2048, "data_type": "sorted_asc"},
             id="data_sorted_ascending",
@@ -1355,7 +1355,7 @@ def test_cooperative_topk_cs2(top_k: int) -> None:
             },
             id="data_float_precision",
         ),
-        # ==================== CATEGORY: Alignment / Vectorization ====================
+        # ==================== CATEGORY: Alignment / Vectorization =============
         pytest.param(
             {
                 "seq_lens": [2055, 2056, 2057, 2063],
@@ -1413,7 +1413,7 @@ def test_workspace_topk_correctness(test_config: dict, backend: str) -> None:
 @pytest.mark.parametrize(
     "test_config",
     [
-        # ==================== CATEGORY: Batch Size Scalability ====================
+        # ==================== CATEGORY: Batch Size Scalability =============
         pytest.param(
             {"batch_size": 1, "seq_len": 5000, "top_k": 2048},
             id="batch_1",
@@ -1430,7 +1430,7 @@ def test_workspace_topk_correctness(test_config: dict, backend: str) -> None:
             {"batch_size": 256, "seq_len": 5000, "top_k": 2048},
             id="batch_256",
         ),
-        # ==================== CATEGORY: Single-CTA vs Multi-CTA ====================
+        # ==================== CATEGORY: Single-CTA vs Multi-CTA =============
         pytest.param(
             {"batch_size": 2, "seq_len": 4096, "top_k": 2048},
             id="single_cta_4k",
@@ -1443,7 +1443,7 @@ def test_workspace_topk_correctness(test_config: dict, backend: str) -> None:
             {"batch_size": 2, "seq_len": 163840, "top_k": 2048},
             id="multi_cta_163840_dsv3_max",
         ),
-        # ==================== CATEGORY: Extreme Cases ====================
+        # ==================== CATEGORY: Extreme Cases =============
         pytest.param(
             {"batch_size": 512, "seq_len": 5000, "top_k": 2048},
             id="extreme_large_batch",
@@ -2899,3 +2899,54 @@ def test_sparse_indexer_resolved_persistent_bf16(
     actual_scores = fp32.gather(1, output.long()).sort(1).values.view(torch.int32)
     reference_scores = fp32.gather(1, reference.long()).sort(1).values.view(torch.int32)
     assert torch.equal(actual_scores, reference_scores)
+
+
+@pytest.mark.parametrize("rows", [1, 6, 12, 72, 292, 512, 8192])
+@pytest.mark.parametrize("width", [512, 544])
+@pytest.mark.parametrize("capture_graph", [False, True])
+def test_canonicalize_sparse_indexer_token_order_preserves_selection(
+    rows, width, capture_graph
+):
+    """Equivalent selections must give one layout without touching buffer tails."""
+    from vllm.model_executor.layers.sparse_attn_indexer import (
+        canonicalize_sparse_indexer_token_order_,
+    )
+
+    torch.manual_seed(93)
+    original = torch.randint(
+        0, 250000, (rows + 3, width), device="cuda", dtype=torch.int32
+    )
+    lengths = torch.arange(rows, device="cuda") % 513
+    original[:rows, :512].masked_fill_(
+        torch.arange(512, device="cuda")[None, :] >= lengths[:, None], -1
+    )
+    order = torch.rand(rows, 512, device="cuda").argsort(dim=-1)
+    original[:rows, :512] = original[:rows, :512].gather(1, order)
+    buffer = original.clone()
+
+    def expected(value):
+        result = value.clone()
+        keys = torch.where(value[:rows, :512] >= 0, value[:rows, :512], 2147483647)
+        sorted_keys = keys.sort(dim=-1).values
+        result[:rows, :512] = torch.where(sorted_keys == 2147483647, -1, sorted_keys)
+        return result
+
+    canonicalize_sparse_indexer_token_order_(buffer[:rows], 512)
+    torch.testing.assert_close(buffer, expected(original), rtol=0, atol=0)
+    if capture_graph:
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                canonicalize_sparse_indexer_token_order_(buffer[:rows], 512)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            canonicalize_sparse_indexer_token_order_(buffer[:rows], 512)
+        for replay in range(3):
+            value = torch.where(
+                original >= 0, (original + replay * 1009) % 250000, original
+            )
+            buffer.copy_(value)
+            graph.replay()
+            torch.testing.assert_close(buffer, expected(value), rtol=0, atol=0)
