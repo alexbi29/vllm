@@ -877,6 +877,9 @@ def sparse_attn_indexer(
             # Free this chunk's logits before the next chunk allocates its own.
             del logits
 
+            # Release this chunk before allocating the next logits matrix.
+            del logits
+
         if row_shard is not None:
             # Rows are already fully ranked, so this is a layout gather.
             row_shard.exchange_topk(topk_indices_buffer, topk_tokens)
