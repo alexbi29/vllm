@@ -8,14 +8,77 @@ import torch
 import torch.nn as nn
 
 from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
+from vllm.config import SpeculativeConfig
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.models.qwen3_dspark import DSparkMarkovHead
 from vllm.model_executor.models.registry import ModelRegistry
 from vllm.models.deepseek_v4.nvidia import dspark as dsv4_dspark
+from vllm.models.deepseek_v4.nvidia import model as dsv4_model
 from vllm.models.deepseek_v41.nvidia import dspark as dsv41_dspark
 from vllm.models.kimi_k3.nvidia import dspark_mla
 from vllm.models.kimi_k3.nvidia.dspark_mla import K3DSparkForCausalLM, K3DSparkModel
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("last_rank", [True, False])
+@pytest.mark.parametrize(
+    "method", [None, "dspark", "mtp", "eagle", "dflash", "draft_model"]
+)
+def test_deepseek_dspark_does_not_reserve_unused_mtp_residual(
+    monkeypatch, method, last_rank
+):
+    """Exercise target construction: DSpark takes aux states, MTP keeps its buffer."""
+
+    class Spec(SimpleNamespace):
+        use_eagle = SpeculativeConfig.use_eagle
+        uses_draft_model = SpeculativeConfig.uses_draft_model
+        use_dspark = SpeculativeConfig.use_dspark
+
+    group = SimpleNamespace(is_first_rank=True, is_last_rank=last_rank)
+    monkeypatch.setattr(dsv4_model, "get_pp_group", lambda: group)
+    monkeypatch.setattr(torch.cuda, "Stream", lambda: None)
+    monkeypatch.setattr(
+        dsv4_model, "VocabParallelEmbedding", lambda *a, **k: nn.Identity()
+    )
+    monkeypatch.setattr(dsv4_model, "RMSNorm", lambda *a, **k: nn.Identity())
+    monkeypatch.setattr(
+        dsv4_model, "make_layers", lambda *a, **k: (0, 0, nn.ModuleList())
+    )
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            dtype=torch.bfloat16,
+            hf_config=SimpleNamespace(
+                vocab_size=8,
+                hidden_size=16,
+                hc_mult=4,
+                hc_eps=1e-6,
+                rms_norm_eps=1e-6,
+                index_topk=8,
+                num_hidden_layers=0,
+                num_hash_layers=0,
+            ),
+        ),
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=1 if last_rank else 2,
+            enable_expert_parallel=False,
+            tensor_parallel_size=1,
+            data_parallel_size=1,
+        ),
+        kernel_config=SimpleNamespace(moe_backend="auto", enable_jit_warmup=False),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=32),
+        quant_config=None,
+        speculative_config=None if method is None else Spec(method=method),
+    )
+    target = dsv4_model.DeepseekV4Model(vllm_config=config)
+    residual = dsv4_model.DeepseekV4ForCausalLM.get_mtp_target_hidden_states(
+        SimpleNamespace(model=target)
+    )
+    if last_rank and method in ("mtp", "eagle", "dflash", "draft_model"):
+        assert residual.shape == (32, 64)
+        assert residual.dtype == torch.bfloat16
+    else:
+        assert residual is None
 
 
 def test_dspark_mla_uses_compile_free_model_entrypoint():
