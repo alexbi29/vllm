@@ -778,6 +778,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                     (0, 0, 0, self.padded_heads - self.n_local_heads),
                     value=0.0,
                 )
+            if self.kv_cache_torch_dtype == torch.uint8:
+                # The real fp8_ds_mla insert allocates a distinct Q output even
+                # without head padding. Profile its lifetime alongside raw Q;
+                # otherwise cache sizing omits this prefill temporary.
+                return q.clone()
             return q
 
         swa_metadata = cast(
