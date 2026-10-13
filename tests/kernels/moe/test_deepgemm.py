@@ -48,6 +48,55 @@ from vllm.utils.deep_gemm import (
 BLOCK_SIZE = [128, 128]
 
 
+@pytest.mark.parametrize("num_tokens", [6, 12, 72, 128])
+@pytest.mark.parametrize("clamp", [None, 7.0])
+def test_indexed_fp4_activation_replays_live_permutation(num_tokens, clamp):
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+        silu_mul_quant_fp8_packed_triton,
+    )
+
+    torch.manual_seed(917)
+    x = torch.randn(num_tokens, 128, device="cuda", dtype=torch.bfloat16)
+    aq, scales = per_token_group_quant_fp8(x, 128, use_ue8m0=True)
+    ids = torch.zeros((num_tokens, 6), device="cuda", dtype=torch.int64)
+    expert_map = torch.tensor([0, -1, 1, -1, 2, -1, 3, -1], device="cuda")
+    padded_rows = min(num_tokens * 6, 4) * 128 + num_tokens * 6
+    activations = (
+        torch.randn(padded_rows, 4096, device="cuda", dtype=torch.bfloat16) * 4
+    )
+
+    def invoke():
+        _, _, _, inverse, _ = deepgemm_moe_permute(aq, scales, ids, 4, expert_map, None)
+        return silu_mul_quant_fp8_packed_triton(
+            activations, clamp_limit=clamp, row_indices=inverse.reshape(-1)
+        ) + (inverse,)
+
+    invoke()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual_q, actual_s, inverse = invoke()
+    reference_q, reference_s = silu_mul_quant_fp8_packed_triton(
+        activations, clamp_limit=clamp
+    )
+    for mode in range(3):
+        ids.copy_(torch.arange(num_tokens * 6, device="cuda").reshape_as(ids) % 8)
+        if mode == 1:
+            ids.fill_(7)
+            ids[0, 0] = 6
+        elif mode == 2:
+            ids.fill_(7)
+        graph.replay()
+        torch.accelerator.synchronize()
+        expected_local = expert_map[ids] >= 0
+        assert torch.equal(inverse >= 0, expected_local)
+        live = inverse[expected_local].long()
+        assert live.unique().numel() == live.numel()
+        assert torch.equal(
+            actual_q.view(torch.uint8)[live], reference_q.view(torch.uint8)[live]
+        )
+        assert torch.equal(actual_s[live], reference_s[live])
+
+
 @pytest.mark.cpu_test
 def test_registered_alignment_operator_preserves_small_expert_batches(monkeypatch):
     """Torch-library arity errors must not silently restore 128-row padding."""

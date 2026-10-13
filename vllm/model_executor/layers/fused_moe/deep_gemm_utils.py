@@ -271,6 +271,12 @@ def _fwd_kernel_ep_scatter_2(
                     tl.store(
                         output_tensor_scale_ptr + offset_in_s, to_copy_s, mask=mask_s
                     )
+            else:
+                # Indexed activation also inspects nonlocal routing slots.
+                tl.store(
+                    output_index + token_id * output_index_stride0 + topk_index,
+                    -1,
+                )
 
 
 @torch.no_grad()
