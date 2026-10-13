@@ -143,6 +143,7 @@ def _silu_mul_quant_fp8_packed_kernel(
     output_q_ptr,
     output_scale_ptr,
     expert_ends_ptr,
+    row_indices_ptr,
     M,
     input_stride_m,
     output_q_stride_m,
@@ -160,6 +161,7 @@ def _silu_mul_quant_fp8_packed_kernel(
     BLOCK_M: tl.constexpr,
     HAS_CLAMP: tl.constexpr,
     EXPERT_ALIGNMENT: tl.constexpr,
+    INDEXED_ROWS: tl.constexpr,
 ):
     GROUPS_PER_PACK: tl.constexpr = 4
     hidden_size: tl.constexpr = N // 2
@@ -188,6 +190,9 @@ def _silu_mul_quant_fp8_packed_kernel(
     while row_start < M:
         rows = row_start + row_offsets
         row_mask = rows < M
+        if INDEXED_ROWS:
+            rows = tl.load(row_indices_ptr + rows, row_mask, other=-1).to(tl.int64)
+            row_mask = row_mask & (rows >= 0)
         input_row_start = rows[:, None] * input_stride_m
         output_row_start = rows[:, None] * output_q_stride_m
 
@@ -266,6 +271,7 @@ def silu_mul_quant_fp8_packed_triton(
     *,
     expert_ends: torch.Tensor | None = None,
     expert_alignment: int = 0,
+    row_indices: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fuse activation and FP8 quantization, optionally skipping expert padding.
 
@@ -274,10 +280,16 @@ def silu_mul_quant_fp8_packed_triton(
     An expert starts at the preceding end rounded up to ``expert_alignment``.
     Padding outputs are left unwritten and must not be consumed as live rows.
     Without ``expert_ends``, the original dense launch configuration is used
-    and the metadata loads are compiled out.
+    and the metadata loads are compiled out. Alternatively, ``row_indices``
+    supplies unique live row offsets, with negative offsets for nonlocal routes.
+    Only those rows are written; padding must not contribute to a live result.
     """
     assert input.dim() == 2
     assert input.is_contiguous()
+    if row_indices is not None:
+        assert expert_ends is None and expert_alignment == 0
+        assert row_indices.ndim == 1 and row_indices.is_contiguous()
+        assert row_indices.dtype == torch.int32 and row_indices.device == input.device
 
     M, N = input.shape
     hidden_size = N // 2
@@ -314,6 +326,13 @@ def silu_mul_quant_fp8_packed_triton(
 
     grid_n = triton.cdiv(packs_per_row, packs_per_cta)
     grid_m = min(triton.cdiv(M, BM), 4096)
+    launch_rows = M
+    if row_indices is not None:
+        # Permutation indices identify unique live routed rows. Negative entries
+        # belong to nonlocal experts; padded rows need no activation or scale.
+        launch_rows = row_indices.numel()
+        BM = 1
+        grid_m = min(launch_rows, 4096)
     grid: tuple[int, ...] = (grid_n, grid_m)
     if expert_ends is not None:
         assert expert_ends.ndim == 1 and expert_ends.numel() > 0
@@ -337,7 +356,8 @@ def silu_mul_quant_fp8_packed_triton(
         output_q,
         output_scale_packed,
         expert_ends,
-        M,
+        row_indices,
+        launch_rows,
         input.stride(0),
         output_q.stride(0),
         output_scale_packed.stride(1),
@@ -354,6 +374,7 @@ def silu_mul_quant_fp8_packed_triton(
         BLOCK_M=BM,
         HAS_CLAMP=has_clamp,
         EXPERT_ALIGNMENT=expert_alignment,
+        INDEXED_ROWS=row_indices is not None,
         num_warps=num_warps,
         num_stages=num_stages,
     )
