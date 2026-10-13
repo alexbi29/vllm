@@ -21,6 +21,30 @@ from vllm.models.kimi_k3.nvidia.dspark_mla import K3DSparkForCausalLM, K3DSparkM
 
 
 @pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "cache_dtype", [torch.uint8, torch.bfloat16, torch.float8_e4m3fn]
+)
+@pytest.mark.parametrize("pad_heads", [False, True])
+def test_deepseek_profile_reserves_real_fp8_query_output(cache_dtype, pad_heads):
+    """FP8 paged insertion allocates distinct Q even without head padding."""
+    from vllm.models.deepseek_v4.attention import DeepseekV4Attention
+
+    layer = SimpleNamespace(
+        n_local_heads=2,
+        padded_heads=4 if pad_heads else 2,
+        kv_cache_torch_dtype=cache_dtype,
+    )
+    q = torch.randn(2, 2, 512, dtype=torch.bfloat16)
+    result = DeepseekV4Attention._fused_qnorm_rope_kv_insert(
+        layer, q, torch.empty(2, 512), torch.zeros(2, dtype=torch.int64), None
+    )
+    assert result.shape == (2, layer.padded_heads, 512)
+    assert torch.equal(result[:, :2], q)
+    allocates = pad_heads or cache_dtype == torch.uint8
+    assert (result.data_ptr() != q.data_ptr()) == allocates
+
+
+@pytest.mark.cpu_test
 @pytest.mark.parametrize("last_rank", [True, False])
 @pytest.mark.parametrize(
     "method", [None, "dspark", "mtp", "eagle", "dflash", "draft_model"]
