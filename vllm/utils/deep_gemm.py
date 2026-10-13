@@ -422,6 +422,15 @@ def get_theoretical_mk_alignment_for_contiguous_layout(
         return _get_theoretical_mk_alignment_for_contiguous_layout_impl(expected_m)
     if num_groups <= 0:
         raise ValueError(f"num_groups must be positive, got {num_groups}")
+    # TORCH_LIBRARY's legacy one-argument operator reports invalid arity as
+    # RuntimeError, unlike the former pybind binding's TypeError.
+    schemas = getattr(
+        _get_theoretical_mk_alignment_for_contiguous_layout_impl, "_schemas", {}
+    )
+    schema = schemas.get("")
+    if schema is not None and len(schema.arguments) == 1:
+        per_group_m = None if expected_m is None else cdiv(expected_m, num_groups)
+        return _get_theoretical_mk_alignment_for_contiguous_layout_impl(per_group_m)
     try:
         return _get_theoretical_mk_alignment_for_contiguous_layout_impl(
             expected_m, num_groups
