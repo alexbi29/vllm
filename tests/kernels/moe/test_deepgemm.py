@@ -48,6 +48,58 @@ from vllm.utils.deep_gemm import (
 BLOCK_SIZE = [128, 128]
 
 
+@pytest.mark.cpu_test
+def test_registered_alignment_operator_preserves_small_expert_batches(monkeypatch):
+    """Torch-library arity errors must not silently restore 128-row padding."""
+    import vllm.utils.deep_gemm as dg
+    from vllm.model_executor.layers.fused_moe.deep_gemm_utils import (
+        compute_aligned_M_and_alignment,
+    )
+
+    received = []
+    library = torch.library.Library("test_dg_alignment", "FRAGMENT")
+    library.define("alignment(int? expected_m=None) -> int")
+
+    def alignment(expected_m):
+        received.append(expected_m)
+        return 32 if expected_m <= 8 else 128
+
+    library.impl("alignment", alignment, "CompositeExplicitAutograd")
+    monkeypatch.setattr(dg, "_lazy_init", lambda: None)
+    monkeypatch.setattr(
+        dg,
+        "_get_theoretical_mk_alignment_for_contiguous_layout_impl",
+        torch.ops.test_dg_alignment.alignment,
+    )
+    assert compute_aligned_M_and_alignment(6, 6, 128, 128, None) == (1152, 32)
+    assert received == [1]
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("arguments", [1, 2])
+def test_alignment_python_binding_compatibility(monkeypatch, arguments):
+    import vllm.utils.deep_gemm as dg
+
+    received = []
+
+    def legacy(expected_m):
+        received.append((expected_m,))
+        return 32
+
+    def grouped(expected_m, groups):
+        received.append((expected_m, groups))
+        return 32
+
+    monkeypatch.setattr(dg, "_lazy_init", lambda: None)
+    monkeypatch.setattr(
+        dg,
+        "_get_theoretical_mk_alignment_for_contiguous_layout_impl",
+        legacy if arguments == 1 else grouped,
+    )
+    assert dg.get_theoretical_mk_alignment_for_contiguous_layout(36, 128) == 32
+    assert received == ([(1,)] if arguments == 1 else [(36, 128)])
+
+
 def test_ep_gather_uses_64_bit_row_offsets():
     hidden_size = 4096
     source_row = 1 << 18
