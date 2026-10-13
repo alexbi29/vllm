@@ -609,6 +609,7 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
         activation: MoEActivation,
         expert_ends: torch.Tensor | None = None,
         expert_alignment: int = 0,
+        row_indices: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         block_k = self._ACT_BLOCK_K
         scale_fmt = DeepGemmQuantScaleFMT.from_oracle()
@@ -626,6 +627,7 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
                     clamp_limit=self.gemm1_clamp_limit,
                     expert_ends=expert_ends,
                     expert_alignment=expert_alignment,
+                    row_indices=row_indices,
                 )
             use_ue8m0 = scale_fmt == DeepGemmQuantScaleFMT.FLOAT32_CEIL_UE8M0
             return silu_mul_per_token_group_quant_fp8_colmajor(
@@ -759,6 +761,7 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
                 activation=activation,
                 expert_ends=grouped_layout if use_psum_layout else None,
                 expert_alignment=align_used if use_psum_layout else 0,
+                row_indices=inv_perm.reshape(-1) if topk_ids.size(0) <= 128 else None,
             )
 
             # FC2: FP8 activations x FP4 weights
