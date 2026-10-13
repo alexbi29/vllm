@@ -900,8 +900,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             requires_grad=False,
         )
         spec_config = vllm_config.speculative_config
-        needs_mtp_hidden_states = spec_config is not None and (
-            spec_config.use_eagle() or spec_config.uses_draft_model()
+        # DSpark combines target aux states and does not consume this residual.
+        needs_mtp_hidden_states = (
+            spec_config is not None
+            and spec_config.method != "dspark"
+            and (spec_config.use_eagle() or spec_config.uses_draft_model())
         )
         if get_pp_group().is_last_rank and needs_mtp_hidden_states:
             self._mtp_hidden_buffer = torch.empty(
