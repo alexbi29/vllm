@@ -55,6 +55,8 @@ preserving weights and scales exactly. Active local experts are decoded into
 shared scratch before the existing DeepGEMM kernels. Savings depend on the
 scale distribution; incompressible layers keep their original scales. Decoding
 adds overhead, so benchmark the memory and throughput tradeoff for your workload.
+Savings also require scratch reuse across layers with the same scale geometry;
+a geometry used by only one layer can consume additional memory.
 
 The option defaults to off and supports expert parallelism. Draft layers stay
 uncompressed. EPLB and overlapping microbatches are unsupported, as are weight
