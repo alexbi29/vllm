@@ -1,7 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from dataclasses import replace
+from typing import TYPE_CHECKING
+
 import torch
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.quantization.utils.mxfp4_csf import (
+        CompressedMxfp4Scales,
+    )
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.logger import init_logger
@@ -19,7 +27,10 @@ from vllm.model_executor.layers.fused_moe.deep_gemm_utils import (
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
 )
-from vllm.model_executor.layers.fused_moe.utils import _resize_cache
+from vllm.model_executor.layers.fused_moe.utils import (
+    _resize_cache,
+    count_expert_num_tokens,
+)
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8,
     per_token_group_quant_fp8_packed_for_deepgemm,
@@ -465,6 +476,53 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
         assert not quant_config.per_out_ch_quant
 
         self.gemm1_clamp_limit = quant_config.gemm1_clamp_limit
+        self._csf_scales: tuple[CompressedMxfp4Scales, ...] | None = None
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        from vllm.config import get_current_vllm_config_or_none
+        from vllm.model_executor.layers.quantization.utils.mxfp4_csf import (
+            CompressedMxfp4Scales,
+            reject_compressed_scale_export,
+            should_compress_mxfp4_scales,
+        )
+
+        if not should_compress_mxfp4_scales(layer):
+            return
+        config = get_current_vllm_config_or_none()
+        assert config is not None
+        if config.parallel_config.enable_eplb or config.parallel_config.use_ubatching:
+            raise ValueError("MXFP4 scale compression does not support EPLB/ubatching")
+        from vllm.model_executor.utils import replace_parameter
+        from vllm.v1.worker.workspace import current_workspace_manager
+
+        assert self.w1_scale is not None and self.w2_scale is not None
+        compressed = tuple(
+            CompressedMxfp4Scales.from_native(s) for s in (self.w1_scale, self.w2_scale)
+        )
+        if (
+            sum(c.nbytes for c in compressed)
+            >= (self.w1_scale.numel() + self.w2_scale.numel()) * 4
+        ):
+            logger.warning_once("Keeping incompressible MXFP4 scales uncompressed.")
+            return
+        key = (
+            CompressedMxfp4Scales,
+            tuple((c.shape, c.stride, c.bases.device) for c in compressed),
+        )
+        scratch = current_workspace_manager().get_persistent_resource(
+            key, lambda: tuple(c.make_scratch() for c in compressed)
+        )
+        for c, out in zip(compressed, scratch):
+            c.decode(out)
+        self.quant_config._w1.scale, self.quant_config._w2.scale = scratch
+        replace_parameter(layer, "w13_weight_scale", scratch[0])
+        replace_parameter(layer, "w2_weight_scale", scratch[1])
+        self._csf_scales = compressed
+        layer.register_state_dict_pre_hook(reject_compressed_scale_export)
+        logger.info_once(
+            "Lossless native MXFP4 scale compression enabled; "
+            "active experts decode into shared DeepGEMM scratch."
+        )
 
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:
@@ -629,6 +687,26 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
         local_num_experts = w1.size(0)
         if global_num_experts == -1:
             global_num_experts = local_num_experts
+
+        if self._csf_scales is not None:
+            counts = (
+                expert_tokens_meta.expert_num_tokens
+                if expert_tokens_meta is not None
+                else None
+            )
+            if counts is None:
+                counts = count_expert_num_tokens(
+                    topk_ids, local_num_experts, expert_map
+                )
+                expert_tokens_meta = (
+                    mk.ExpertTokensMetadata(counts, None)
+                    if expert_tokens_meta is None
+                    else replace(expert_tokens_meta, expert_num_tokens=counts)
+                )
+            for compressed, scratch in zip(
+                self._csf_scales, (self.w1_scale, self.w2_scale)
+            ):
+                compressed.decode(scratch, counts, topk_ids.numel())
 
         M_sum, _ = compute_aligned_M_and_alignment(
             M=topk_ids.size(0),
