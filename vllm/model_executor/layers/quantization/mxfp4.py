@@ -1023,6 +1023,15 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+        from vllm.model_executor.layers.quantization.utils.mxfp4_csf import (
+            should_compress_mxfp4_scales,
+        )
+
+        if (
+            should_compress_mxfp4_scales(layer)
+            and self.mxfp4_backend != Mxfp4MoeBackend.DEEPGEMM_MXFP4
+        ):
+            raise ValueError("MXFP4 scale compression requires the DeepGEMM backend")
         if self.mxfp4_backend == Mxfp4MoeBackend.NONE:
             return
 

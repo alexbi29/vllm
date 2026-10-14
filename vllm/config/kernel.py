@@ -346,6 +346,14 @@ class KernelConfig:
                    running QDQ on activations.
     """
 
+    mxfp4_scale_compression: bool = False
+    """Keep DeepGEMM MXFP4 expert scales losslessly compressed on GPU.
+
+    Loads ordinary checkpoints and decodes active experts into shared scratch.
+    Currently excludes draft layers, EPLB and overlapping microbatches.
+    Weight reload, mutation, checksums and state export are unsupported.
+    """
+
     sparse_indexer_topk_backend: SparseIndexerTopkBackend = "auto"
     """Backend for the DSA sparse indexer decode top-k kernel. Available options:
 

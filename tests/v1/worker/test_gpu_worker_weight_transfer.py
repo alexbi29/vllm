@@ -13,7 +13,10 @@ import torch.nn as nn
 
 from vllm.config import ParallelConfig, VllmConfig, get_current_vllm_config
 from vllm.lora.layers import BaseLayerWithLoRA
-from vllm.model_executor.model_loader.reload.inplace import get_parameter_for_reload
+from vllm.model_executor.model_loader.reload.inplace import (
+    get_parameter_for_reload,
+    reload_weights,
+)
 from vllm.v1.worker.gpu_worker import Worker
 
 
@@ -109,6 +112,45 @@ def test_shutdown_weight_transfer_engine_preserves_inference(enabled, active):
         assert engine.closed is not active
     assert worker.weight_transfer_engine is engine
     assert worker.model_runner is model_runner
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "reload_weights",
+        "reset_weights",
+        "compute_weight_checksums",
+        "start_weight_update",
+        "update_weights",
+        "sleep",
+        "discard",
+        "save_sharded_state",
+        "save_tensorized_model",
+    ],
+)
+def test_compressed_scales_reject_weight_access_before_mutation(operation):
+    engine = _RecordingEngine()
+    worker = _make_worker(engine)
+    worker.vllm_config.kernel_config.mxfp4_scale_compression = True
+    args = {
+        "update_weights": ({"names": ["w"]},),
+        "sleep": (2,),
+        "discard": (("weights",),),
+        "save_sharded_state": ("/unused",),
+        "save_tensorized_model": (None,),
+    }.get(operation, ())
+    with pytest.raises(RuntimeError, match="MXFP4 scale compression"):
+        getattr(worker, operation)(*args)
+    assert isinstance(worker.model_runner, _RecordingModelRunner)
+    assert worker.model_runner.seen_config is None
+    assert not engine.started and not engine.update_calls
+
+
+def test_direct_runner_reload_rejects_compressed_scales_before_loading():
+    config = VllmConfig()
+    config.kernel_config.mxfp4_scale_compression = True
+    with pytest.raises(RuntimeError, match="MXFP4 scale compression"):
+        reload_weights(config, nn.Module(), None, None, True)
 
 
 def test_reload_parameter_lookup_preserves_lora_module_names():
