@@ -1154,6 +1154,7 @@ def test_reload_weights_path_replaces_object_storage_source(monkeypatch):
 
     vllm_config = SimpleNamespace(
         lora_config=None,
+        kernel_config=VllmConfig().kernel_config,
         load_config=SimpleNamespace(load_format="runai_streamer"),
         model_config=SimpleNamespace(
             model="/tmp/pulled-config-files",
