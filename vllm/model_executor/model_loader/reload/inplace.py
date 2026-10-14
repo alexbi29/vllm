@@ -52,6 +52,8 @@ def reload_weights(
             processed into kernel format (repacking, renaming, etc.)
 
     """
+    if vllm_config.kernel_config.mxfp4_scale_compression:
+        raise RuntimeError("Weight reload is unsupported with MXFP4 scale compression")
     # TODO(@kylesayrs): generalize to all runners and loaders
     # argument validation
     if weights_iterator is None and not is_checkpoint_format:
