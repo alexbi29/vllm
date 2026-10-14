@@ -40,6 +40,26 @@ layers use CUTLASS. Per-quantization overrides take precedence over
 `--linear-backend`; schemes without an override continue to use the global
 setting, including automatic selection when it is `auto`.
 
+## Lossless MXFP4 Expert Scale Compression
+
+DeepGEMM MXFP4 MoE models can retain expert scales in compressed GPU memory:
+
+```bash
+vllm serve <mxfp4-model> \
+  --moe-backend deep_gemm \
+  --kernel-config '{"mxfp4_scale_compression":true}'
+```
+
+This loads ordinary checkpoints and compresses the native exponent bytes,
+preserving weights and scales exactly. Active local experts are decoded into
+shared scratch before the existing DeepGEMM kernels. Savings depend on the
+scale distribution; incompressible layers keep their original scales. Decoding
+adds overhead, so benchmark the memory and throughput tradeoff for your workload.
+
+The option defaults to off and supports expert parallelism. Draft layers stay
+uncompressed. EPLB and overlapping microbatches are unsupported, as are weight
+reload/update/reset, checksums, state export, level-2 sleep and weight discard.
+
 ## Supported Hardware
 
 The table below shows the compatibility of various quantization implementations with different hardware platforms in vLLM:
