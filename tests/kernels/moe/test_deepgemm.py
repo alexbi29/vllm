@@ -669,7 +669,7 @@ def test_resident_csf_matches_native_moe_across_local_routes(
     config = VllmConfig()
     config.kernel_config.mxfp4_scale_compression = True
     config.model_config = SimpleNamespace(
-        hf_config=SimpleNamespace(num_hidden_layers=2)
+        hf_text_config=SimpleNamespace(num_hidden_layers=2)
     )
     moe = make_dummy_moe_config(activation=activation)
     moe.activation_situ_beta = 4.0
