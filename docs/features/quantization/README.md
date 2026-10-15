@@ -61,6 +61,9 @@ a geometry used by only one layer can consume additional memory.
 The option defaults to off and supports expert parallelism. Draft layers stay
 uncompressed. EPLB and overlapping microbatches are unsupported, as are weight
 reload/update/reset, checksums, state export, level-2 sleep and weight discard.
+CPU weight offload via `--cpu-offload-gb` requires UVA; its non-UVA fallback is
+rejected before model loading because it exports and copies parameters during
+inference. CPU KV offload is unaffected.
 
 ## Supported Hardware
 
