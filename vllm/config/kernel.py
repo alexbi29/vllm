@@ -352,6 +352,7 @@ class KernelConfig:
     Loads ordinary checkpoints and decodes active experts into shared scratch.
     Currently excludes draft layers, EPLB and overlapping microbatches.
     Weight reload, mutation, checksums and state export are unsupported.
+    CPU weight offload via cpu_offload_gb requires UVA; CPU KV offload is unaffected.
     """
 
     sparse_indexer_topk_backend: SparseIndexerTopkBackend = "auto"
@@ -489,6 +490,23 @@ class KernelConfig:
     def set_platform_defaults(self, vllm_config: "VllmConfig") -> None:
         """Set platform-specific defaults for the kernel config."""
         from vllm.platforms import current_platform
+
+        if self.mxfp4_scale_compression:
+            offload = vllm_config.offload_config
+            uses_uva_backend = offload.offload_backend == "uva" or (
+                offload.offload_backend == "auto"
+                and offload.prefetch.offload_group_size == 0
+            )
+            if uses_uva_backend and offload.uva.cpu_offload_gb > 0:
+                from vllm import envs
+                from vllm.utils.platform_utils import is_uva_available
+
+                if not is_uva_available() or envs.VLLM_WEIGHT_OFFLOADING_DISABLE_UVA:
+                    raise ValueError(
+                        "MXFP4 scale compression does not support CPU weight "
+                        "offload without UVA. Enable UVA or disable CPU weight "
+                        "offload or scale compression."
+                    )
 
         if vllm_config.model_config is not None:
             validate_flashinfer_moe_ep_model(
