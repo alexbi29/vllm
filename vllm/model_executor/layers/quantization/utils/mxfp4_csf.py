@@ -14,7 +14,7 @@ import torch
 
 from vllm.triton_utils import tl, triton
 
-_ROWS = 16
+_ROWS = 32
 
 
 def should_compress_mxfp4_scales(layer: torch.nn.Module) -> bool:
@@ -62,30 +62,27 @@ def _decode_scales(
     TILES: tl.constexpr,
     ACTIVE_ONLY: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
 ):
     slot = tl.program_id(0)
     expert = tl.load(ExpertIds + slot) if ACTIVE_ONLY else slot
     tile = tl.program_id(1)
     if expert >= 0:
-        row = tile * 16 + tl.arange(0, 16)
-        word = tl.arange(0, BLOCK_K)
+        row = (tile * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS))[None, :]
+        word = tl.arange(0, BLOCK_K)[:, None]
         base = tl.load(Bases + expert * ROWS + row, row < ROWS, 0).to(tl.uint32)
         # One selector byte covers two native four-scale words.
         bits = tl.load(
-            Selectors
-            + (expert * ROWS + row[:, None]) * tl.cdiv(WORDS, 2)
-            + word[None, :] // 2,
-            (row[:, None] < ROWS) & (word[None, :] < WORDS),
+            Selectors + (expert * ROWS + row) * tl.cdiv(WORDS, 2) + word // 2,
+            (row < ROWS) & (word < WORDS),
             0,
         ).to(tl.uint32)
-        nibble = (bits >> ((word[None, :] % 2) * 4)) & 15
-        packed = base[:, None] * 0x01010101
+        nibble = (bits >> ((word % 2) * 4)) & 15
+        packed = base * 0x01010101
         packed += (nibble & 1) | ((nibble & 2) << 7)
         packed += ((nibble & 4) << 14) | ((nibble & 8) << 21)
-        index = (expert * WORDS + word[None, :]) * ALIGNED_ROWS + row[:, None]
-        tl.store(
-            Output + index, packed, (row[:, None] < ROWS) & (word[None, :] < WORDS)
-        )
+        index = (expert * WORDS + word) * ALIGNED_ROWS + row
+        tl.store(Output + index, packed, (row < ROWS) & (word < WORDS))
         # Each CTA owns these rows, including every exception byte. Palette
         # stores must finish before unique byte stores patch their words.
         tl.debug_barrier()
@@ -239,5 +236,6 @@ class CompressedMxfp4Scales:
             triton.cdiv(n, _ROWS),
             expert_counts is not None,
             triton.next_power_of_2(k),
+            _ROWS,
             num_warps=4,
         )
