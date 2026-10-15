@@ -22,17 +22,18 @@ def native_scales(values, device="cpu", padding=0):
 
 
 @pytest.mark.cpu_test
-def test_codec_preserves_outlier_bytes_and_expert_local_positions():
+@pytest.mark.parametrize("words,padding", [(1, 0), (1, 13), (3, 13)])
+def test_codec_preserves_outlier_bytes_and_expert_local_positions(words, padding):
     """Every original byte is retained, including four exceptions in one word."""
-    values = torch.full((3, 19, 12), 127, dtype=torch.uint8)
+    values = torch.full((3, 19, words * 4), 127, dtype=torch.uint8)
     values[:, :, 1::2] = 128
     values[0, 0, :4] = torch.tensor([0, 255, 247, 249], dtype=torch.uint8)
     values[1, 18, -4:] = torch.tensor([255, 0, 42, 200], dtype=torch.uint8)
-    original = native_scales(values, padding=13)
+    original = native_scales(values, padding=padding)
     csf = CompressedMxfp4Scales.from_native(original)
     assert csf.stride == original.stride()
     selectors = np.unpackbits(csf.selectors.numpy(), axis=-1, bitorder="little")
-    restored = csf.bases.numpy()[..., None] + selectors[..., :12]
+    restored = csf.bases.numpy()[..., None] + selectors[..., : words * 4]
     restored = restored.astype(np.uint8)
     offsets = csf.offsets.numpy()
     for expert in range(3):
@@ -72,19 +73,28 @@ def test_decoder_rejects_counts_that_would_select_incorrect_experts(counts):
 
 
 @pytest.mark.cpu_test
-def test_compression_excludes_draft_tags_and_shifted_mtp_layers():
+@pytest.mark.parametrize("nested", [False, True])
+def test_compression_excludes_draft_tags_and_shifted_mtp_layers(nested):
     from types import SimpleNamespace
+
+    from transformers import PreTrainedConfig, Qwen3VLMoeConfig
 
     from vllm.compilation.backends import set_model_tag
     from vllm.config import VllmConfig, set_current_vllm_config
     from vllm.model_executor.layers.quantization.utils.mxfp4_csf import (
         should_compress_mxfp4_scales,
     )
+    from vllm.transformers_utils.config import get_hf_text_config
 
     config = VllmConfig()
     config.kernel_config.mxfp4_scale_compression = True
+    hf_config = (
+        Qwen3VLMoeConfig(text_config={"num_hidden_layers": 2})
+        if nested
+        else PreTrainedConfig(num_hidden_layers=2)
+    )
     config.model_config = SimpleNamespace(
-        hf_config=SimpleNamespace(num_hidden_layers=2)
+        hf_config=hf_config, hf_text_config=get_hf_text_config(hf_config)
     )
     layer = SimpleNamespace(layer_name="model.layers.0.mlp.experts")
     with set_current_vllm_config(config):
@@ -96,8 +106,56 @@ def test_compression_excludes_draft_tags_and_shifted_mtp_layers():
         assert not should_compress_mxfp4_scales(layer)
 
 
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("backend", ["auto", "uva"])
+@pytest.mark.parametrize("uva_available,disable_uva", [(False, False), (True, True)])
+def test_compression_rejects_non_uva_weight_offload_before_model_load(
+    monkeypatch, backend, uva_available, disable_uva
+):
+    from vllm.config import KernelConfig, OffloadConfig, VllmConfig
+    from vllm.config.offload import UVAOffloadConfig
+
+    monkeypatch.setattr(
+        "vllm.utils.platform_utils.is_uva_available", lambda: uva_available
+    )
+    monkeypatch.setenv("VLLM_WEIGHT_OFFLOADING_DISABLE_UVA", str(int(disable_uva)))
+    offload = OffloadConfig(
+        offload_backend=backend, uva=UVAOffloadConfig(cpu_offload_gb=1)
+    )
+    VllmConfig(offload_config=offload)  # The default uncompressed path still works.
+    with pytest.raises(ValueError, match="CPU weight offload without UVA"):
+        VllmConfig(
+            kernel_config=KernelConfig(mxfp4_scale_compression=True),
+            offload_config=offload,
+        )
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("offload_mode", ["none", "uva", "prefetch"])
+def test_compression_allows_other_offload_modes(monkeypatch, offload_mode):
+    from vllm.config import KernelConfig, OffloadConfig, VllmConfig
+    from vllm.config.offload import PrefetchOffloadConfig, UVAOffloadConfig
+
+    monkeypatch.setattr(
+        "vllm.utils.platform_utils.is_uva_available", lambda: offload_mode == "uva"
+    )
+    monkeypatch.setenv("VLLM_WEIGHT_OFFLOADING_DISABLE_UVA", "0")
+    offload = OffloadConfig(
+        uva=UVAOffloadConfig(cpu_offload_gb=int(offload_mode == "uva")),
+        prefetch=PrefetchOffloadConfig(
+            offload_group_size=2 if offload_mode == "prefetch" else 0
+        ),
+    )
+    VllmConfig(
+        kernel_config=KernelConfig(mxfp4_scale_compression=True),
+        offload_config=offload,
+    )
+
+
 @pytest.mark.skipif(not torch.accelerator.is_available(), reason="GPU required")
-@pytest.mark.parametrize("rows,words,padding", [(19, 3, 13), (256, 32, 0)])
+@pytest.mark.parametrize(
+    "rows,words,padding", [(19, 1, 0), (19, 1, 13), (19, 3, 13), (256, 32, 0)]
+)
 def test_gpu_decoder_is_byte_exact_with_native_padding(rows, words, padding):
     values = torch.randint(0, 256, (3, rows, words * 4), dtype=torch.uint8)
     original = native_scales(values, "cuda", padding)
