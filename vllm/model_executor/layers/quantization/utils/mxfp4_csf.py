@@ -30,7 +30,7 @@ def should_compress_mxfp4_scales(layer: torch.nn.Module) -> bool:
     # Speculative layers retain their own scales and backend selection.
     match = re.search(r"(?:^|\.)layers\.(\d+)\.", layer.layer_name)
     return not (
-        match and int(match[1]) >= config.model_config.hf_config.num_hidden_layers
+        match and int(match[1]) >= config.model_config.hf_text_config.num_hidden_layers
     )
 
 
@@ -129,7 +129,14 @@ class CompressedMxfp4Scales:
             raise ValueError("CSF exception positions exceed 24 bits per expert")
         # Packing is load-time CPU work. Integer views preserve native bytes,
         # including 0 and 255; no float conversion, clamp or requantization.
-        values = scales.detach().cpu().contiguous().view(torch.uint8).numpy()
+        # Singleton dimensions can retain non-unit strides after contiguous().
+        values = (
+            scales.detach()
+            .cpu()
+            .clone(memory_format=torch.contiguous_format)
+            .view(torch.uint8)
+            .numpy()
+        )
         values = values.reshape(e * n, k * 4)
         bases = np.empty(e * n, dtype=np.uint8)
         selectors = np.empty((e * n, (k + 1) // 2), dtype=np.uint8)
