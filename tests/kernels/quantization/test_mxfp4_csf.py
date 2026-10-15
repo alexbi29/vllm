@@ -23,12 +23,13 @@ def native_scales(values, device="cpu", padding=0):
 
 @pytest.mark.cpu_test
 @pytest.mark.parametrize("words,padding", [(1, 0), (1, 13), (3, 13)])
-def test_codec_preserves_outlier_bytes_and_expert_local_positions(words, padding):
+@pytest.mark.parametrize("rows", [19, 35])
+def test_codec_preserves_outlier_bytes_and_expert_local_positions(words, padding, rows):
     """Every original byte is retained, including four exceptions in one word."""
-    values = torch.full((3, 19, words * 4), 127, dtype=torch.uint8)
+    values = torch.full((3, rows, words * 4), 127, dtype=torch.uint8)
     values[:, :, 1::2] = 128
     values[0, 0, :4] = torch.tensor([0, 255, 247, 249], dtype=torch.uint8)
-    values[1, 18, -4:] = torch.tensor([255, 0, 42, 200], dtype=torch.uint8)
+    values[1, -1, -4:] = torch.tensor([255, 0, 42, 200], dtype=torch.uint8)
     original = native_scales(values, padding=padding)
     csf = CompressedMxfp4Scales.from_native(original)
     assert csf.stride == original.stride()
@@ -36,9 +37,10 @@ def test_codec_preserves_outlier_bytes_and_expert_local_positions(words, padding
     restored = csf.bases.numpy()[..., None] + selectors[..., : words * 4]
     restored = restored.astype(np.uint8)
     offsets = csf.offsets.numpy()
+    tiles = (len(offsets) - 1) // 3
     for expert in range(3):
         records = csf.exceptions.numpy()[
-            offsets[expert * 2] : offsets[(expert + 1) * 2]
+            offsets[expert * tiles] : offsets[(expert + 1) * tiles]
         ]
         restored[expert].flat[records & 0xFFFFFF] = records >> 24
     np.testing.assert_array_equal(restored, values.numpy())
@@ -154,7 +156,8 @@ def test_compression_allows_other_offload_modes(monkeypatch, offload_mode):
 
 @pytest.mark.skipif(not torch.accelerator.is_available(), reason="GPU required")
 @pytest.mark.parametrize(
-    "rows,words,padding", [(19, 1, 0), (19, 1, 13), (19, 3, 13), (256, 32, 0)]
+    "rows,words,padding",
+    [(19, 1, 0), (19, 1, 13), (19, 3, 13), (35, 3, 13), (256, 32, 0)],
 )
 def test_gpu_decoder_is_byte_exact_with_native_padding(rows, words, padding):
     values = torch.randint(0, 256, (3, rows, words * 4), dtype=torch.uint8)
@@ -169,8 +172,8 @@ def test_gpu_decoder_is_byte_exact_with_native_padding(rows, words, padding):
 @pytest.mark.skipif(not torch.accelerator.is_available(), reason="GPU required")
 def test_active_routes_and_alternating_graphs_restore_poisoned_shared_scratch():
     """Replay restores active experts after another layer overwrites scratch."""
-    a = native_scales(torch.randint(0, 256, (8, 32, 64), dtype=torch.uint8), "cuda")
-    b = native_scales(torch.randint(0, 256, (8, 32, 64), dtype=torch.uint8), "cuda")
+    a = native_scales(torch.randint(0, 256, (8, 35, 64), dtype=torch.uint8), "cuda")
+    b = native_scales(torch.randint(0, 256, (8, 35, 64), dtype=torch.uint8), "cuda")
     ca, cb = (CompressedMxfp4Scales.from_native(x) for x in (a, b))
     scratch = ca.make_scratch()
     counts = torch.tensor([0, 0, 0, 0, 0, 0, 1, 1], dtype=torch.int32, device="cuda")
