@@ -585,7 +585,12 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
         block_m = get_mk_alignment_for_contiguous_layout()[0]
         M_sum, align_used = compute_aligned_M_and_alignment(
-            M, topk, local_num_experts, block_m, expert_tokens_meta
+            M,
+            topk,
+            local_num_experts,
+            block_m,
+            expert_tokens_meta,
+            allow_sm120_fp4_m32=self._csf_scales is not None and 0 < M <= 128,
         )
         assert M_sum % align_used == 0
 
@@ -716,6 +721,9 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
             local_num_experts=local_num_experts,
             alignment=get_mk_alignment_for_contiguous_layout()[0],
             expert_tokens_meta=expert_tokens_meta,
+            allow_sm120_fp4_m32=(
+                self._csf_scales is not None and 0 < topk_ids.size(0) <= 128
+            ),
         )
 
         a1q_perm = _resize_cache(
@@ -731,6 +739,9 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
             expert_tokens_meta=expert_tokens_meta,
             aq_out=a1q_perm,
             use_psum_layout=use_psum_layout,
+            allow_sm120_fp4_m32=(
+                self._csf_scales is not None and 0 < topk_ids.size(0) <= 128
+            ),
         )
         assert a1q.size(0) == M_sum
 
