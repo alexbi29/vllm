@@ -30,6 +30,8 @@ def compute_aligned_M_and_alignment(
     local_num_experts: int,
     alignment: int,
     expert_tokens_meta: mk.ExpertTokensMetadata | None,
+    *,
+    allow_sm120_fp4_m32: bool = False,
 ) -> tuple[int, int]:
     """Return (M_sum, alignment_used).
 
@@ -70,6 +72,7 @@ def compute_aligned_M_and_alignment(
         per_call_align = get_theoretical_mk_alignment_for_contiguous_layout(
             expected_m=expected_m,
             num_groups=local_num_experts,
+            allow_sm120_fp4_m32=allow_sm120_fp4_m32,
         )
         if per_call_align and per_call_align <= alignment:
             alignment = per_call_align
@@ -480,6 +483,7 @@ def deepgemm_moe_permute(
     aq_out: torch.Tensor | None = None,
     block_size: int | None = None,
     use_psum_layout: bool = False,
+    allow_sm120_fp4_m32: bool = False,
 ):
     assert aq.ndim == 2
     assert topk_ids.dtype.is_signed, "The kernel uses -1 to represent invalid topk_ids"
@@ -498,6 +502,7 @@ def deepgemm_moe_permute(
         local_num_experts=local_num_experts,
         alignment=block_m,
         expert_tokens_meta=expert_tokens_meta,
+        allow_sm120_fp4_m32=allow_sm120_fp4_m32,
     )
 
     expert_start_loc = torch.empty(

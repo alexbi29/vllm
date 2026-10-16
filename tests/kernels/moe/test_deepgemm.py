@@ -188,6 +188,46 @@ def test_sm12x_legacy_alignment_steps_down_at_per_expert_boundary(
             )
 
 
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "per_expert,enabled,capability,sm120,expected",
+    [
+        (1, True, True, True, 32),
+        (32, True, True, True, 32),
+        (33, True, True, True, 64),
+        (1, False, True, True, 64),
+        (1, True, False, True, 64),
+        (1, True, None, True, 64),
+        (1, True, True, False, 128),
+    ],
+)
+def test_sm120_fp4_m32_alignment_requires_matching_native_support(
+    monkeypatch, per_expert, enabled, capability, sm120, expected
+):
+    """M32 must never reach an older native selector or an unrelated caller."""
+    from types import SimpleNamespace
+
+    import vllm.utils.deep_gemm as dg
+
+    module = SimpleNamespace()
+    if capability is not None:
+        module.supports_sm120_grouped_fp8_fp4_m32 = lambda: capability
+    monkeypatch.setattr(dg, "_lazy_init", lambda: None)
+    monkeypatch.setattr(dg, "_import_deep_gemm", lambda: module)
+    monkeypatch.setattr(
+        dg, "_get_theoretical_mk_alignment_for_contiguous_layout_impl", lambda m: 128
+    )
+    monkeypatch.setattr(
+        dg.current_platform, "is_device_capability_family", lambda family: sm120
+    )
+    assert (
+        dg.get_theoretical_mk_alignment_for_contiguous_layout(
+            per_expert * 128, 128, allow_sm120_fp4_m32=enabled
+        )
+        == expected
+    )
+
+
 def test_ep_gather_uses_64_bit_row_offsets():
     hidden_size = 4096
     source_row = 1 << 18
@@ -784,8 +824,9 @@ def test_deepgemm_fp4_vs_triton(
     reason="Requires Blackwell DeepGEMM FP4 kernels",
 )
 @pytest.mark.parametrize("activation", [MoEActivation.SILU, MoEActivation.SITU])
+@pytest.mark.parametrize("m,e", [(6, 4), (96, 16), (128, 16), (129, 16)])
 def test_resident_csf_matches_native_moe_across_local_routes(
-    activation, monkeypatch, workspace_init
+    activation, m, e, monkeypatch, workspace_init
 ):
     """Shared scratch must preserve native output after routing and layer changes."""
     import weakref
@@ -803,7 +844,7 @@ def test_resident_csf_matches_native_moe_across_local_routes(
     from vllm.platforms import current_platform
 
     torch.manual_seed(917)
-    m, n, k, e = 6, 512, 1024, 4
+    n, k = 512, 1024
     w1, w2, s1, s2, *_ = make_mxfp4_weights(e, n, k)
     s1, s2 = _pack_deepgemm_mxfp4_scales(w1, w2, s1, s2)
     config = VllmConfig()
@@ -855,7 +896,8 @@ def test_resident_csf_matches_native_moe_across_local_routes(
         layer.state_dict()
 
     # EP map: even global expert IDs belong to this rank, odd ones are remote.
-    expert_map = torch.tensor([0, -1, 1, -1, 2, -1, 3, -1], device="cuda")
+    expert_map = torch.arange(e, device="cuda").repeat_interleave(2)
+    expert_map[1::2] = -1
     tokens = torch.randn(m, k, device="cuda", dtype=torch.bfloat16) * (k**-0.5)
     weights = torch.full((m, 2), 0.5, device="cuda")
     original_apply = packed.apply
@@ -877,13 +919,25 @@ def test_resident_csf_matches_native_moe_across_local_routes(
                 w2=w2,
                 topk_weights=weights,
                 topk_ids=topk_ids,
-                global_num_experts=8,
+                global_num_experts=2 * e,
                 activation=activation,
                 expert_map=expert_map,
                 apply_router_weight_on_input=False,
             )
-            expected = reference.apply(**args)
+            expected = reference.apply(**args).clone()
             packed.w1_scale.fill_(0)
             packed.w2_scale.fill_(0)
             actual = candidate.apply(**args)
             assert torch.equal(actual, expected)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        replay_output = candidate.apply(**args)
+    for ids in ([0, 2], [1, 3], [4, 6], [0, 7]):
+        args["topk_ids"].copy_(torch.tensor(ids, device="cuda").expand(m, 2))
+        expected = reference.apply(**args).clone()
+        packed.w1_scale.fill_(0)
+        packed.w2_scale.fill_(0)
+        graph.replay()
+        torch.accelerator.synchronize()
+        assert torch.equal(replay_output, expected)
