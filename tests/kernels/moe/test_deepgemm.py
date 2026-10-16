@@ -149,6 +149,45 @@ def test_alignment_python_binding_compatibility(monkeypatch, arguments):
     assert received == ([(1,)] if arguments == 1 else [(36, 128)])
 
 
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "expected_m,groups,sm12x,expected",
+    [
+        (None, None, True, 128),
+        (1, None, True, 64),
+        (64, None, True, 64),
+        (65, None, True, 128),
+        (512, 8, True, 64),
+        (513, 8, True, 128),
+        (512, 8, False, 128),
+    ],
+)
+def test_sm12x_legacy_alignment_steps_down_at_per_expert_boundary(
+    monkeypatch, expected_m, groups, sm12x, expected
+):
+    """A legacy library must not force small SM12x expert batches to 128 rows."""
+    import vllm.utils.deep_gemm as dg
+
+    monkeypatch.setattr(dg, "_lazy_init", lambda: None)
+    monkeypatch.setattr(
+        dg,
+        "_get_theoretical_mk_alignment_for_contiguous_layout_impl",
+        lambda expected_m: 128,
+    )
+    monkeypatch.setattr(
+        dg.current_platform, "is_device_capability_family", lambda family: sm12x
+    )
+    assert (
+        dg.get_theoretical_mk_alignment_for_contiguous_layout(expected_m, groups)
+        == expected
+    )
+    for invalid_groups in (0, -1):
+        with pytest.raises(ValueError, match="num_groups must be positive"):
+            dg.get_theoretical_mk_alignment_for_contiguous_layout(
+                expected_m, invalid_groups
+            )
+
+
 def test_ep_gather_uses_64_bit_row_offsets():
     hidden_size = 4096
     source_row = 1 << 18
