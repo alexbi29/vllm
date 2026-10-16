@@ -404,6 +404,8 @@ def get_mk_alignment_for_contiguous_layout() -> list[int]:
 def get_theoretical_mk_alignment_for_contiguous_layout(
     expected_m: int | None = None,
     num_groups: int | None = None,
+    *,
+    allow_sm120_fp4_m32: bool = False,
 ) -> int:
     """Per-call optimal M alignment for grouped contiguous GEMMs.
 
@@ -444,14 +446,18 @@ def get_theoretical_mk_alignment_for_contiguous_layout(
             alignment = _get_theoretical_mk_alignment_for_contiguous_layout_impl(
                 per_group_m
             )
-    # Older SM12x bindings retain a fixed 128-row legacy alignment. Their
-    # grouped kernels support 64 rows, but not the 32-row floor used elsewhere.
+    # M32 needs both the FP4 caller's opt-in and a matching native selector.
     if (
-        alignment == 128
+        alignment in (64, 128)
         and per_group_m is not None
         and per_group_m <= 64
         and current_platform.is_device_capability_family(120)
     ):
+        if allow_sm120_fp4_m32 and per_group_m <= 32:
+            module = _import_deep_gemm()
+            supports_m32 = getattr(module, "supports_sm120_grouped_fp8_fp4_m32", None)
+            if supports_m32 is not None and supports_m32():
+                return 32
         return 64
     return alignment
 
