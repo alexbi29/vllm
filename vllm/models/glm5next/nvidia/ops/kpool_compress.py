@@ -1031,6 +1031,10 @@ def _expand_pools_and_append_tail_kernel(
     tail_out = tl.where(is_tail, tail_val, -1)
 
     result = tl.where(is_history, hist_out, tail_out)
+    # Capture takes the pooled path even when eager would select all tokens.
+    # Match eager's contiguous causal layout, including its reduction order.
+    causal = tl.where(cols < seq_len, cols, -1).to(tl.int32)
+    result = tl.where(seq_len <= topk, causal, result)
     tl.store(out_ptr + row * out_s0 + cols, result, mask=mask)
 
 
@@ -1041,9 +1045,9 @@ def expand_pools_and_append_tail(
 ) -> torch.Tensor:
     """Fuse ``expand_pools_to_tokens`` + ``append_tail_to_topk`` (identity path).
 
-    Produces the same ``[rows, topk + pool_size - 1]`` int32 output as calling
-    the two functions in sequence when neither ``page_table`` nor
-    ``topk_offsets`` is passed — the only path used by the GLM-5.3-Flash indexer.
+    Short rows use contiguous causal indices to match the eager fast path.
+    Longer rows match the two separate operations without ``page_table`` or
+    ``topk_offsets``, as used by the GLM-5.3-Flash indexer.
     The kernel derives ``pool_len = seq_len // pool_size`` internally, so the
     caller no longer needs to precompute it. Replaces ~25 elementwise kernels
     with one Triton launch.

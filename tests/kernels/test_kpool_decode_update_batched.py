@@ -134,6 +134,50 @@ def test_pool_cutoff_ties_choose_lowest_logical_ids(device, columns, poor_cutoff
         torch.testing.assert_close(selected, expected, rtol=0, atol=0)
 
 
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="NVIDIA pool indexer")
+@pytest.mark.parametrize("device", range(torch.accelerator.device_count()))
+def test_short_pool_history_matches_eager_causal_layout_on_graph_replay(device):
+    """Short rows keep tails contiguous when replay crosses the sparse cutoff."""
+    from vllm.models.glm5next.nvidia.ops.kpool_compress import (
+        expand_pools_and_append_tail,
+    )
+
+    with torch.accelerator.device_index(device):
+        pool_ids = torch.arange(512, dtype=torch.int64, device=device).repeat(5, 1)
+        lengths = torch.tensor([0, 37, 2048, 2049, 8192], device=device)
+        pool_ids.masked_fill_(pool_ids >= lengths[:, None] // 4, -1)
+
+        def expected():
+            rows = []
+            for length, ids in zip(lengths.tolist(), pool_ids.tolist()):
+                if length <= 2048:
+                    rows.append(list(range(length)) + [-1] * (2051 - length))
+                else:
+                    history = [
+                        4 * pid + offset if pid >= 0 else -1
+                        for pid in ids
+                        for offset in range(4)
+                    ]
+                    tail = [
+                        4 * (length // 4) + i if i < length % 4 else -1
+                        for i in range(3)
+                    ]
+                    rows.append(history + tail)
+            return torch.tensor(rows, dtype=torch.int32, device=device)
+
+        output = expand_pools_and_append_tail(pool_ids, lengths, 4)
+        torch.testing.assert_close(output, expected(), rtol=0, atol=0)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=torch.cuda.Stream(device=device)):
+            output = expand_pools_and_append_tail(pool_ids, lengths, 4)
+        lengths.copy_(torch.tensor([2049, 2047, 2050, 36, 8193], device=device))
+        pool_ids.copy_(torch.arange(512, device=device).flip(0).repeat(5, 1))
+        pool_ids.masked_fill_(pool_ids >= lengths[:, None] // 4, -1)
+        pool_ids[:, ::3] = -1
+        graph.replay()
+        torch.testing.assert_close(output, expected(), rtol=0, atol=0)
+
+
 def _make_caches():
     kv = torch.zeros(
         NUM_BLOCKS, PAGE_SIZE, HEAD_DIM + 4, dtype=torch.uint8, device="cuda"

@@ -34,15 +34,43 @@ across repeats; all scores are finite. Operator checks also cover native
 GEMM output bytes, changing graph routes, all finite BF16 cache maxima,
 strided pages and native/public FlashInfer prefill/decode parity.
 
-Full hard8×15/C2 is running separately. No throughput gain or completed
+The original eager hard8×15/C2 was checkpointed at 17 completed attempts;
+a fresh full graph-profile run started on October 17. No completed
 general-quality result is claimed here. See
 [validation summary](glm53_sm120_compression_validation.json).
 
 Qualified serving configuration: TP2/DCP1, no EP, synchronous scheduling,
-eager execution, text only, MTP off, BF16 activations, FP8 KV, two request
-slots, 2048 batched tokens, 65536 request context, and 0.95 memory budget.
-Capacity is not a validated single-request context limit. Full-model
-graphs, MTP, external KV connectors and other hardware are not qualified.
+eager or full decode graphs at sizes 1/2, text only, MTP off, BF16 activations,
+FP8 KV, two request slots, 2048 batched tokens, 65536 request context, and 0.95 memory budget.
+The graph profile pins the tested host's 137 physical cache blocks to retain
+345,324 logical tokens; this block count is host-specific. Capacity is not a
+validated single-request context limit. Prefill graphs, MTP, external KV
+connectors and other hardware are not qualified.
+
+## Decode graphs
+
+Matched fixed-work raw completions (three runs, two requests/run, 128 output
+tokens/request, temperature 0, seed 0, replayed prompts) measure about 63 tok/s
+at C1 and 98–100 aggregate tok/s at C2, versus 8.25/16.16 with eager execution.
+Returning to eager gives 8.05/15.70; a final graph cold load gives 62.98/97.76.
+This is a configuration speedup; no serving speedup is attributed to the scale
+codec itself. The raw API uses no chat or reasoning template. These rates do
+not describe general answer quality or a long-context throughput sweep.
+
+The graph profile passes all 13 frozen full-model fixtures, with exact IDs
+and top-five scores through 64K, plus a simultaneous two-request fixture with
+64,512 input and 64 output tokens per request. C2 short-prompt checks expose
+two prefill outcome groups from HTTP batching; each complete token/score group
+has an exact counterpart in eager and graph execution. Global batching
+invariance is not claimed.
+
+Capture uses the pooled path while eager short contexts use contiguous causal
+indices. The old pooled layout left padding before tail tokens and changed
+attention reduction order. Expansion now selects contiguous causal indices on
+the GPU when all history fits, preserving eager behavior as lengths change on
+replay. Long rows retain the pooled layout. This adds no host read or kernel
+launch. The valid-input regression fails before the change; all 28 pool tests
+pass afterward across both GPUs, and all packaged suites total 75 passed.
 
 ## Sparse-selector repair
 
@@ -93,10 +121,11 @@ Example launch after building this vLLM base and preparing the overlay:
 vllm serve nvidia/GLM-5.3-Flash-NVFP4 \
   --tensor-parallel-size 2 --dtype bfloat16 --kv-cache-dtype fp8 \
   --max-model-len 65536 --max-num-seqs 2 --max-num-batched-tokens 2048 \
-  --gpu-memory-utilization 0.95 --enforce-eager --no-async-scheduling \
+  --gpu-memory-utilization 0.95 --num-gpu-blocks-override 137 --no-async-scheduling \
+  --compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[1,2],"max_cudagraph_capture_size":2}' \
   --moe-backend flashinfer_cutlass --language-model-only \
   --reasoning-parser glm45 --tool-call-parser glm47 --enable-auto-tool-choice \
-  --kernel-config '{"nvfp4_scale_compression":true,"enable_flashinfer_autotune":false,"glm53_compact_kv":true}'
+  --kernel-config '{"nvfp4_scale_compression":true,"enable_flashinfer_autotune":false,"glm53_compact_kv":true,"enable_jit_warmup":false}'
 ```
 
 Original-layout control: remove `glm53_compact_kv` and use installed FlashInfer
@@ -104,6 +133,12 @@ instead of the overlay, retaining the selector repair and weight-scale codec.
 Resident compression rejects EP, EPLB, ubatching, asynchronous scheduling,
 sleep and state export; its scratch is shared across serialized target layers.
 Draft/MTP layers are excluded.
+
+For the eager execution control, add `--enforce-eager`; retain the other
+settings. Graph profiling otherwise conservatively selects 116 blocks on
+this host, reducing capacity to 292,391 tokens. The pinned 137-block profile
+passes the simultaneous 64K fixture with about 1.35 GiB free/GPU reported by
+NVML. Re-measure capacity and peak usage for different hardware or settings.
 
 ## Existing upstream work
 
@@ -119,4 +154,5 @@ Draft/MTP layers are excluded.
   representation here addresses that separate memory cost.
 
 This is a fork review package, not a competing upstream submission. Human
-semantic review and the remaining quality result are required before promotion.
+semantic review and the remaining quality result are required before promoting
+this draft for upstream submission.
