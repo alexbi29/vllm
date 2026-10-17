@@ -1768,3 +1768,32 @@ def test_concat_and_cache_mla_cpu(
 
     ops.concat_and_cache_mla(kv_c, k_pe, kv_cache, slot_mapping, kv_cache_dtype, scale)
     torch.testing.assert_close(kv_cache, ref_kv_cache)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability_family(120),
+    reason="Compact NoPE layout is qualified on SM120",
+)
+@pytest.mark.parametrize("tokens", [1, 17, 65])
+def test_compact_nope_cache_preserves_native_bytes_and_block_padding(tokens):
+    """The compact writer must match the legacy payload and respect block stride."""
+    from vllm.v1.attention.ops.glm53_compact_kv import write_compact_nope
+
+    set_random_seed(0)
+    values = torch.randn((tokens, 1024), dtype=torch.bfloat16, device="cuda")[:, :512]
+    slots = torch.arange(tokens, device="cuda", dtype=torch.int64).flip(0)
+    slots[1::7] = -1
+    legacy = torch.full((2, 64, 656), 0xA5, dtype=torch.uint8, device="cuda")
+    storage = torch.full((2, 65, 528), 0xA5, dtype=torch.uint8, device="cuda")
+    compact = storage[:, :64, :]
+    ops.concat_and_cache_mla(
+        values,
+        values.new_empty((tokens, 0)),
+        legacy,
+        slots,
+        "fp8_ds_mla",
+        torch.ones(1, dtype=torch.float32, device="cuda"),
+    )
+    write_compact_nope(values, compact, slots)
+    assert torch.equal(compact, legacy[:, :, :528])
+    assert bool(torch.all(storage[:, 64, :] == 0xA5))
