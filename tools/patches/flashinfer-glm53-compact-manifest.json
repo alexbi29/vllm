@@ -1,0 +1,42 @@
+{
+  "baseline": "FlashInfer 0.7.0.post1 packaged source",
+  "candidate": "Companion compact-KV overlay patch",
+  "files": [
+    {
+      "path": "data/include/flashinfer/attention/sparse_mla_sm120/model/model_type.h",
+      "baseline_sha256": "ecb4be428e4e522053b31e45c230f0c21455eac421a317a0668b37ea4c0c0566",
+      "compact_sha256": "ad555f0ff470c95683a6ade4a2e3a0728cf4a95914982ae094d241b54c19cdc7"
+    },
+    {
+      "path": "data/include/flashinfer/attention/sparse_mla_sm120/model/kv_cache_traits.cuh",
+      "baseline_sha256": "8f9270a58272810f5eb22fd2e5d22ac3e2596f2fdbfa9fe28d5773c09737d6e6",
+      "compact_sha256": "d85ef5594452f2e9dfacbdff64075a1afcfda5d2da521b41121aa786d4d7915e"
+    },
+    {
+      "path": "mla/_sparse_mla_sm120_plan.py",
+      "baseline_sha256": "d4fcc48abe2ff4bf956e799fd5d7e32886e83a68700f032de70a2fcf42dd3f3a",
+      "compact_sha256": "1d698020615b7142f755f2600d357649016cbb00a255edfdf2db3439a868000f"
+    },
+    {
+      "path": "mla/_sparse_mla_sm120.py",
+      "baseline_sha256": "0b93e36914f2614dde2a6ecc23c546ca486f53a7e3ecd99ad7ef43b3ac51b245",
+      "compact_sha256": "0bea6e87c8b43033ee2db25039afb2004ecc25c8e6ce723d76224e96a1dbdaf8"
+    },
+    {
+      "path": "mla/_sparse_mla_sm120_cpb.py",
+      "baseline_sha256": "f72ad95b35ae38eac0e715d4484e2ec04388dbfdb165fa3dd76e0952a11add90",
+      "compact_sha256": "10c76b8bc44479ff1f212df5e93937a007a27c8719d8cc815c571ce6cc1cc20f"
+    },
+    {
+      "path": "mla/_core.py",
+      "baseline_sha256": "80bea4478dc0b812463a3d2557f0b9721ab7d79b25f0dc7513816fd3a0188785",
+      "compact_sha256": "a37a81d5933341aebb30acbf5805a6030c75ab013cfceffc62765051ef611e21"
+    },
+    {
+      "path": "jit/mla.py",
+      "baseline_sha256": "9e45911c7946082bf80707ccd7655ba640d4cc9a8de2fa72e9eae1284cbf9030",
+      "compact_sha256": "34f672735c059c5eb81118b1f2ca7b3d7d8e68904ee5828b8e34f64337366874"
+    }
+  ],
+  "patch_sha256": "a1f54b97d7bf5bb9f9d48f4ed66b66f5f8024e00b2fbe539df72f1b821d89c17"
+}

@@ -66,6 +66,11 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
         if self.quant_config.use_nvfp4_w4a4:
             layer.w13_weight_scale_2.data.mul_(layer.w13_input_scale)
             layer.w2_weight_scale_2.data.mul_(layer.w2_input_scale)
+        from vllm.model_executor.layers.quantization.utils.nvfp4_resident import (
+            prepare_resident_nvfp4_scales,
+        )
+
+        self._nvfp4_resident = prepare_resident_nvfp4_scales(self, layer)
 
     def __init__(
         self,
@@ -84,6 +89,7 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
             " float16 quantization are currently supported."
         )
         self.device = moe_config.device
+        self._nvfp4_resident = None
         self.num_experts = moe_config.num_local_experts
         self.ep_rank = moe_config.moe_parallel_config.ep_rank
         self.ep_size = moe_config.moe_parallel_config.ep_size
@@ -260,6 +266,8 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool | None,
     ):
+        if self._nvfp4_resident is not None:
+            self._nvfp4_resident.decode(topk_ids)
         quant_scales = None
         fc1_expert_weights = None
         fc2_expert_weights = None

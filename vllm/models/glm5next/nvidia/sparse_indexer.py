@@ -368,6 +368,10 @@ def sparse_attn_indexer_kpool(
                     logits.stride(1),
                     select_k,
                 )
+            if index_kpool > 1:
+                kpool_ops.stabilize_pool_topk_(
+                    logits, pool_topk, chunk.cu_seqlen_ke, chunk.cu_seqlen_ks
+                )
             # Local pool ids -> request-relative global pool ids.
             _merge_dcp_topk_global(
                 logits,
@@ -380,6 +384,7 @@ def sparse_attn_indexer_kpool(
             )
 
             if index_kpool > 1:
+                kpool_ops.canonicalize_pool_indices_(pool_topk)
                 pool_ids = pool_topk.to(torch.int64)
                 if positions is not None:
                     # Fused expand-pools + append-tail into one Triton kernel
@@ -614,6 +619,8 @@ def sparse_attn_indexer_kpool(
             select_k,
             attn_metadata_narrowed.max_seq_len,
         )
+        if index_kpool > 1:
+            kpool_ops.stabilize_pool_topk_(logits, pool_topk, seq_lens.reshape(-1))
         _merge_dcp_topk_global(
             logits,
             topk_dst,
@@ -625,6 +632,7 @@ def sparse_attn_indexer_kpool(
 
         # Resolve to token-level indices in the output buffer.
         if index_kpool > 1:
+            kpool_ops.canonicalize_pool_indices_(pool_topk)
             pool_ids = pool_topk.to(torch.int64)
             n = pool_topk.shape[0]
             # Decode seq_lens are pool-granular; recover token lengths from
