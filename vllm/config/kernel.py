@@ -298,6 +298,16 @@ class KernelConfig:
     in a single launch (DeepSeek-V4.1 on MI355X). A deployment that cannot run
     it is refused at startup."""
 
+    nvfp4_scale_compression: bool = False
+    """Experimental lossless native NVFP4 expert-scale compression.
+
+    Requires the FlashInfer CUTLASS backend, TP without EP, synchronous
+    scheduling and no sleep/EPLB/ubatching. Original weights and GEMMs remain.
+    """
+
+    glm53_compact_kv: bool = False
+    """Use the private SM120 528-byte GLM no-RoPE FP8 cache ABI."""
+
     moe_backend: MoEBackend = "auto"
     """Backend for MoE expert computation kernels. Available options:
 
@@ -473,6 +483,23 @@ class KernelConfig:
                         "offload without UVA. Enable UVA or disable CPU weight "
                         "offload or scale compression."
                     )
+        if self.nvfp4_scale_compression:
+            if self.moe_backend != "flashinfer_cutlass":
+                raise ValueError("NVFP4 scale compression requires flashinfer_cutlass")
+            if vllm_config.model_config is None:
+                raise ValueError("NVFP4 scale compression requires a model config")
+            parallel = vllm_config.parallel_config
+            if (
+                parallel.enable_expert_parallel
+                or parallel.enable_eplb
+                or parallel.use_ubatching
+                or vllm_config.scheduler_config.async_scheduling
+                or vllm_config.model_config.enable_sleep_mode
+            ):
+                raise ValueError(
+                    "NVFP4 scale compression prototype requires synchronous "
+                    "TP without EP, EPLB, ubatching, or sleep"
+                )
 
         if vllm_config.model_config is not None:
             validate_flashinfer_moe_ep_model(

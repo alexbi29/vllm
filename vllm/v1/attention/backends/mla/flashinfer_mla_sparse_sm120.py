@@ -92,6 +92,39 @@ class FlashInferMLASparseSM120Impl(SparseMLACommonImpl[FlashInferMLASparseMetada
                 vllm_config.model_config.hf_text_config, "model_type", None
             )
         self.kv_scale_format = _kv_scale_format_for_model(model_type)
+        self.compact_glm53_kv = getattr(
+            vllm_config.kernel_config, "glm53_compact_kv", False
+        )
+        if self.compact_glm53_kv:
+            from flashinfer.mla import supported_sparse_mla_sm120_configs
+
+            if (
+                model_type is None
+                or not model_type.startswith("glm")
+                or self.qk_rope_head_dim != 0
+                or self.kv_lora_rank != 512
+                or supported_sparse_mla_sm120_configs()["glm53_nope"].bytes_per_token
+                != 528
+            ):
+                raise ValueError(
+                    "Compact GLM KV requires the private 528-byte FlashInfer build"
+                )
+            if isinstance(getattr(self, "index_group", None), HiSparseMLAIndexGroup):
+                raise ValueError("Compact GLM KV does not support HiSparse")
+        elif (
+            model_type is not None
+            and model_type.startswith("glm")
+            and self.qk_rope_head_dim == 0
+        ):
+            from flashinfer.mla import supported_sparse_mla_sm120_configs
+
+            if (
+                supported_sparse_mla_sm120_configs()["glm53_nope"].bytes_per_token
+                != 656
+            ):
+                raise ValueError(
+                    "Private compact FlashInfer requires glm53_compact_kv=true"
+                )
 
         from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm120
 
@@ -104,6 +137,21 @@ class FlashInferMLASparseSM120Impl(SparseMLACommonImpl[FlashInferMLASparseMetada
 
         self.supports_quant_query_input = False
         self._workspace_buffer: torch.Tensor | None = None
+
+    def do_kv_cache_update(
+        self, kv_c_normed, k_pe, kv_cache, slot_mapping, kv_cache_dtype, k_scale
+    ) -> None:
+        if not self.compact_glm53_kv:
+            return super().do_kv_cache_update(
+                kv_c_normed, k_pe, kv_cache, slot_mapping, kv_cache_dtype, k_scale
+            )
+        if k_pe.numel() != 0 or kv_cache_dtype != "fp8_ds_mla":
+            raise ValueError("Compact GLM writer requires no positional keys")
+        if not kv_cache.numel():
+            return
+        from vllm.v1.attention.ops.glm53_compact_kv import write_compact_nope
+
+        write_compact_nope(kv_c_normed, kv_cache, slot_mapping.flatten())
 
     def forward_mqa(
         self,

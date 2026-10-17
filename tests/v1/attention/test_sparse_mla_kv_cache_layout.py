@@ -13,6 +13,10 @@ from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.platforms import current_platform
 from vllm.v1.attention.backend import MultipleOf
+from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
+    FlashInferMLASparseSM120Backend,
+)
+from vllm.v1.attention.backends.mla.flashmla_sparse import FlashMLASparseBackend
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
 from vllm.v1.attention.backends.mla.sparse_utils import (
     _CONVERT_REQ_INDEX_TO_GLOBAL_INDEX_KERNEL,
@@ -26,6 +30,45 @@ from vllm.v1.kv_cache_layout import KVCacheLayout
 from vllm.v1.worker.utils import allocate_kv_cache, customize_attention_spec
 
 pytestmark = pytest.mark.skip_global_cleanup
+
+
+@pytest.mark.parametrize("compact,row_bytes", [(False, 656), (True, 528)])
+def test_glm_nope_cache_uses_selected_physical_row_size(compact, row_bytes):
+    config = SimpleNamespace(
+        cache_config=CacheConfig(block_size=4352),
+        model_config=SimpleNamespace(dtype=torch.bfloat16),
+        attention_config=SimpleNamespace(hisparse_config=None),
+        kernel_config=SimpleNamespace(glm53_compact_kv=compact),
+    )
+    config.cache_config.kv_cache_layout = "BLHNC"
+    layer = SimpleNamespace(
+        attn_backend=FlashInferMLASparseSM120Backend,
+        kv_cache_dtype="fp8_ds_mla",
+        head_size=512,
+        kv_lora_rank=512,
+        qk_rope_head_dim=0,
+        sliding_window=None,
+        indexer=None,
+        non_causal_multi_token_decode=False,
+    )
+    spec = MLAAttention.get_kv_cache_spec(layer, config)
+    assert spec.state_content_bytes == row_bytes
+    assert spec.page_size_bytes == 4352 * row_bytes
+    group = KVCacheGroupSpec(["mla"], spec)
+    cache = get_kv_cache_config_from_groups(config, [group], 2**24)
+    views = allocate_kv_cache(cache, torch.device("cpu"), KVCacheLayout.BLHNC)
+    rows = views["mla"].view(-1, 4352, row_bytes)
+    assert rows.stride(1) == row_bytes
+    assert rows.stride(0) == 4352 * row_bytes
+    assert rows.untyped_storage().nbytes() == cache.num_blocks * spec.page_size_bytes
+    if compact:
+        layer.qk_rope_head_dim = 64
+        with pytest.raises(ValueError, match="no-RoPE"):
+            MLAAttention.get_kv_cache_spec(layer, config)
+        layer.qk_rope_head_dim = 0
+        layer.attn_backend = FlashMLASparseBackend
+        with pytest.raises(ValueError, match="SM120"):
+            MLAAttention.get_kv_cache_spec(layer, config)
 
 
 @pytest.mark.parametrize(
