@@ -721,9 +721,7 @@ def test_triton_unified_attn_clamped_mm_matches_dense_reference(
         [0] + query_lens, dtype=torch.int32, device=DEVICE_TYPE
     ).cumsum(0, dtype=torch.int32)
     kv_lens = torch.tensor(kv_lens_list, dtype=torch.int32, device=DEVICE_TYPE)
-    mm_prefix_range = torch.tensor(
-        [[[32, 351]], [[160, 287]]], dtype=torch.int32, device=DEVICE_TYPE
-    )
+    mm_prefix_range = torch.tensor(mm_ranges, dtype=torch.int32, device=DEVICE_TYPE)
     actual = torch.empty_like(query)
 
     attention_args = dict(
