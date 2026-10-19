@@ -387,7 +387,7 @@ def test_clamped_mm_prefix_preserves_noncausal_right_window(
 @pytest.mark.parametrize("kv_heads", [1, 2])
 @pytest.mark.parametrize("layout", ["HND", "NHD"])
 @pytest.mark.parametrize("block_size", [16, 256])
-@pytest.mark.parametrize("scratch_rows", [1, 8])
+@pytest.mark.parametrize("scratch_rows", [1, 4, 8])
 def test_gemma4_compact_kv(
     query_len, segments, kv_heads, layout, block_size, scratch_rows, monkeypatch
 ):
