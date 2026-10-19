@@ -362,6 +362,15 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
             fc1_expert_weights = w1
             fc2_expert_weights = w2
 
+        finalize_kwargs = {}
+        if (
+            activation == MoEActivation.GELU_TANH
+            and self.quant_config.use_nvfp4_w4a4
+            and current_platform.is_device_capability_family(120)
+        ):
+            # Atomic finalize rounds each expert addition in a variable order.
+            finalize_kwargs["use_fused_finalize"] = False
+
         _ = flashinfer_cutlass_fused_moe(
             input=hidden_states,
             token_selected_experts=topk_ids.to(torch.int),
@@ -386,12 +395,7 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
             use_deepseek_fp8_block_scale=self.use_deepseek_fp8_block_scale,
             use_mxfp8_act_scaling=use_mxfp8_act_scaling,
             use_w4_group_scaling=use_w4_group_scaling,
-            # Atomic finalize rounds each expert addition and is order dependent.
-            use_fused_finalize=not (
-                activation == MoEActivation.GELU_TANH
-                and self.quant_config.use_nvfp4_w4a4
-                and current_platform.is_device_capability_family(120)
-            ),
+            **finalize_kwargs,
         )
 
     def moe_sum(self, input: torch.Tensor, output: torch.Tensor) -> None:
