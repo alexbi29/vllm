@@ -1112,13 +1112,33 @@ def unified_attention(
             f"(out.stride(1) = {out.stride(1)} != head_size = {head_size})."
         )
 
+    # Compact global attention has very few KV heads. Short verification
+    # queries whose scratch holds every query row keep the per-sequence
+    # split-KV threshold, instead of serially scanning the context on a few
+    # CTAs once the Q-block count passes it.
+    compact_short_query = (
+        compact_k_norm is not None
+        and current_platform.is_device_capability(120)
+        and max_seqlen_q <= 4
+        and softmax_segm_output is not None
+        and softmax_segm_max is not None
+        and softmax_segm_expsum is not None
+        and min(
+            softmax_segm_output.shape[0],
+            softmax_segm_max.shape[0],
+            softmax_segm_expsum.shape[0],
+        )
+        >= q.shape[0]
+    )
+
     # Launch the 2D kernel if
     # 1. No split-K threshold or scratch buffers, or the scratch has fewer
     #    rows than query tokens, or
     # 2. max_seqlen_q > 1 and either it exceeds MAX_3D_QUERY_LEN, masking is
     #    non-causal, per-sequence causal, or mm-prefix, or the tuned
     #    large-head path applies, or
-    # 3. The number of Q blocks exceeds seq_threshold_3D, or
+    # 3. The number of Q blocks (sequences, for compact short queries)
+    #    exceeds seq_threshold_3D, or
     # 4. Batch invariance is enabled
     use_3d = not (
         seq_threshold_3D is None
@@ -1136,7 +1156,12 @@ def unified_attention(
                 or tuned_large_head
             )
         )
-        or num_seqs * triton.cdiv(max_seqlen_q, BLOCK_Q) > seq_threshold_3D
+        or (
+            num_seqs
+            if compact_short_query
+            else num_seqs * triton.cdiv(max_seqlen_q, BLOCK_Q)
+        )
+        > seq_threshold_3D
         or is_batch_invariant
     )
     if use_3d and softmax_segm_max.shape[0] < q.shape[0]:
