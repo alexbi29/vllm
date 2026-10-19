@@ -1101,6 +1101,30 @@ def unified_attention(
         # Reconstructing 512-wide K tiles needs more shared memory than the
         # dense path. Bound pipelining to fit SM120's per-block limit.
         launch_num_stages = 1
+        if (
+            compact_fp8_storage
+            and current_platform.is_device_capability(120)
+            and num_seqs == 1
+            and num_kv_heads == 2
+            and num_queries_per_kv == 8
+            and block_size == 512
+            and max_seqlen_q >= 1024
+            and window_size == (-1, -1)
+            and use_causal
+            and not use_per_seq_causal
+            and not is_batch_invariant
+            and mm_prefix_range is None
+            and rswa_prefix_lens is None
+            and rswa_window is None
+            and sinks is None
+            and qq_bias is None
+            and alibi_slopes is None
+            and output_scale is None
+            and softcap == 0
+            and chunk_lookback == -1
+        ):
+            # More warps reduce FP8 reconstruction spills without repacking KV.
+            launch_num_warps = 8
 
     # head_size 256 with many query rows per sequence (e.g. diffusion-gemma
     # bidirectional canvas passes) is prefill-shaped, but the decode-oriented
