@@ -419,7 +419,7 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 # Provision one bare Python per `requires-python` entry; cmake reads
 # DEEPGEMM_PYTHON_INTERPRETERS to build DeepGEMM `_C` for each. See
 # cmake/external_projects/deepgemm.cmake for the full picture.
-COPY tools/setup_deepgemm_pythons.sh tools/build_deepgemm_C.py tools/
+COPY tools/setup_deepgemm_pythons.sh tools/build_deepgemm_C.py tools/apply_deepgemm_patch.sh tools/
 ENV DEEPGEMM_VENV_PREFIX=/opt/dgenv
 RUN --mount=type=cache,target=/root/.cache/uv \
     tools/setup_deepgemm_pythons.sh > /tmp/dg_pythons.txt
