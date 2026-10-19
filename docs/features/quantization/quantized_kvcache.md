@@ -25,6 +25,13 @@ speculative draft and scheduler reservations; halving the global payload
 does not imply doubling the automatic token budget. Qualify accuracy and
 long-context behavior for the checkpoint and workload before enabling it.
 
+Supported SM120 single-sequence global text prefill with at least 1024 query
+tokens uses eight warps for the direct FP8 reader (16 query heads, two KV
+heads, 512-token pages). This reduces register spilling while retaining
+reader math, the cache representation and resident budget. BF16, decode,
+images and other shapes keep their existing launches. The FP8 format remains
+experimental and lossy; qualify model accuracy separately.
+
 These compact modes require 512-dimensional global heads, proportional 25%
 RoPE, 256-dimensional local heads with a 4:1 KV-head ratio, BF16 activations,
 and no LoRA or target KV-sharing layers. BF16, FP8 and NVFP4 model weights
