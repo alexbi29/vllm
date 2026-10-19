@@ -12,6 +12,7 @@ steps:
   - "!vllm/distributed/kv_transfer/"
   - rust/src/bench/tests/python_serve_flags.txt
   - tests/benchmarks/
+  - benchmarks/deepseek_v4/
   commands:
   - pytest -v -s benchmarks/
   mirror:

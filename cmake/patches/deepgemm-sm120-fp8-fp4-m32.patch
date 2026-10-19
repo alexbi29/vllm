@@ -1,0 +1,57 @@
+diff --git a/csrc/apis/config.hpp b/csrc/apis/config.hpp
+index 5654502..f56cc69 100644
+--- a/csrc/apis/config.hpp
++++ b/csrc/apis/config.hpp
+@@ -22,6 +22,9 @@ TORCH_LIBRARY_FRAGMENT(deep_gemm, m) {
+     m.def("get_tc_util() -> int", [&]() {
+         return int64_t(runtime->get_tc_util());
+     });
++    m.def("supports_sm120_grouped_fp8_fp4_m32() -> bool", []() {
++        return true;
++    });
+     m.def("set_pdl(bool new_enable_pdl) -> ()", [](const bool& new_enable_pdl) {
+         jit->default_launch_options.enable_pdl = new_enable_pdl;
+     });
+diff --git a/csrc/jit_kernels/heuristics/sm120.hpp b/csrc/jit_kernels/heuristics/sm120.hpp
+index 14ef524..0bad166 100644
+--- a/csrc/jit_kernels/heuristics/sm120.hpp
++++ b/csrc/jit_kernels/heuristics/sm120.hpp
+@@ -44,7 +44,13 @@ struct SM120ArchSpec {
+         const bool is_small_n = (n_for_tile > 0 and n_for_tile <= 32);
+ 
+         std::vector<int> block_m_candidates;
+-        if (runtime_align <= kMinBlockM)
++        const bool use_grouped_fp8_fp4_m32 = runtime_align == 32
++            and is_m_grouped_contiguous(desc.gemm_type)
++            and desc.a_dtype == at::ScalarType::Float8_e4m3fn
++            and desc.b_dtype == kPackedFP4;
++        if (use_grouped_fp8_fp4_m32)
++            block_m_candidates.push_back(32);
++        else if (runtime_align <= kMinBlockM)
+             block_m_candidates.push_back(64);
+         else {
+             if (is_small_n)
+diff --git a/deep_gemm/_C.py b/deep_gemm/_C.py
+index 7e5a3da..663e2bd 100644
+--- a/deep_gemm/_C.py
++++ b/deep_gemm/_C.py
+@@ -38,6 +38,7 @@ set_num_sms = _torch_ops.set_num_sms
+ get_num_sms = _torch_ops.get_num_sms
+ set_tc_util = _torch_ops.set_tc_util
+ get_tc_util = _torch_ops.get_tc_util
++supports_sm120_grouped_fp8_fp4_m32 = _torch_ops.supports_sm120_grouped_fp8_fp4_m32
+ set_pdl = _torch_ops.set_pdl
+ get_pdl = _torch_ops.get_pdl
+ set_ignore_compile_dims = _torch_ops.set_ignore_compile_dims
+diff --git a/deep_gemm/__init__.py b/deep_gemm/__init__.py
+index a5e1fe4..bcb74a5 100644
+--- a/deep_gemm/__init__.py
++++ b/deep_gemm/__init__.py
+@@ -18,6 +18,7 @@ from ._C import (
+     get_num_sms,
+     set_tc_util,
+     get_tc_util,
++    supports_sm120_grouped_fp8_fp4_m32,
+     set_ignore_compile_dims,
+     set_block_size_multiple_of,
+     set_pdl,
