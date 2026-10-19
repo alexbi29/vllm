@@ -47,6 +47,9 @@ class AttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
     )
     TRITON_ATTN = "vllm.v1.attention.backends.triton_attn.TritonAttentionBackend"
     GEMMA4_COMPACT = "vllm.v1.attention.backends.gemma4_compact.Gemma4CompactBackend"
+    GEMMA4_COMPACT_FP8 = (
+        "vllm.v1.attention.backends.gemma4_compact_fp8.Gemma4CompactFp8Backend"
+    )
     TRITON_ATTN_DIFFKV = (
         "vllm.v1.attention.backends.triton_attn_diffkv.TritonAttentionDiffKVBackend"
     )
