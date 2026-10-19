@@ -1,5 +1,36 @@
 # Quantized KV Cache
 
+## Experimental Gemma4 compact global storage
+
+Gemma4 models with shared global K/V projections can opt into a compact
+global cache. It stores 128 rotated key coordinates and 512 value coordinates
+per head; the other keys are reconstructed from values and the learned key
+normalization. BF16 reconstruction changes rounding from the dense cache.
+The optional redundant global V projection can also be omitted:
+
+```bash
+vllm serve nvidia/Gemma-4-26B-A4B-NVFP4 \
+  --dtype bfloat16 --kv-cache-dtype bfloat16 \
+  --hf-overrides '{"gemma4_compact_kv":true,"gemma4_compact_no_v_proj":true}'
+```
+
+On SM120, adding `"gemma4_compact_fp8_storage":true` to those overrides stores
+the compact global payload in unit-scale E4M3 FP8. Local attention remains
+BF16; keep `--kv-cache-dtype bfloat16`. This is lossy cache quantization,
+independent of the model's weight quantization. Values are saturated to the
+finite FP8 range when stored, then converted to BF16 for attention. Global
+512-token pages and local 80-token pages preserve the payload saving without
+padding local pages. Whole-model capacity also depends on the local caches,
+speculative draft and scheduler reservations; halving the global payload
+does not imply doubling the automatic token budget. Qualify accuracy and
+long-context behavior for the checkpoint and workload before enabling it.
+
+These compact modes require 512-dimensional global heads, proportional 25%
+RoPE, 256-dimensional local heads with a 4:1 KV-head ratio, BF16 activations,
+and no LoRA or target KV-sharing layers. BF16, FP8 and NVFP4 model weights
+are supported independently of the cache representation. Gemma MTP readers
+inherit the target compact layout and precision.
+
 ## FP8 KV Cache Overview
 
 Efficient memory usage is crucial for working with large language models. Quantizing the KV (Key-Value) cache to FP8 format can significantly reduce its memory footprint. This optimization enables you to store more tokens in memory, leading to improved throughput and support for longer context windows.
