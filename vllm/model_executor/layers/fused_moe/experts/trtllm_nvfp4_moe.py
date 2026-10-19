@@ -228,14 +228,13 @@ class TrtLlmNvFp4ExpertsBase:
 
     @staticmethod
     def _supports_activation(activation: MoEActivation) -> bool:
-        """Supports SITU only when the installed FlashInfer exposes it."""
+        """TRTLLM does not implement the GegluTanh activation enum."""
         if activation == MoEActivation.SITU:
             return has_flashinfer_situ_activation()
         return activation in [
             MoEActivation.SILU,
             MoEActivation.RELU2_NO_MUL,
             MoEActivation.GELU,
-            MoEActivation.GELU_TANH,
             MoEActivation.SWIGLUOAI_UNINTERLEAVE,
         ]
 

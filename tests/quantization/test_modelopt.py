@@ -1273,6 +1273,72 @@ def test_modelopt_nvfp4_moe_validates_activation_override(
 
 
 @pytest.mark.parametrize(
+    "capability,activation,requested,expected",
+    [
+        (100, "GELU_TANH", "auto", "FLASHINFER_CUTLASS"),
+        (120, "GELU_TANH", "auto", "FLASHINFER_CUTLASS"),
+        (100, "GELU", "auto", "FLASHINFER_TRTLLM"),
+        (100, "SILU", "auto", "FLASHINFER_TRTLLM"),
+        (100, "GELU_TANH", "flashinfer_trtllm", None),
+    ],
+)
+def test_nvfp4_moe_backend_respects_gelu_approximation(
+    monkeypatch, capability, activation, requested, expected
+):
+    """TRTLLM must decline tanh GELU before passing an unsupported native enum."""
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.fused_moe.config import (
+        FusedMoEConfig,
+        FusedMoEParallelConfig,
+        RoutingMethodType,
+    )
+    from vllm.model_executor.layers.fused_moe.experts import (
+        flashinfer_cutlass_moe,
+        trtllm_nvfp4_moe,
+    )
+    from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
+        select_nvfp4_moe_backend,
+    )
+    from vllm.platforms.interface import DeviceCapability
+
+    # Exercise real selection/capability predicates without allocating a GPU.
+    monkeypatch.setattr(
+        type(current_platform), "is_cuda", classmethod(lambda cls: True)
+    )
+    monkeypatch.setattr(
+        type(current_platform),
+        "get_device_capability",
+        classmethod(lambda cls, device_id=0: DeviceCapability(capability // 10, 0)),
+    )
+    monkeypatch.setattr(
+        trtllm_nvfp4_moe, "has_flashinfer_trtllm_fused_moe", lambda: True
+    )
+    monkeypatch.setattr(
+        flashinfer_cutlass_moe, "has_flashinfer_cutlass_fused_moe", lambda: True
+    )
+    config = FusedMoEConfig(
+        num_experts=128,
+        experts_per_token=8,
+        hidden_dim=2816,
+        intermediate_size=704,
+        num_local_experts=128,
+        num_logical_experts=128,
+        moe_parallel_config=FusedMoEParallelConfig.make_no_parallel(),
+        activation=MoEActivation[activation],
+        in_dtype=torch.bfloat16,
+        device="cpu",
+        routing_method=RoutingMethodType.Renormalize,
+        moe_backend=requested,
+    )
+    if expected is None:
+        with pytest.raises(ValueError, match="GELU_TANH.*activation"):
+            select_nvfp4_moe_backend(config, kNvfp4Static, kNvfp4Dynamic)
+    else:
+        backend, _ = select_nvfp4_moe_backend(config, kNvfp4Static, kNvfp4Dynamic)
+        assert backend.name == expected
+
+
+@pytest.mark.parametrize(
     "per_layer_algo, expected_weight, expected_activation",
     [
         ("NVFP4", kNvfp4Static, kNvfp4Dynamic),
