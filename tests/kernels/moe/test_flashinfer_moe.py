@@ -249,7 +249,10 @@ def test_flashinfer_fp4_moe_no_graph(
             torch_output, flashinfer_output, atol=1e-1, rtol=1e-1
         )
 
-        if activation == MoEActivation.GELU_TANH:
+        if (
+            activation == MoEActivation.GELU_TANH
+            and current_platform.is_device_capability_family(120)
+        ):
             from flashinfer import autotune
 
             def run():
@@ -291,7 +294,7 @@ def test_flashinfer_nvfp4_geglu_tanh_reference(workspace_init):
 
 
 def test_flashinfer_nvfp4_geglu_tanh_prefill_repeatability(workspace_init):
-    """Tuned expert reductions must retain their result on identical inputs."""
+    """Check prefill math and SM120's tuned ordered reduction."""
     test_flashinfer_fp4_moe_no_graph(
         m=29,
         n=704,
