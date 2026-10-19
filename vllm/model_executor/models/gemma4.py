@@ -26,6 +26,7 @@ from typing import ClassVar
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
@@ -333,6 +334,13 @@ class Gemma4MLP(nn.Module):
             prefix=f"{prefix}.down_proj",
         )
         self.act_fn = get_act_and_mul_fn(hidden_activation)
+        if envs.VLLM_GEMMA4_DENSE_CUDNN:
+            from vllm.model_executor.layers.gemma4_dense_cudnn import (
+                install_gemma4_mlp_cudnn,
+            )
+
+            install_gemma4_mlp_cudnn(self.gate_up_proj)
+            install_gemma4_mlp_cudnn(self.down_proj)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up, _ = self.gate_up_proj(x)
