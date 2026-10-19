@@ -293,6 +293,9 @@ def kernel_unified_attention(
     MM_PREFIX_CLAMP_SW: tl.constexpr = False,
     COMPACT_GEMMA4_KV: tl.constexpr = False,
     compact_k_norm_ptr=None,
+    SCORE_MAX_ONLY: tl.constexpr = False,
+    USE_PREFIX_MAX: tl.constexpr = False,
+    score_prefix_max_ptr=None,
 ):
     # Per-(token, head) scale caches: used iff KV_QUANT_MODE in {2, 3}.
     USE_PER_TOKEN_HEAD_SCALES: tl.constexpr = (KV_QUANT_MODE >= 2) and (
@@ -382,6 +385,24 @@ def kernel_unified_attention(
         sink_ptr, query_offset_1, query_mask_1, segm_idx, BLOCK_M, USE_SINKS, IS_3D
     )
     L = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
+    if USE_PREFIX_MAX:
+        # Preserve the serial kernel's scale before rounding P to BF16.
+        segment_ids = tl.arange(0, NUM_SEGMENTS_PER_SEQ)
+        prefix_offsets = (
+            query_offset_0[:, None].to(tl.int64)
+            * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
+            + query_offset_1[:, None] * NUM_SEGMENTS_PER_SEQ
+            + segment_ids[None, :]
+        )
+        prefix_max = tl.load(
+            score_prefix_max_ptr + prefix_offsets,
+            mask=(segment_ids[None, :] < segm_idx)
+            & query_mask_0[:, None]
+            & query_mask_1[:, None],
+            other=float("-inf"),
+        )
+        M = tl.maximum(M, tl.max(prefix_max, axis=1))
+        L = tl.where(segm_idx == 0, L, 0.0)
     # acc : (BLOCK_M, HEAD_SIZE_PADDED)
     acc = tl.zeros([BLOCK_M, HEAD_SIZE_PADDED], dtype=tl.float32)
     score_scale = scale
@@ -596,41 +617,55 @@ def kernel_unified_attention(
                 qq_bias_row_ptrs, seq_offset, context_len, qq_bias_stride_0
             )
 
-        M, L, P, alpha = softmax_step(S, M, L)
-        acc = acc * alpha[:, None]
-
-        if SLIDING_WINDOW:
-            qpos_lo = q_block_local_idx * BLOCK_Q
-            dist = context_len + qpos_lo - seq_offset[:, None]
-            if USE_PER_SEQ_CAUSAL:
-                is_causal_seq = tl.load(per_seq_causal_ptr + seq_idx)
-                sw_mask_v = tl.where(
-                    is_causal_seq,
-                    dist < SLIDING_WINDOW,
-                    (dist < SLIDING_WINDOW) & (dist > -SLIDING_WINDOW),
-                )
-            elif USE_CAUSAL:
-                sw_mask_v = dist < SLIDING_WINDOW
-            else:
-                sw_mask_v = (dist < SLIDING_WINDOW) & (dist > -SLIDING_WINDOW)
-            V = tl.where(sw_mask_v, V, 0.0)
-        if USE_PER_TOKEN_HEAD_SCALES:
-            # Per-token-head quant: apply v_scale to P instead of V.
-            P_v = (P * v_token_head_scales[None, :]).to(V.dtype)
-            acc += tl.dot(P_v, V)
+        if SCORE_MAX_ONLY:
+            M = tl.maximum(M, tl.max(S, axis=1))
         else:
-            # Keep softmax weights representable when the P @ V dot uses FP8
-            # tensor cores. Undo the power-of-two scale after the dot.
-            if V.dtype == tl.float8e4nv:
-                p_scale = 256.0
-            elif V.dtype.is_fp8():
-                p_scale = 128.0
+            M, L, P, alpha = softmax_step(S, M, L)
+            acc = acc * alpha[:, None]
+
+            if SLIDING_WINDOW:
+                qpos_lo = q_block_local_idx * BLOCK_Q
+                dist = context_len + qpos_lo - seq_offset[:, None]
+                if USE_PER_SEQ_CAUSAL:
+                    is_causal_seq = tl.load(per_seq_causal_ptr + seq_idx)
+                    sw_mask_v = tl.where(
+                        is_causal_seq,
+                        dist < SLIDING_WINDOW,
+                        (dist < SLIDING_WINDOW) & (dist > -SLIDING_WINDOW),
+                    )
+                elif USE_CAUSAL:
+                    sw_mask_v = dist < SLIDING_WINDOW
+                else:
+                    sw_mask_v = (dist < SLIDING_WINDOW) & (dist > -SLIDING_WINDOW)
+                V = tl.where(sw_mask_v, V, 0.0)
+            if USE_PER_TOKEN_HEAD_SCALES:
+                # Per-token-head quant: apply v_scale to P instead of V.
+                P_v = (P * v_token_head_scales[None, :]).to(V.dtype)
+                acc += tl.dot(P_v, V)
             else:
-                p_scale = 1.0
-            acc += tl.dot((P * p_scale).to(V.dtype), V) / p_scale
+                # Keep softmax weights representable when the P @ V dot uses FP8
+                # tensor cores. Undo the power-of-two scale after the dot.
+                if V.dtype == tl.float8e4nv:
+                    p_scale = 256.0
+                elif V.dtype.is_fp8():
+                    p_scale = 128.0
+                else:
+                    p_scale = 1.0
+                acc += tl.dot((P * p_scale).to(V.dtype), V) / p_scale
 
     # ---- Epilogue ---------------------------------------------------------
-    if IS_3D:
+    if SCORE_MAX_ONLY:
+        prefix_offsets = (
+            query_offset_0.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
+            + query_offset_1 * NUM_SEGMENTS_PER_SEQ
+            + segm_idx
+        )
+        tl.store(
+            score_prefix_max_ptr + prefix_offsets,
+            M,
+            mask=query_mask_0 & query_mask_1,
+        )
+    elif IS_3D:
         if USE_FP8_Q_DESCALE:
             acc *= value_scale
         # Store per-segment partials; finalized by ``reduce_segments``.
@@ -1131,6 +1166,22 @@ def unified_attention(
         >= q.shape[0]
     )
 
+    score_prefix_max = None
+    if (
+        compact_short_query
+        and max_seqlen_q > 1
+        and num_par_softmax_segments is not None
+    ):
+        # Maxima live beyond all output rows; the second pass cannot overwrite them.
+        used = (
+            q.shape[0] * num_query_heads * num_par_softmax_segments * head_size_padded
+        )
+        needed = q.shape[0] * num_query_heads * num_par_softmax_segments
+        if softmax_segm_output.numel() >= used + needed:
+            score_prefix_max = softmax_segm_output.view(-1)[used : used + needed]
+        else:
+            compact_short_query = False
+
     # Launch the 2D kernel if
     # 1. No split-K threshold or scratch buffers, or the scratch has fewer
     #    rows than query tokens, or
@@ -1166,6 +1217,15 @@ def unified_attention(
     )
     if use_3d and softmax_segm_max.shape[0] < q.shape[0]:
         logger.debug_once("Split-K scratch rows < query tokens; using 2D.")
+        use_3d = False
+    if (
+        use_3d
+        and compact_k_norm is not None
+        and max_seqlen_q > 1
+        and score_prefix_max is None
+    ):
+        # Compact multi-token queries split KV only with the serial-scale
+        # prefix pass below; otherwise keep the serial 2D scan.
         use_3d = False
 
     # The kernel signature is the same for 2D and 3D — only the launch
@@ -1206,7 +1266,7 @@ def unified_attention(
     if launch_num_stages is not None:
         launch_kwargs["num_stages"] = launch_num_stages
 
-    kernel_unified_attention[grid](
+    kernel_kwargs = dict(
         output_ptr=out,
         segm_output_ptr=segm_output_ptr,
         segm_max_ptr=segm_max_ptr,
@@ -1285,6 +1345,19 @@ def unified_attention(
         COMPACT_GEMMA4_KV=compact_k_norm is not None,
         compact_k_norm_ptr=compact_k_norm,
         **launch_kwargs,
+    )
+
+    faithful_split = use_3d and score_prefix_max is not None
+    if faithful_split:
+        kernel_unified_attention[grid](
+            **kernel_kwargs,
+            SCORE_MAX_ONLY=True,
+            score_prefix_max_ptr=score_prefix_max,
+        )
+    kernel_unified_attention[grid](
+        **kernel_kwargs,
+        USE_PREFIX_MAX=faithful_split,
+        score_prefix_max_ptr=score_prefix_max,
     )
 
     if use_3d:
