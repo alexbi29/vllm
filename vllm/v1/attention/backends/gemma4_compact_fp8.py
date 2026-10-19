@@ -3,6 +3,7 @@
 """Opt-in unit-scale FP8 global storage; local attention keeps BF16 KV."""
 
 from dataclasses import replace
+from math import lcm
 
 import torch
 
@@ -26,7 +27,12 @@ class Gemma4CompactFp8Backend(Gemma4CompactBackend):
     @classmethod
     def customize_spec(cls, spec):
         spec = super().customize_spec(spec)
-        return replace(spec, dtype=torch.float8_e4m3fn, state_content_bytes=640)
+        return replace(
+            spec,
+            block_size=lcm(spec.block_size, 512),
+            dtype=torch.float8_e4m3fn,
+            state_content_bytes=640,
+        )
 
 
 class Gemma4CompactFp8Impl(Gemma4CompactImpl):
