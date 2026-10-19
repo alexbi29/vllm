@@ -410,8 +410,12 @@ def test_gemma4_compact_kv(
     from vllm.v1.attention.ops.gemma4_compact_cache import write_compact_cache
 
     device = "cpu" if os.environ.get("TRITON_INTERPRET") == "1" else DEVICE_TYPE
-    if fp8_storage and device == "cpu":
-        pytest.skip("FP8 storage requires the native CUDA FP8 conversion")
+    if fp8_storage and (
+        device == "cpu"
+        or not current_platform.is_cuda()
+        or not current_platform.is_device_capability_family(120)
+    ):
+        pytest.skip("Compact FP8 storage is currently SM120-only")
     if device == "cpu":
         # Triton 3.7.1's interpreter feeds BF16 uint16 storage directly to
         # numpy.matmul. Decode BF16 operands for the CPU-only test runner.
