@@ -612,6 +612,12 @@ class Gemma4Attention(nn.Module):
                 "attn_backend": Gemma4CompactBackend,
                 "compact_k_norm": self.k_norm.weight,
             }
+            if getattr(hf_config, "gemma4_compact_fp8_storage", False):
+                from vllm.v1.attention.backends.gemma4_compact_fp8 import (
+                    Gemma4CompactFp8Backend,
+                )
+
+                compact_args["attn_backend"] = Gemma4CompactFp8Backend
 
         self.attn = Attention(
             self.num_heads,

@@ -940,14 +940,20 @@ def unified_attention(
     # Default False keeps the original behavior for every other model.
     mm_prefix_clamp_sliding_window: bool = False,
     compact_k_norm=None,
+    compact_fp8_storage: bool = False,
 ):
+    compact_storage_dtype = (
+        torch.float8_e4m3fn if compact_fp8_storage else torch.bfloat16
+    )
+    if compact_fp8_storage and compact_k_norm is None:
+        raise ValueError("FP8 compact storage requires the Gemma4 compact layout")
     if compact_k_norm is not None and (
         q.shape[-1] != 512
         or k.shape[-1] != 128
         or v.shape[-1] != 512
         or q.dtype != torch.bfloat16
-        or k.dtype != torch.bfloat16
-        or v.dtype != torch.bfloat16
+        or k.dtype != compact_storage_dtype
+        or v.dtype != compact_storage_dtype
         or kv_quant_mode != KVQuantMode.NONE
         or compact_k_norm.dtype != torch.bfloat16
         or compact_k_norm.shape != (512,)

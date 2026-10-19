@@ -737,6 +737,7 @@ class TritonAttentionImpl(AttentionImpl):
                 layer, "mm_prefix_clamp_sliding_window", False
             ),
             compact_k_norm=compact_k_norm,
+            compact_fp8_storage=getattr(self, "compact_fp8_storage", False),
         )
 
         return output

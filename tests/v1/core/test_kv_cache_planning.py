@@ -1396,9 +1396,11 @@ def _grouping_config():
 
 
 @pytest.mark.parametrize("tp_size", [1, 2])
-def test_gemma4_compact_global_pages_keep_storage_saving(tp_size):
+@pytest.mark.parametrize("fp8_storage", [False, True])
+def test_gemma4_compact_global_pages_keep_storage_saving(tp_size, fp8_storage):
     """Hybrid grouping must not pad the 640-value global rows back to 1024."""
     from vllm.v1.attention.backends.gemma4_compact import Gemma4CompactBackend
+    from vllm.v1.attention.backends.gemma4_compact_fp8 import Gemma4CompactFp8Backend
 
     global_spec = FullAttentionSpec(
         block_size=16,
@@ -1406,7 +1408,8 @@ def test_gemma4_compact_global_pages_keep_storage_saving(tp_size):
         head_size=512,
         dtype=torch.bfloat16,
     )
-    compact_spec = Gemma4CompactBackend.customize_spec(global_spec)
+    backend = Gemma4CompactFp8Backend if fp8_storage else Gemma4CompactBackend
+    compact_spec = backend.customize_spec(global_spec)
     local_spec = SlidingWindowSpec(
         block_size=16,
         num_kv_heads=8 // tp_size,
@@ -1428,12 +1431,19 @@ def test_gemma4_compact_global_pages_keep_storage_saving(tp_size):
         )
         for layer_spec in layer_specs:
             if isinstance(layer_spec, FullAttentionSpec):
-                assert layer_spec.state_content_size_bytes == 1280
+                assert layer_spec.state_content_size_bytes == (
+                    640 if fp8_storage else 1280
+                )
+                assert layer_spec.dtype == (
+                    torch.float8_e4m3fn if fp8_storage else torch.bfloat16
+                )
                 assert layer_spec.page_size_padded is None
                 seen += 1
     assert seen
     assert (
-        compact_spec.page_size_bytes // compact_spec.block_size * 8
+        compact_spec.page_size_bytes
+        // compact_spec.block_size
+        * (16 if fp8_storage else 8)
         == global_spec.page_size_bytes // global_spec.block_size * 5
     )
 

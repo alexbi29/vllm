@@ -388,8 +388,16 @@ def test_clamped_mm_prefix_preserves_noncausal_right_window(
 @pytest.mark.parametrize("layout", ["HND", "NHD"])
 @pytest.mark.parametrize("block_size", [16, 256])
 @pytest.mark.parametrize("scratch_rows", [1, 4, 8])
+@pytest.mark.parametrize("fp8_storage", [False, True])
 def test_gemma4_compact_kv(
-    query_len, segments, kv_heads, layout, block_size, scratch_rows, monkeypatch
+    query_len,
+    segments,
+    kv_heads,
+    layout,
+    block_size,
+    scratch_rows,
+    fp8_storage,
+    monkeypatch,
 ):
     """Compact paged attention agrees with explicit BF16 K reconstruction.
 
@@ -402,6 +410,8 @@ def test_gemma4_compact_kv(
     from vllm.v1.attention.ops.gemma4_compact_cache import write_compact_cache
 
     device = "cpu" if os.environ.get("TRITON_INTERPRET") == "1" else DEVICE_TYPE
+    if fp8_storage and device == "cpu":
+        pytest.skip("FP8 storage requires the native CUDA FP8 conversion")
     if device == "cpu":
         # Triton 3.7.1's interpreter feeds BF16 uint16 storage directly to
         # numpy.matmul. Decode BF16 operands for the CPU-only test runner.
@@ -439,6 +449,8 @@ def test_gemma4_compact_kv(
     norm = torch.randn(512, dtype=dtype, device=device)
     query = torch.randn(query_len, heads, 512, dtype=dtype, device=device) * 0.1
     cache = torch.full((4, kv_heads, block_size, 640), -7, dtype=dtype, device=device)
+    if fp8_storage:
+        cache = cache.to(torch.float8_e4m3fn)
     if layout == "NHD":
         cache = cache.transpose(1, 2).contiguous().transpose(1, 2)
     block_table = torch.tensor([[2, 0, 3, 1]], dtype=torch.int32, device=device)
@@ -447,10 +459,15 @@ def test_gemma4_compact_kv(
         block_table[0, positions // block_size] * block_size + positions % block_size
     )
     slots = torch.cat((slots, torch.tensor([-1], device=device))).long()
-    write_compact_cache(key, value, cache, slots)
+    write_compact_cache(key, value, cache, slots, fp8_storage=fp8_storage)
+    if fp8_storage:
+        key = key.clamp(-448, 448).to(torch.float8_e4m3fn).to(dtype)
+        value = value.clamp(-448, 448).to(torch.float8_e4m3fn).to(dtype)
     # Padding writes must not touch an unused page.
-    torch.testing.assert_close(cache[1], torch.full_like(cache[1], -7))
-    packed = cache[block_table[0, :3].long()].transpose(1, 2).reshape(-1, kv_heads, 640)
+    torch.testing.assert_close(cache[1].float(), torch.full_like(cache[1].float(), -7))
+    storage = cache.view(torch.uint8) if fp8_storage else cache
+    packed = storage[block_table[0, :3].long()].view(cache.dtype)
+    packed = packed.transpose(1, 2).reshape(-1, kv_heads, 640).to(dtype)
     packed = packed[:length]
     torch.testing.assert_close(packed[..., :64], key[:length, ..., :64])
     torch.testing.assert_close(packed[..., 64:128], key[:length, ..., 256:320])
@@ -497,6 +514,7 @@ def test_gemma4_compact_kv(
         softmax_segm_max=torch.empty((scratch_rows, heads, segments), device=device),
         softmax_segm_expsum=torch.empty((scratch_rows, heads, segments), device=device),
         compact_k_norm=norm,
+        compact_fp8_storage=fp8_storage,
     )
     torch.testing.assert_close(output, expected, atol=0.016, rtol=0.02)
 
