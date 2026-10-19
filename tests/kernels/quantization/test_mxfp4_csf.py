@@ -3,6 +3,8 @@
 
 """Exact native-layout reconstruction and shared-scratch graph safety."""
 
+import os
+
 import numpy as np
 import pytest
 import torch
@@ -193,3 +195,54 @@ def test_active_routes_and_alternating_graphs_restore_poisoned_shared_scratch():
             graph.replay()
             assert torch.equal(scratch[active], original[active])
             assert torch.all(scratch[~active] == -1234567)
+
+
+@pytest.mark.skipif(
+    not torch.accelerator.is_available() and os.getenv("TRITON_INTERPRET") != "1",
+    reason="GPU or Triton interpreter required",
+)
+@pytest.mark.parametrize("capacity", [0, 2, 8])
+def test_paired_decoder_preserves_routes_exceptions_and_padding(capacity):
+    """Unequal projections must restore active bytes without touching padding."""
+    from vllm.model_executor.layers.quantization.utils.mxfp4_csf_pair import decode_pair
+
+    interpreting = os.getenv("TRITON_INTERPRET") == "1"
+    device = "cpu" if interpreting else "cuda"
+    generator = torch.Generator().manual_seed(42)
+    originals = tuple(
+        native_scales(
+            torch.randint(0, 256, shape, dtype=torch.uint8, generator=generator),
+            device,
+            padding=13,
+        )
+        for shape in ((8, 35, 12), (8, 19, 28))
+    )
+    items = tuple(CompressedMxfp4Scales.from_native(x) for x in originals)
+    outputs = tuple(item.make_scratch() for item in items)
+    counts = torch.zeros(8, dtype=torch.int32, device=device)
+    ids = torch.empty_like(counts)
+    decode_pair(items, outputs, counts, ids, capacity)
+    graph = None
+    if not interpreting:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            decode_pair(items, outputs, counts, ids, capacity)
+    for active_ids in (list(range(8 - capacity, 8)), [0] if capacity else [], []):
+        counts.zero_()
+        counts[active_ids] = 1
+        storage = tuple(
+            out.as_strided((item.shape[0] * item.shape[2] * item.stride[2],), (1,))
+            for item, out in zip(items, outputs)
+        )
+        for flat in storage:
+            flat.fill_(-1234567)
+        if graph is None:
+            decode_pair(items, outputs, counts, ids, capacity)
+        else:
+            graph.replay()
+        active = counts.bool()
+        for item, out, original, flat in zip(items, outputs, originals, storage):
+            assert torch.equal(out[active], original[active])
+            assert torch.all(out[~active] == -1234567)
+            padded = flat.view(item.shape[0], item.shape[2], item.stride[2])
+            assert torch.all(padded[:, :, item.shape[1] :] == -1234567)
