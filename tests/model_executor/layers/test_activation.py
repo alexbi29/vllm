@@ -36,3 +36,25 @@ def test_cpu_act_and_mul_without_compiled_ops(
     layer = activation_factory()
 
     torch.testing.assert_close(layer(x), reference(x[:, :4]) * x[:, 4:])
+
+
+@pytest.mark.parametrize(
+    "requested,expected",
+    [("GELU", "Geglu"), ("GELU_TANH", "GegluTanh")],
+)
+def test_flashinfer_preserves_gated_gelu_approximation(requested, expected):
+    """The external activation ABI must retain the checkpoint's GELU variant."""
+    flashinfer = pytest.importorskip("flashinfer.fused_moe.core")
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
+        activation_to_flashinfer_type,
+    )
+
+    activation = MoEActivation[requested]
+    if not hasattr(flashinfer.ActivationType, expected):
+        with pytest.raises(ValueError, match="GELU.*tanh"):
+            activation_to_flashinfer_type(activation)
+    else:
+        assert activation_to_flashinfer_type(activation) == getattr(
+            flashinfer.ActivationType, expected
+        )
