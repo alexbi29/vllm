@@ -13,8 +13,13 @@ steps:
     - docker/Dockerfile.cpu
     - docker/docker-bake.hcl
     - tests/tools/test_docker_build_metadata_args.py
+    - tests/tools/test_deepgemm_build_patch.py
+    - tools/apply_deepgemm_patch.sh
+    - cmake/external_projects/deepgemm.cmake
+    - cmake/patches/deepgemm-sm120-fp8-fp4-m32.patch
   commands:
     - pytest -v -s tools/test_docker_build_metadata_args.py
+    - pytest -v -s tools/test_deepgemm_build_patch.py
   mirror:
     amd:
       label: ":amd: (MI250) Docker Build Metadata"
