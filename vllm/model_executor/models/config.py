@@ -337,6 +337,9 @@ class Gemma4Config(VerifyAndUpdateConfig):
             model_config.hf_text_config.gemma4_compact_no_v_proj = getattr(
                 model_config.hf_config, "gemma4_compact_no_v_proj", False
             )
+            model_config.hf_text_config.gemma4_compact_fp8_storage = getattr(
+                model_config.hf_config, "gemma4_compact_fp8_storage", False
+            )
         arch_config = model_config.model_arch_config
         layer_types = getattr(model_config.hf_text_config, "layer_types", None) or []
         head_dims = {

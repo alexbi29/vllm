@@ -590,7 +590,10 @@ class Gemma4Attention(nn.Module):
             from vllm.v1.attention.backends.gemma4_compact import Gemma4CompactBackend
 
             logger.info_once(
-                "Gemma4 compact BF16 global KV enabled (640 values/token/head)"
+                "Gemma4 compact %s global KV enabled (640 values/token/head)",
+                "FP8"
+                if getattr(hf_config, "gemma4_compact_fp8_storage", False)
+                else "BF16",
             )
 
             if (
