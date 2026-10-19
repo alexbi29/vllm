@@ -27,6 +27,7 @@ from vllm.model_executor.layers.fused_moe import (
     RoutedExperts,
     SharedExperts,
 )
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.moe_output import UnfinalizedMoEOutput
 from vllm.model_executor.layers.fused_moe.oracle.fp8 import (
     Fp8MoeBackend,
@@ -1059,10 +1060,26 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         if self.moe.is_act_and_mul and not torch.allclose(
             layer.w13_weight_scale_2[:, 0], layer.w13_weight_scale_2[:, 1]
         ):
-            logger.warning_once(
-                "w1_weight_scale_2 must match w3_weight_scale_2. "
-                "Accuracy may be affected."
+            compensate_up_scale = (
+                self.nvfp4_backend == NvFp4MoeBackend.FLASHINFER_CUTLASS
+                and layer.activation == MoEActivation.GELU_TANH
+                and not self.moe.moe_parallel_config.enable_eplb
+                and getattr(layer, "w13_bias", None) is None
             )
+            if compensate_up_scale:
+                # The up branch is linear. Retain its factor before FC2 FP4
+                # quantization without changing the FP4 weights or FP8 scales.
+                # BF16 epilogue rounding still differs from two native GEMMs.
+                layer.register_buffer(
+                    "nvfp4_up_scale_ratio",
+                    layer.w13_weight_scale_2[:, 1] / layer.w13_weight_scale_2[:, 0],
+                    persistent=False,
+                )
+            else:
+                logger.warning_once(
+                    "w1_weight_scale_2 must match w3_weight_scale_2. "
+                    "Accuracy may be affected."
+                )
         w13_weight_scale_2 = layer.w13_weight_scale_2[:, 0].contiguous()
 
         (
@@ -1114,6 +1131,10 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
     def _build_moe_kernel(self, layer: RoutedExperts) -> None:
         """Build the modular MoE kernel from the (already in-format) weights."""
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+        up_scale_ratio = getattr(layer, "nvfp4_up_scale_ratio", None)
+        if up_scale_ratio is not None:
+            assert self.moe_quant_config.a2_gscale is not None
+            self.moe_quant_config.a2_gscale.mul_(up_scale_ratio)
         assert self.experts_cls is not None
         self.moe_kernel = make_nvfp4_moe_kernel(
             moe_quant_config=self.moe_quant_config,
