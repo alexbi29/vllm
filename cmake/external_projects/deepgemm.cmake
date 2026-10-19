@@ -94,6 +94,17 @@ cuda_archs_loose_intersection(DEEPGEMM_ARCHS
 if(DEEPGEMM_ARCHS)
   message(STATUS "DeepGEMM CUDA architectures: ${DEEPGEMM_ARCHS}")
 
+  set(_dg_patch "${CMAKE_SOURCE_DIR}/cmake/patches/deepgemm-sm120-fp8-fp4-m32.patch")
+  set(_dg_apply_patch "${CMAKE_SOURCE_DIR}/tools/apply_deepgemm_patch.sh")
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${_dg_patch}" "${_dg_apply_patch}")
+  execute_process(
+    COMMAND bash "${_dg_apply_patch}" "${deepgemm_SOURCE_DIR}"
+    RESULT_VARIABLE _dg_patch_result)
+  if(NOT _dg_patch_result EQUAL 0)
+    message(FATAL_ERROR "Cannot apply the DeepGEMM SM120 M32 patch")
+  endif()
+
   #
   # DeepGEMM integration notes
   # --------------------------
@@ -129,6 +140,7 @@ if(DEEPGEMM_ARCHS)
             "${deepgemm_SOURCE_DIR}" "${_dg_dir}"
     COMMAND "${CMAKE_COMMAND}" -E touch "${_dg_marker}"
     DEPENDS "${CMAKE_SOURCE_DIR}/tools/build_deepgemm_C.py"
+            "${_dg_patch}" "${_dg_apply_patch}"
             "${deepgemm_SOURCE_DIR}/csrc/python_api.cpp"
             "${deepgemm_SOURCE_DIR}/deep_gemm/_C.py"
             "${deepgemm_SOURCE_DIR}/setup.py"
