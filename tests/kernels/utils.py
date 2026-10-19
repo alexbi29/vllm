@@ -3,6 +3,7 @@
 """Kernel test utils."""
 
 from collections.abc import Sequence
+from functools import partial
 from typing import Any
 from unittest.mock import patch
 
@@ -11,7 +12,7 @@ from torch._prims_common import TensorLikeType
 
 from tests.kernels.quant_utils import native_w8a8_block_matmul
 from vllm.model_executor.custom_op import op_registry
-from vllm.model_executor.layers.activation import SiluAndMul
+from vllm.model_executor.layers.activation import GeluAndMul, SiluAndMul
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
 
@@ -218,7 +219,11 @@ def torch_experts(
 
     f32 = torch.float32
 
-    act = op_registry[activation.custom_op_name]
+    act = (
+        partial(GeluAndMul, approximate="tanh")
+        if activation == MoEActivation.GELU_TANH
+        else op_registry[activation.custom_op_name]
+    )
     if activation == MoEActivation.SITU and activation_situ_beta is not None:
         act_kwargs = {
             "beta": activation_situ_beta,

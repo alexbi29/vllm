@@ -37,6 +37,12 @@ def activation_to_flashinfer_type(activation: MoEActivation) -> "ActivationType"
             raise ValueError("The installed FlashInfer does not support SITU")
         return situ
 
+    if activation == MoEActivation.GELU_TANH:
+        geglu_tanh = getattr(ActivationType, "GegluTanh", None)
+        if geglu_tanh is None:
+            raise ValueError("The installed FlashInfer does not support GELU tanh")
+        return geglu_tanh
+
     # silu and gelu are mapped to their gated versions SwiGLU and GeGLU respectively
     ACTIVATION_TO_FI_ACTIVATION = {
         MoEActivation.SILU_NO_MUL: ActivationType.Silu,
@@ -46,7 +52,6 @@ def activation_to_flashinfer_type(activation: MoEActivation) -> "ActivationType"
         MoEActivation.SWIGLUOAI: ActivationType.Swiglu,
         MoEActivation.SWIGLUOAI_UNINTERLEAVE: ActivationType.Swiglu,
         MoEActivation.GELU: ActivationType.Geglu,
-        MoEActivation.GELU_TANH: ActivationType.Geglu,
         MoEActivation.RELU2_NO_MUL: ActivationType.Relu2,
     }
     return ACTIVATION_TO_FI_ACTIVATION[activation]
