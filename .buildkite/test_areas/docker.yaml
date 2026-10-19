@@ -25,9 +25,14 @@ steps:
     - tests/tools/test_kernel_symbol_map.py
     - tools/ci/kernel_symbol_map.py
     - tools/ci/rocm_kernel_symbol_map.py
+    - tests/tools/test_deepgemm_build_patch.py
+    - tools/apply_deepgemm_patch.sh
+    - cmake/external_projects/deepgemm.cmake
+    - cmake/patches/deepgemm-sm120-fp8-fp4-m32.patch
   commands:
     - pytest -v -s tools/test_docker_build_metadata_args.py tools/test_rocm_build.py tools/test_amd_ci_fast_exit.py
     - pytest -v -s tools/test_kernel_symbol_map.py
+    - pytest -v -s tools/test_deepgemm_build_patch.py
   mirror:
     amd:
       label: ":amd: (MI250) Docker Build Metadata"
