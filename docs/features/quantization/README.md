@@ -1,5 +1,9 @@
 # Quantization
 
+For the retained DeepSeek-V4-Flash SM120 compression/performance work,
+native build instructions and qualification boundaries, see the
+[DeepSeek V4 Flash notes](../../models/deepseek_v4_flash.md).
+
 Quantization trades off model precision for smaller memory footprint, allowing large models to be run on a wider range of devices.
 
 !!! tip
