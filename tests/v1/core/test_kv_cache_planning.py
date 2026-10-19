@@ -1430,6 +1430,7 @@ def test_gemma4_compact_global_pages_keep_storage_saving(tp_size, fp8_storage):
             else [spec]
         )
         for layer_spec in layer_specs:
+            assert layer_spec.page_size_padded is None
             if isinstance(layer_spec, FullAttentionSpec):
                 assert layer_spec.state_content_size_bytes == (
                     640 if fp8_storage else 1280
