@@ -967,7 +967,7 @@ def unified_attention(
         and k.shape[2:] == (8, 256)
         and q.dtype == k.dtype == v.dtype == torch.bfloat16
         and k.shape[1] % 16 == 0
-        and max_seqlen_q >= 128
+        and max_seqlen_q >= 1024
         and use_causal
         and not use_per_seq_causal
         and window_size == (1023, 0)

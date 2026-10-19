@@ -669,9 +669,9 @@ def test_triton_unified_attn_clamped_mm_matches_dense_reference(
     gemma4_sliding: bool,
 ) -> None:
     set_random_seed(0)
-    query_lens = [384, 96]
-    kv_lens_list = [384, 320]
-    mm_ranges = [[(32, 351)], [(160, 287)]]
+    query_lens = [1024 if gemma4_sliding else 384, 96]
+    kv_lens_list = [query_lens[0], 320]
+    mm_ranges = [[(32, query_lens[0] - 33)], [(160, 287)]]
     sliding_window = 1024 if gemma4_sliding else 128
     chunk_lookback = -1 if gemma4_sliding else 0
     block_size = 80 if gemma4_sliding else 16
