@@ -959,6 +959,54 @@ def unified_attention(
     use_causal = bool(causal) if not use_per_seq_causal else True
     per_seq_causal_ptr = causal if use_per_seq_causal else None
 
+    if (
+        mm_prefix_clamp_sliding_window
+        and compact_k_norm is None
+        and current_platform.is_device_capability_family(120)
+        and q.shape[1:] == (16, 256)
+        and k.shape[2:] == (8, 256)
+        and q.dtype == k.dtype == v.dtype == torch.bfloat16
+        and k.shape[1] % 16 == 0
+        and max_seqlen_q >= 128
+        and use_causal
+        and not use_per_seq_causal
+        and window_size == (1023, 0)
+        and kv_quant_mode == KVQuantMode.NONE
+        and mm_prefix_range is None
+        and rswa_prefix_lens is None
+        and rswa_window is None
+        and sinks is None
+        and qq_bias is None
+        and alibi_slopes is None
+        and output_scale is None
+        and softcap == 0
+        and chunk_lookback == -1
+        and not use_td
+        and not is_batch_invariant
+    ):
+        from vllm.vllm_flash_attn.flash_attn_interface import (
+            flash_attn_varlen_func,
+            is_fa_version_supported,
+        )
+
+        if is_fa_version_supported(2):
+            flash_attn_varlen_func(
+                q=q,
+                k=k,
+                v=v,
+                out=out,
+                cu_seqlens_q=cu_seqlens_q,
+                max_seqlen_q=max_seqlen_q,
+                seqused_k=seqused_k,
+                max_seqlen_k=max_seqlen_k,
+                softmax_scale=softmax_scale,
+                causal=True,
+                window_size=window_size,
+                block_table=block_table,
+                fa_version=2,
+            )
+            return
+
     # Sub-byte packed mode (INT4) needs a bespoke kernel (split-dot +
     # sub-byte unpack); everything else goes through the core kernel below.
     if kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD:
