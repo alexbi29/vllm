@@ -252,3 +252,17 @@ def test_flashinfer_fp4_moe_no_graph(
 
 if __name__ == "__main__":
     test_flashinfer_fp4_moe_no_graph((2, 1024, 1024), 40, 1, torch.half)
+
+
+def test_flashinfer_nvfp4_geglu_tanh_reference(workspace_init):
+    """Exercise Gemma's activation through the real quantized expert path."""
+    test_flashinfer_fp4_moe_no_graph(
+        m=3,
+        n=704,
+        k=2816,
+        e=128,
+        topk=8,
+        dtype=torch.bfloat16,
+        activation=MoEActivation.GELU_TANH,
+        workspace_init=workspace_init,
+    )
