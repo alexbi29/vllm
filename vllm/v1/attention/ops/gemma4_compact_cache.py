@@ -26,6 +26,7 @@ def _write_compact_cache(
     cache_head_stride: tl.int64,
     cache_token_stride: tl.int64,
     BLOCK_SIZE: tl.constexpr,
+    FP8_STORAGE: tl.constexpr = False,
 ):
     token = tl.program_id(0)
     head = tl.program_id(1)
@@ -42,16 +43,20 @@ def _write_compact_cache(
     k = tl.load(key + token * key_token_stride + head * key_head_stride + kd)
     vd = tl.arange(0, 512)
     v = tl.load(value + token * value_token_stride + head * value_head_stride + vd)
+    if FP8_STORAGE:
+        k = tl.minimum(tl.maximum(k.to(tl.float32), -448.0), 448.0)
+        v = tl.minimum(tl.maximum(v.to(tl.float32), -448.0), 448.0)
     tl.store(cache + base + kr, k)
     tl.store(cache + base + 128 + vd, v)
 
 
-def write_compact_cache(key, value, cache, slots):
-    """Write paged BF16 cache; negative slots are graph-padding tokens."""
+def write_compact_cache(key, value, cache, slots, fp8_storage=False):
+    """Write paged compact cache; negative slots are graph-padding tokens."""
     if key.dtype != torch.bfloat16 or value.dtype != torch.bfloat16:
         raise ValueError("Gemma4 compact KV requires BF16 keys and values")
-    if cache.dtype != torch.bfloat16 or cache.shape[-1] != 640:
-        raise ValueError("Gemma4 compact KV requires a BF16 640-element row")
+    storage_dtype = torch.float8_e4m3fn if fp8_storage else torch.bfloat16
+    if cache.dtype != storage_dtype or cache.shape[-1] != 640:
+        raise ValueError("Gemma4 compact KV storage dtype or row size mismatch")
     if key.shape[-1] != 512 or value.shape != key.shape:
         raise ValueError("Gemma4 compact KV requires matching 512-element heads")
     if key.stride(-1) != 1 or value.stride(-1) != 1 or cache.stride(-1) != 1:
@@ -69,4 +74,5 @@ def write_compact_cache(key, value, cache, slots):
         cache.stride(1),
         cache.stride(2),
         cache.shape[2],
+        FP8_STORAGE=fp8_storage,
     )
