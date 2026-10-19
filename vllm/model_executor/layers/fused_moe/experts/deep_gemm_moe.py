@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
@@ -477,6 +478,7 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
 
         self.gemm1_clamp_limit = quant_config.gemm1_clamp_limit
         self._csf_scales: tuple[CompressedMxfp4Scales, ...] | None = None
+        self._csf_pair_fusion = os.getenv("DS4_CSF_PAIR_FUSION", "1") == "1"
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         from vllm.config import get_current_vllm_config_or_none
@@ -523,6 +525,8 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
             "Lossless native MXFP4 scale compression enabled; "
             "active experts decode into shared DeepGEMM scratch."
         )
+        if self._csf_pair_fusion:
+            logger.info_once("Paired CSF scale preparation enabled.")
 
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:
@@ -710,10 +714,24 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
                     if expert_tokens_meta is None
                     else replace(expert_tokens_meta, expert_num_tokens=counts)
                 )
-            for compressed, scratch in zip(
-                self._csf_scales, (self.w1_scale, self.w2_scale)
-            ):
-                compressed.decode(scratch, counts, topk_ids.numel())
+            if self._csf_pair_fusion:
+                from vllm.model_executor.layers.quantization.utils import mxfp4_csf_pair
+
+                ids = torch.empty(
+                    local_num_experts, device=counts.device, dtype=torch.int32
+                )
+                mxfp4_csf_pair.decode_pair(
+                    self._csf_scales,
+                    (self.w1_scale, self.w2_scale),
+                    counts,
+                    ids,
+                    min(local_num_experts, topk_ids.numel()),
+                )
+            else:
+                for compressed, scratch in zip(
+                    self._csf_scales, (self.w1_scale, self.w2_scale)
+                ):
+                    compressed.decode(scratch, counts, topk_ids.numel())
 
         M_sum, _ = compute_aligned_M_and_alignment(
             M=topk_ids.size(0),
