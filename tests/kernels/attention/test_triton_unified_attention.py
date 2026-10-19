@@ -383,6 +383,81 @@ def test_clamped_mm_prefix_preserves_noncausal_right_window(
     assert bounds.tolist() == [3, 68, 4096]
 
 
+@pytest.mark.skipif(
+    not current_platform.is_cuda() or not current_platform.is_device_capability(120),
+    reason="Compact FP8 prefill tuning requires SM120",
+)
+@pytest.mark.parametrize(
+    "qlen,context,layout",
+    [
+        (1024, 8192, "HND"),
+        (8192, 8192, "HND"),
+        (1024, 65536, "HND"),
+        (8192, 65536, "HND"),
+        (1024, 131072, "HND"),
+        (1024, 8192, "NHD"),
+    ],
+)
+def test_gemma4_compact_fp8_prefill_warps_preserve_math(
+    monkeypatch, qlen, context, layout
+):
+    """The tuned launch matches the actual four-warp reader, without staging."""
+    from vllm.v1.attention.ops import triton_unified_attention as attention
+
+    set_random_seed(42)
+    page = 512
+    cache = torch.randn(context // page, page, 2, 640, device=DEVICE_TYPE).to(
+        torch.float8_e4m3fn
+    )
+    if layout == "HND":
+        cache = cache.transpose(1, 2).contiguous().transpose(1, 2)
+    k, v = cache.split([128, 512], dim=-1)
+    q = torch.randn(qlen, 16, 512, device=DEVICE_TYPE, dtype=torch.bfloat16)
+    args = dict(
+        q=q,
+        k=k,
+        v=v,
+        out=torch.empty_like(q),
+        cu_seqlens_q=torch.tensor([0, qlen], device=DEVICE_TYPE, dtype=torch.int32),
+        max_seqlen_q=qlen,
+        seqused_k=torch.tensor([context], device=DEVICE_TYPE, dtype=torch.int32),
+        max_seqlen_k=context,
+        softmax_scale=512**-0.5,
+        causal=True,
+        window_size=(-1, -1),
+        block_table=torch.arange(
+            context // page, device=DEVICE_TYPE, dtype=torch.int32
+        ).unsqueeze(0),
+        softcap=0.0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        compact_k_norm=torch.randn(512, device=DEVICE_TYPE, dtype=torch.bfloat16),
+        compact_fp8_storage=True,
+    )
+    kernel = attention.kernel_unified_attention
+    observed = []
+    force_four = False
+
+    class Launch:
+        def __getitem__(self, grid):
+            def run(**kwargs):
+                observed.append(kwargs.get("num_warps"))
+                if force_four:
+                    kwargs["num_warps"] = 4
+                return kernel[grid](**kwargs)
+
+            return run
+
+    monkeypatch.setattr(attention, "kernel_unified_attention", Launch())
+    unified_attention(**args)
+    tuned = args["out"].clone()
+    assert observed == [8]
+    force_four = True
+    unified_attention(**args)
+    torch.testing.assert_close(tuned, args["out"], rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("query_len,segments", [(1, 1), (1, 4), (3, 4), (4, 4), (5, 4)])
 @pytest.mark.parametrize("kv_heads", [1, 2])
 @pytest.mark.parametrize("layout", ["HND", "NHD"])
