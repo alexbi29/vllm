@@ -1680,3 +1680,86 @@ def test_modelopt_block_quant_loads_expert_blocks_with_aligned_tp_slices(
             "w2",
             0,
         )
+
+
+@pytest.mark.parametrize("unequal", [False, True])
+def test_nvfp4_up_global_preserves_fc2_dequant_units(unequal):
+    """An up-factor correction must not also rescale the down dequant alpha."""
+    from types import SimpleNamespace
+
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutlass_moe import (
+        FlashInferExperts,
+    )
+    from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import NvFp4MoeBackend
+    from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4FusedMoE
+
+    method = ModelOptNvFp4FusedMoE.__new__(ModelOptNvFp4FusedMoE)
+    method.per_token_activation = False
+    method.use_a16 = False
+    method.nvfp4_backend = NvFp4MoeBackend.FLASHINFER_CUTLASS
+    method.experts_cls = Mock()
+    method.moe = SimpleNamespace(
+        is_act_and_mul=True,
+        moe_parallel_config=SimpleNamespace(enable_eplb=False),
+    )
+    layer = torch.nn.Module()
+    layer.activation = MoEActivation.GELU_TANH
+    layer._expert_routing_tables = lambda: None
+    globals_ = torch.tensor([[0.1, 0.08], [0.2, 0.3]])
+    if not unequal:
+        globals_[:, 1] = globals_[:, 0]
+    values = {
+        "w13_weight": torch.zeros(2, 64, 32, dtype=torch.uint8),
+        "w2_weight": torch.zeros(2, 64, 16, dtype=torch.uint8),
+        "w13_weight_scale": torch.ones(2, 64, 4),
+        "w2_weight_scale": torch.ones(2, 64, 2),
+        "w13_weight_scale_2": globals_,
+        "w2_weight_scale_2": torch.tensor([0.5, 0.6]),
+        "w13_input_scale": torch.full((2, 2), 2.0),
+        "w2_input_scale": torch.full((2,), 3.0),
+    }
+    for name, value in values.items():
+        layer.register_parameter(name, torch.nn.Parameter(value, requires_grad=False))
+    original_weights = {
+        name: values[name].clone()
+        for name in ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale")
+    }
+
+    def convert(**kw):
+        return (
+            kw["w13"],
+            kw["w13_scale"],
+            kw["w13_scale_2"],
+            kw["a13_scale"][:, 0].contiguous(),
+            kw["w2"],
+            kw["w2_scale"],
+            kw["w2_scale_2"],
+            kw["a2_scale"],
+        )
+
+    def kernel(**kw):
+        experts = SimpleNamespace(quant_config=kw["moe_quant_config"])
+
+        def process(layer):
+            FlashInferExperts.process_weights_after_loading(experts, layer)
+
+        return SimpleNamespace(
+            fused_experts=SimpleNamespace(process_weights_after_loading=process)
+        )
+
+    target = "vllm.model_executor.layers.quantization.modelopt."
+    with (
+        patch(target + "is_weights_pre_processed", return_value=False),
+        patch(target + "convert_to_nvfp4_moe_kernel_format", side_effect=convert),
+        patch(target + "make_nvfp4_moe_kernel", side_effect=kernel),
+    ):
+        method.process_weights_after_loading(layer)
+
+    ratio = globals_[:, 1] / globals_[:, 0]
+    assert method.moe_quant_config is not None
+    torch.testing.assert_close(method.moe_quant_config.a2_gscale, ratio / 3)
+    torch.testing.assert_close(layer.w2_weight_scale_2, torch.tensor([1.5, 1.8]))
+    torch.testing.assert_close(layer.w13_weight_scale_2, globals_[:, 0] * 2)
+    for name, value in original_weights.items():
+        torch.testing.assert_close(getattr(layer, name), value)
