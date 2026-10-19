@@ -383,12 +383,13 @@ def test_clamped_mm_prefix_preserves_noncausal_right_window(
     assert bounds.tolist() == [3, 68, 4096]
 
 
-@pytest.mark.parametrize("query_len,segments", [(1, 1), (1, 4), (5, 1)])
+@pytest.mark.parametrize("query_len,segments", [(1, 1), (1, 4), (3, 4), (4, 4), (5, 4)])
 @pytest.mark.parametrize("kv_heads", [1, 2])
 @pytest.mark.parametrize("layout", ["HND", "NHD"])
 @pytest.mark.parametrize("block_size", [16, 256])
+@pytest.mark.parametrize("scratch_rows", [1, 8])
 def test_gemma4_compact_kv(
-    query_len, segments, kv_heads, layout, block_size, monkeypatch
+    query_len, segments, kv_heads, layout, block_size, scratch_rows, monkeypatch
 ):
     """Compact paged attention agrees with explicit BF16 K reconstruction.
 
@@ -490,9 +491,11 @@ def test_gemma4_compact_kv(
         v_descale=None,
         seq_threshold_3D=8 if segments > 1 else None,
         num_par_softmax_segments=segments,
-        softmax_segm_output=torch.empty((8, heads, segments, 512), device=device),
-        softmax_segm_max=torch.empty((8, heads, segments), device=device),
-        softmax_segm_expsum=torch.empty((8, heads, segments), device=device),
+        softmax_segm_output=torch.empty(
+            (scratch_rows, heads, segments, 512), device=device
+        ),
+        softmax_segm_max=torch.empty((scratch_rows, heads, segments), device=device),
+        softmax_segm_expsum=torch.empty((scratch_rows, heads, segments), device=device),
         compact_k_norm=norm,
     )
     torch.testing.assert_close(output, expected, atol=0.016, rtol=0.02)
