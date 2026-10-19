@@ -4,8 +4,14 @@
 set -euo pipefail
 
 src_dir=${1:?Usage: apply_deepgemm_patch.sh DEEPGEMM_SRC_DIR}
+src_dir=$(cd -- "$src_dir" && pwd -P)
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 patch_file="$script_dir/../cmake/patches/deepgemm-sm120-fp8-fp4-m32.patch"
+
+# Archives must not inherit an enclosing repository's subdirectory prefix.
+unset GIT_DIR GIT_COMMON_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_PREFIX
+export GIT_CEILING_DIRECTORIES
+GIT_CEILING_DIRECTORIES=$(dirname -- "$src_dir")
 
 # Reconfiguration and already-patched local sources must be idempotent.
 if git -C "$src_dir" apply --reverse --check "$patch_file" >/dev/null 2>&1; then

@@ -108,6 +108,27 @@ class QualityCompareTests(unittest.TestCase):
         self.assertEqual(result["unit_count"], 2)
         self.assertEqual(result["per_question"], [])
 
+    def test_recorded_repeated_or_incomplete_seeds_refuse_attempt_inference(self):
+        for seeds in ([7] * 16, [7, None] * 8):
+            with self.subTest(seeds=seeds):
+                runs = []
+                for label, offset in (("A", 100), ("B", 200)):
+                    data = fixture({f"q{i}": [offset + i] * 16 for i in range(4)})
+                    for question in data["results"]:
+                        for attempt, seed in zip(question["attempts"], seeds):
+                            attempt["seed"] = seed
+                    directory = tempfile.TemporaryDirectory()
+                    self.addCleanup(directory.cleanup)
+                    path = Path(directory.name) / "run.json"
+                    path.write_text(json.dumps(data))
+                    runs.append(load_run(label, path))
+                self.assertTrue(all(not run["independent_draws"] for run in runs))
+                result = compare(*runs, resamples=999, seed=1)
+                self.assertEqual(result["unit"], "questions")
+                self.assertEqual(result["p_two_sided"], 0.125)
+                with self.assertRaisesRegex(ValueError, "fixed seeds"):
+                    compare(*runs, unit="attempts", resamples=999)
+
     def test_paired_question_exact_direction_and_interval(self):
         a = self.load({f"q{i}": [10.0 + i, 20.0 + i] for i in range(8)}, "A", seed=1)
         b = self.load({f"q{i}": [20.0 + i, 30.0 + i] for i in range(8)}, "B", seed=1)

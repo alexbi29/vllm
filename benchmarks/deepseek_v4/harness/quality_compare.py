@@ -79,9 +79,17 @@ def load_run(label, path):
         top_p=request.get("top_p", 1),
         max_tokens=data.get("max_tokens"),
         request_args=request,
-        # A shared explicit seed does not establish independent trial draws.
+        # Repeated or incomplete recorded seeds cannot establish independent draws.
         independent_draws=request.get("seed") is None
-        and (data.get("temperature") or 0) > 0,
+        and (data.get("temperature") or 0) > 0
+        and all(
+            all(s is None for s in q["seeds"])
+            or (
+                all(type(s) is int for s in q["seeds"])
+                and len(set(q["seeds"])) == q["n"]
+            )
+            for q in questions.values()
+        ),
         questions=questions,
         mean=float(np.mean([q["mean"] for q in questions.values()])),
         attempts=sum(q["n"] for q in questions.values()),
