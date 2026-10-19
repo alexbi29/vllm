@@ -621,7 +621,7 @@ def ref_paged_clamped_mm_attn(
 ) -> torch.Tensor:
     block_tables_cpu = block_tables.cpu().numpy()
     _, block_size, num_kv_heads, head_size = key_cache.shape
-    chunk_size = sliding_window // (chunk_lookback + 1)
+    chunk_size = sliding_window // (chunk_lookback + 1) if chunk_lookback >= 0 else None
 
     outputs: list[torch.Tensor] = []
     query_start = 0
@@ -641,10 +641,13 @@ def ref_paged_clamped_mm_attn(
             value_i = torch.repeat_interleave(value_i, repeats, dim=1)
 
         delta = query_pos[:, None] - key_pos[None, :]
-        keep = (delta >= 0) & (
-            query_pos[:, None] // chunk_size - key_pos[None, :] // chunk_size
-            <= chunk_lookback
-        )
+        if chunk_size is None:
+            keep = (delta >= 0) & (delta < sliding_window)
+        else:
+            keep = (delta >= 0) & (
+                query_pos[:, None] // chunk_size - key_pos[None, :] // chunk_size
+                <= chunk_lookback
+            )
         for range_start, range_end in mm_ranges[req_idx]:
             q_in_range = (query_pos >= range_start) & (query_pos <= range_end)
             k_in_range = (key_pos >= range_start) & (key_pos <= range_end)
@@ -661,17 +664,20 @@ def ref_paged_clamped_mm_attn(
 
 
 @torch.inference_mode()
-def test_triton_unified_attn_clamped_mm_matches_dense_reference() -> None:
+@pytest.mark.parametrize("gemma4_sliding", [False, True])
+def test_triton_unified_attn_clamped_mm_matches_dense_reference(
+    gemma4_sliding: bool,
+) -> None:
     set_random_seed(0)
     query_lens = [384, 96]
     kv_lens_list = [384, 320]
     mm_ranges = [[(32, 351)], [(160, 287)]]
-    sliding_window = 128
-    chunk_lookback = 0
-    block_size = 16
-    num_query_heads = 4
-    num_kv_heads = 2
-    head_size = 128
+    sliding_window = 1024 if gemma4_sliding else 128
+    chunk_lookback = -1 if gemma4_sliding else 0
+    block_size = 80 if gemma4_sliding else 16
+    num_query_heads = 16 if gemma4_sliding else 4
+    num_kv_heads = 8 if gemma4_sliding else 2
+    head_size = 256 if gemma4_sliding else 128
     scale = head_size**-0.5
 
     query = torch.randn(
@@ -720,7 +726,7 @@ def test_triton_unified_attn_clamped_mm_matches_dense_reference() -> None:
     )
     actual = torch.empty_like(query)
 
-    unified_attention(
+    attention_args = dict(
         q=query,
         k=key_cache,
         v=value_cache,
@@ -741,6 +747,7 @@ def test_triton_unified_attn_clamped_mm_matches_dense_reference() -> None:
         chunk_lookback=chunk_lookback,
         mm_prefix_clamp_sliding_window=True,
     )
+    unified_attention(**attention_args)
 
     expected = ref_paged_clamped_mm_attn(
         query,
@@ -769,6 +776,13 @@ def test_triton_unified_attn_clamped_mm_matches_dense_reference() -> None:
 
     torch.testing.assert_close(actual.float(), expected.float(), atol=2e-2, rtol=2e-2)
     assert not torch.allclose(expected, chunk_only, atol=2e-2, rtol=2e-2)
+    if gemma4_sliding:
+        # Ordinary text can take the native path; image ranges must retain
+        # their bidirectional semantics through the existing Triton fallback.
+        unified_attention(**{**attention_args, "mm_prefix_range": None})
+        torch.testing.assert_close(
+            actual.float(), chunk_only.float(), atol=2e-2, rtol=2e-2
+        )
 
 
 @pytest.mark.parametrize(
