@@ -133,7 +133,13 @@ def test_unknown_indexed_graph_api_is_rejected(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "version,missing", [("0.8.0", None), ("0.7.0.post1", "_get_cudnn_handle")]
+    "version,missing",
+    [
+        ("0.8.0", None),
+        ("0.7.1", None),
+        ("0.7.0.post1", "_get_cudnn_handle"),
+        ("0.7.2", "_get_cudnn_handle"),
+    ],
 )
 def test_unqualified_flashinfer_dependency_is_rejected(version, missing):
     api = SimpleNamespace(
