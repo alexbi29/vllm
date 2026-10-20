@@ -1321,6 +1321,10 @@ class FusedMoEConfig:
     # Routes are adjusted between routing and expert execution.
     require_decomposed_backend: bool = False
     shared_expert_prefix: str | None = None
+    # Canonicalize routed token order inside Marlin expert regions before the
+    # kernel. Only DeepSeek-V4 on SM120 is qualified with it; other Marlin
+    # models keep the upstream layout.
+    canonicalize_marlin_token_order: bool = False
 
     # When True, the MoE skips its final cross-rank all-reduce (and the separate
     # shared-expert reduce), returning the partial per-rank sum. The caller is

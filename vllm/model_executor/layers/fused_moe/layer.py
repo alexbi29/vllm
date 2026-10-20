@@ -41,6 +41,7 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import QuantKey
+from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
@@ -362,6 +363,16 @@ def FusedMoEFactory(
         # since model_config is not set in the pytest test.
         moe_in_dtype = params_dtype
 
+    canonicalize_marlin_token_order = (
+        current_platform.is_cuda()
+        and current_platform.is_device_capability_family(120)
+        and vllm_config.model_config is not None
+        and getattr(vllm_config.model_config.hf_config, "model_type", None)
+        == "deepseek_v4"
+    )
+    if canonicalize_marlin_token_order:
+        logger.info_once("DeepSeek V4 SM120: canonical Marlin token ordering enabled.")
+
     moe_config = (moe_config_cls or FusedMoEConfig)(
         num_experts=global_num_experts,
         experts_per_token=top_k,
@@ -379,6 +390,7 @@ def FusedMoEFactory(
         has_bias=has_bias,
         is_lora_enabled=vllm_config.lora_config is not None,
         shared_expert_prefix=shared_expert_prefix,
+        canonicalize_marlin_token_order=canonicalize_marlin_token_order,
         activation=moe_activation,
         device=vllm_config.device_config.device,
         routing_method=router.kernel_routing_method_type,
