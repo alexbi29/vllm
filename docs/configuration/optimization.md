@@ -556,3 +556,11 @@ settings, stop that worker, then load fresh weights in a new process using
 the populated cache. Keep the initial profile log and recheck the new boot's
 reported KV capacity. Zero GEMM workspace alone does not establish unchanged
 total GPU memory or KV capacity. No memory-budget override is required.
+
+Surrounding compiled reductions can select different launch configurations
+when rebuilding a cache. The local normalization-controlled deployment
+preserves its populated compilation cache and checks whole-model token IDs,
+selected logprobs and top-20 scores at 8K and 64K against saved references.
+Changing the compilation cache, serving profile or dependencies requires
+rechecking those outputs and the actual KV budget. Fixed-input GEMM equality
+does not establish sample-efficiency equivalence for concurrent generation.
