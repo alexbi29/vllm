@@ -517,8 +517,17 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
         for c, out in zip(compressed, scratch):
             c.decode(out)
         self.quant_config._w1.scale, self.quant_config._w2.scale = scratch
-        replace_parameter(layer, "w13_weight_scale", scratch[0])
-        replace_parameter(layer, "w2_weight_scale", scratch[1])
+        for name, out in (
+            ("w13_weight_scale", scratch[0]),
+            ("w2_weight_scale", scratch[1]),
+        ):
+            param = getattr(layer, name)
+            if isinstance(param, torch.nn.Parameter):
+                # Alias the shared scratch. replace_parameter would copy into the
+                # same-shaped original storage and keep every layer's scales.
+                param.data = out
+            else:
+                replace_parameter(layer, name, out)
         self._csf_scales = compressed
         layer.register_state_dict_pre_hook(reject_compressed_scale_export)
         logger.info_once(
