@@ -31,7 +31,7 @@ is inherited rather than copied from the older special branch.
 
 ## Build and configuration
 
-Normal CMake and `tools/install_deepgemm.sh` builds apply the checked-in
+Normal CMake builds apply the checked-in
 `cmake/patches/deepgemm-sm120-fp8-fp4-m32.patch`. Reapplication is idempotent;
 incompatible or partially patched sources fail before modification. The patch
 adds the native capability query and enables M32 only for grouped-contiguous
@@ -39,11 +39,14 @@ FP8 activations by packed-FP4 weights at runtime alignment32. It changes no
 device arithmetic. Python also requires the native capability before selecting
 M32; older prebuilt libraries retain the supported64-row fallback.
 
-The patch applies to the PR base's pinned DeepGEMM
-`6ce1c5ec6627a6bf11dbcc698b0b1e19c9248432` and to the qualified runtime base
-`1e1842a833699298f7afc02eefb2ed168fff6938`. Applying it to the latter reproduces
-all four changed files at qualified native commit
-`a0c6de48f042160409fdb4ede3be9caeda49a7ae`. The existing
+The patch targets the pinned DeepGEMM
+`727f847082d2e7946f70dc02b94949db206310d3` (2.8.1), whose stable-ABI op
+registration declares the capability query with `m.def` and binds it with
+`m.impl(TORCH_BOX(...))`. Earlier revisions of the patch targeted
+`1e1842a833699298f7afc02eefb2ed168fff6938`, reproducing the four changed files
+of the qualified private native commit
+`a0c6de48f042160409fdb4ede3be9caeda49a7ae`; the device heuristic is unchanged.
+The existing
 `DEEPGEMM_SRC_DIR` override remains available; use a separate source checkout
 because the build applies the patch to that checkout.
 
