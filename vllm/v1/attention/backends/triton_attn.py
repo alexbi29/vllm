@@ -114,7 +114,7 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
         self.num_heads_q = get_num_attention_heads_from_layers(
             vllm_config, layer_names
         ) or model_config.get_num_attention_heads(vllm_config.parallel_config)
-        self.num_heads_kv = model_config.get_num_kv_heads(vllm_config.parallel_config)
+        self.num_heads_kv = self._get_num_heads_kv(kv_cache_spec, vllm_config)
         self.headdim = model_config.get_head_size()
 
         # Check if CUDA Graphs are enabled for decode
@@ -219,6 +219,12 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
                 dtype=torch.int32,
                 device=device,
             )
+
+    def _get_num_heads_kv(
+        self, kv_cache_spec: AttentionSpec, vllm_config: VllmConfig
+    ) -> int:
+        model_config = vllm_config.model_config
+        return model_config.get_num_kv_heads(vllm_config.parallel_config)
 
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata

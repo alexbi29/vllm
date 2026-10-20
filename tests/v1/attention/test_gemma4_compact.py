@@ -310,6 +310,56 @@ def test_compact_metadata_uses_global_head_width(monkeypatch):
     assert builder.softmax_segm_output.shape[-1] == 512
 
 
+@pytest.mark.parametrize("sm120", [False, True])
+def test_compact_metadata_uses_global_kv_heads(monkeypatch, sm120):
+    """Split-KV thresholds follow the 2 global KV heads, not the 8 local ones,
+    and full verification scratch still has room for the score prefix maxima."""
+    from vllm.config import CUDAGraphMode
+    from vllm.v1.attention.backends.gemma4_compact import Gemma4CompactMetadataBuilder
+    from vllm.v1.attention.backends.triton_attn import current_platform
+
+    monkeypatch.setattr(current_platform, "num_compute_units", lambda: 188)
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: sm120)
+    monkeypatch.setattr(
+        current_platform, "is_device_capability", lambda cap: sm120 and cap == (12, 0)
+    )
+    config = SimpleNamespace(
+        compilation_config=SimpleNamespace(
+            cudagraph_mode=CUDAGraphMode.NONE, static_forward_context={}
+        ),
+        model_config=SimpleNamespace(
+            get_num_attention_heads=lambda _: 16,
+            get_num_kv_heads=lambda _: 8,
+            get_head_size=lambda: 256,
+            rswa_window=None,
+        ),
+        parallel_config=None,
+        speculative_config=SimpleNamespace(
+            num_speculative_tokens=2, parallel_drafting=False
+        ),
+        scheduler_config=SimpleNamespace(max_num_seqs=64),
+    )
+    spec = FullAttentionSpec(
+        block_size=256, num_kv_heads=2, head_size=512, dtype=torch.bfloat16
+    )
+    builder = Gemma4CompactMetadataBuilder(spec, [], config, torch.device("cpu"))
+    assert builder.num_heads_kv == 2
+    assert builder.seq_threshold_3D == 64
+    assert builder.max_seqs_64_segments == (5 if sm120 else 0)
+
+    # Every row-count/segment layout build() can hand to the kernel: 64
+    # segments up to max_seqs_64_segments requests, else 16 up to 64 requests.
+    out = builder.softmax_segm_output
+    layouts = {16: 64 * 3}
+    if sm120:
+        layouts[64] = 5 * 3
+    for segments, min_tokens in layouts.items():
+        num_tokens = builder.softmax_segm_max.numel() // (16 * segments)
+        assert num_tokens >= min_tokens
+        used = num_tokens * 16 * segments * 512
+        assert out.numel() >= used + num_tokens * 16 * segments
+
+
 @pytest.mark.parametrize(
     "dtype,mode,head_size",
     [
