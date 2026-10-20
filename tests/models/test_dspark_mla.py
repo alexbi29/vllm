@@ -81,6 +81,7 @@ def test_deepseek_dspark_does_not_reserve_unused_mtp_residual(
                 index_topk=8,
                 num_hidden_layers=0,
                 num_hash_layers=0,
+                mlp_layer_types=[],
             ),
         ),
         parallel_config=SimpleNamespace(
