@@ -974,6 +974,54 @@ def test_canonicalize_marlin_moe_token_order():
     )
 
 
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
+@pytest.mark.parametrize("canonicalize", [False, True])
+def test_fused_marlin_moe_token_order_canonicalization_is_opt_in(
+    monkeypatch, canonicalize
+):
+    import vllm.model_executor.layers.fused_moe.experts.marlin_moe as marlin_moe
+
+    calls = []
+
+    def fake_canonicalize(sorted_token_ids, *args):
+        calls.append(sorted_token_ids.numel())
+        return sorted_token_ids
+
+    def fake_fused(*, hidden_states, **kwargs):
+        return hidden_states
+
+    monkeypatch.setattr(
+        marlin_moe, "_canonicalize_marlin_moe_token_order", fake_canonicalize
+    )
+    monkeypatch.setattr(marlin_moe, "_fused_marlin_moe", fake_fused)
+
+    m, e, topk = 4, 4, 2
+    hidden_states = torch.zeros((m, 16), device="cuda", dtype=torch.bfloat16)
+    topk_ids = torch.tensor(
+        [[0, 1], [1, 2], [2, 3], [3, 0]], device="cuda", dtype=torch.int32
+    )
+    topk_weights = torch.ones((m, topk), device="cuda", dtype=torch.float32)
+    # Shapes only need to satisfy the 4-bit size checks; the kernel is faked.
+    w1 = torch.empty((e, 1, 1), device="cuda", dtype=torch.int32)
+    w2 = torch.empty((e, 1, 32), device="cuda", dtype=torch.int32)
+    marlin_moe.fused_marlin_moe(
+        hidden_states,
+        w1,
+        w2,
+        None,
+        None,
+        torch.empty(0),
+        torch.empty(0),
+        topk_weights,
+        topk_ids,
+        quant_type_id=scalar_types.uint4b8.id,
+        global_num_experts=e,
+        moe_sum=lambda *args: None,
+        canonicalize_token_order=canonicalize,
+    )
+    assert bool(calls) == canonicalize
+
+
 MARLIN_MOE_SCENARIOS = [
     # (m, n, k, e, topk, ep_size)
     # N>=256 required for Marlin kernel thread config for MXFP8.

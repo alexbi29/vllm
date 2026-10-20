@@ -318,6 +318,7 @@ def fused_marlin_moe(
     input_dtype: torch.dtype | None = None,
     activation_config: ApplyMoEActivationConfig | None = None,
     mul_topk_weights_in_gemm2: bool = True,
+    canonicalize_token_order: bool = False,
 ) -> torch.Tensor:
     """This function computes a Mixture of Experts (MoE) layer using two sets of
     weights, w1 and w2, and top-k gating mechanism.
@@ -365,6 +366,9 @@ def fused_marlin_moe(
         activation_config (ApplyMoEActivationConfig|None): Extra
             configuration forwarded to the activation.
         mul_topk_weights_in_gemm2 (bool): Apply top-k weights in GEMM2.
+        canonicalize_token_order (bool): Sort routed token IDs inside each
+            expert region before the kernel so equivalent routings reduce in
+            the same order. Off by default.
 
     Returns:
         torch.Tensor: The output tensor after applying the MoE layer.
@@ -425,7 +429,7 @@ def fused_marlin_moe(
 
     # A single-token decode cannot span multiple routed blocks for one expert,
     # so keep it on the original fast path.
-    if topk_ids.shape[0] > 1:
+    if canonicalize_token_order and topk_ids.shape[0] > 1:
         sorted_token_ids = _canonicalize_marlin_moe_token_order(
             sorted_token_ids,
             expert_ids,
@@ -868,6 +872,9 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
                 intermediate_cache2=workspace13,
                 input_dtype=self.input_dtype,
                 mul_topk_weights_in_gemm2=not hooked,
+                canonicalize_token_order=(
+                    self.moe_config.canonicalize_marlin_token_order
+                ),
             )
             return
 
@@ -978,6 +985,7 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
             intermediate_cache13=workspace2,
             intermediate_cache2=workspace13,
             input_dtype=self.input_dtype,
+            canonicalize_token_order=self.moe_config.canonicalize_marlin_token_order,
         )
 
     def moe_sum(
