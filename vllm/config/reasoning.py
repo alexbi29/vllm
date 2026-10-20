@@ -25,6 +25,14 @@ class ReasoningConfig:
     """String that indicates the start of reasoning."""
     reasoning_end_str: str = ""
     """String forced when the thinking budget is exhausted."""
+    block_reasoning_reentry: bool = False
+    """Once a request's `thinking_token_budget` has been exhausted, mask the
+    reasoning start marker for the rest of that generation, so the model
+    cannot reopen a reasoning block after the forced end. Without it, a
+    reopened block is budgeted afresh, and a model that keeps reopening
+    thinks without bound. Only a block that closed in the generated output
+    counts; reasoning rendered into the prompt never blocks a new turn.
+    Model Runner V2 only."""
 
     _reasoning_start_token_ids: list[int] | None = field(
         default=None, init=False, repr=False
