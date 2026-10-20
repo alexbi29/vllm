@@ -39,6 +39,7 @@ from vllm.model_executor.layers.fused_moe.config import (
     int8_w8a16_moe_quant_config,
 )
 from vllm.model_executor.layers.fused_moe.experts.marlin_moe import (
+    _canonicalize_marlin_moe_token_order,
     batched_fused_marlin_moe,
     fused_marlin_moe,
 )
@@ -789,6 +790,166 @@ def test_fused_moe_wn16(
         torch_output = torch_moe(a, w1_ref, w2_ref, score, topk, expert_map=e_map)
 
     torch.testing.assert_close(triton_output, torch_output, atol=2e-2, rtol=0)
+
+
+def test_canonicalize_marlin_moe_token_order():
+    block_size_m = 4
+    num_valid_tokens = 9
+    num_tokens_post_padded = torch.tensor([12], dtype=torch.int32)
+
+    # The fourth block intentionally has the same expert ID as the final
+    # active block. Its contents are outside num_tokens_post_padded and must
+    # never leak into the active prefix.
+    expert_ids = torch.tensor(
+        [2, 2, 7, 7, -123],
+        dtype=torch.int32,
+    )
+
+    first_order = torch.tensor(
+        [
+            8,
+            3,
+            9,
+            1,
+            7,
+            4,
+            6,
+            9,
+            5,
+            9,
+            0,
+            2,
+            -2147483648,
+            -100,
+            123456,
+            17,
+            -77,
+            42,
+            999999,
+            -9,
+        ],
+        dtype=torch.int32,
+    )
+
+    second_order = torch.tensor(
+        [
+            9,
+            6,
+            4,
+            7,
+            1,
+            9,
+            3,
+            8,
+            2,
+            0,
+            9,
+            5,
+            314159,
+            -2147483648,
+            -1,
+            88,
+            7,
+            -300,
+            111111,
+            22,
+        ],
+        dtype=torch.int32,
+    )
+
+    expected_active = torch.tensor(
+        [
+            1,
+            3,
+            4,
+            6,
+            7,
+            8,
+            9,
+            9,
+            0,
+            2,
+            5,
+            9,
+        ],
+        dtype=torch.int32,
+    )
+
+    first_canonical = _canonicalize_marlin_moe_token_order(
+        first_order,
+        expert_ids,
+        num_tokens_post_padded,
+        block_size_m,
+        num_valid_tokens,
+    )
+    second_canonical = _canonicalize_marlin_moe_token_order(
+        second_order,
+        expert_ids,
+        num_tokens_post_padded,
+        block_size_m,
+        num_valid_tokens,
+    )
+
+    torch.testing.assert_close(
+        first_canonical[:12],
+        expected_active,
+        atol=0,
+        rtol=0,
+    )
+    torch.testing.assert_close(
+        second_canonical[:12],
+        expected_active,
+        atol=0,
+        rtol=0,
+    )
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
+@pytest.mark.parametrize("canonicalize", [False, True])
+def test_fused_marlin_moe_token_order_canonicalization_is_opt_in(
+    monkeypatch, canonicalize
+):
+    import vllm.model_executor.layers.fused_moe.experts.marlin_moe as marlin_moe
+
+    calls = []
+
+    def fake_canonicalize(sorted_token_ids, *args):
+        calls.append(sorted_token_ids.numel())
+        return sorted_token_ids
+
+    def fake_fused(*, hidden_states, **kwargs):
+        return hidden_states
+
+    monkeypatch.setattr(
+        marlin_moe, "_canonicalize_marlin_moe_token_order", fake_canonicalize
+    )
+    monkeypatch.setattr(marlin_moe, "_fused_marlin_moe", fake_fused)
+
+    m, e, topk = 4, 4, 2
+    hidden_states = torch.zeros((m, 16), device="cuda", dtype=torch.bfloat16)
+    topk_ids = torch.tensor(
+        [[0, 1], [1, 2], [2, 3], [3, 0]], device="cuda", dtype=torch.int32
+    )
+    topk_weights = torch.ones((m, topk), device="cuda", dtype=torch.float32)
+    # Shapes only need to satisfy the 4-bit size checks; the kernel is faked.
+    w1 = torch.empty((e, 1, 1), device="cuda", dtype=torch.int32)
+    w2 = torch.empty((e, 1, 32), device="cuda", dtype=torch.int32)
+    marlin_moe.fused_marlin_moe(
+        hidden_states,
+        w1,
+        w2,
+        None,
+        None,
+        torch.empty(0),
+        torch.empty(0),
+        topk_weights,
+        topk_ids,
+        quant_type_id=scalar_types.uint4b8.id,
+        global_num_experts=e,
+        moe_sum=lambda *args: None,
+        canonicalize_token_order=canonicalize,
+    )
+    assert bool(calls) == canonicalize
 
 
 MARLIN_MOE_SCENARIOS = [

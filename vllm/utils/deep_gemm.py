@@ -371,6 +371,8 @@ def get_mk_alignment_for_contiguous_layout() -> list[int]:
 def get_theoretical_mk_alignment_for_contiguous_layout(
     expected_m: int | None = None,
     num_groups: int | None = None,
+    *,
+    allow_sm120_fp4_m32: bool = False,
 ) -> int:
     """Per-call optimal M alignment for grouped contiguous GEMMs.
 
@@ -385,17 +387,46 @@ def get_theoretical_mk_alignment_for_contiguous_layout(
     _lazy_init()
     if _get_theoretical_mk_alignment_for_contiguous_layout_impl is None:
         return _missing()
-    if num_groups is None:
-        return _get_theoretical_mk_alignment_for_contiguous_layout_impl(expected_m)
-    if num_groups <= 0:
+    if num_groups is not None and num_groups <= 0:
         raise ValueError(f"num_groups must be positive, got {num_groups}")
-    try:
-        return _get_theoretical_mk_alignment_for_contiguous_layout_impl(
-            expected_m, num_groups
+    per_group_m = (
+        expected_m
+        if num_groups is None or expected_m is None
+        else cdiv(expected_m, num_groups)
+    )
+    # TORCH_LIBRARY's legacy one-argument operator reports invalid arity as
+    # RuntimeError, unlike the former pybind binding's TypeError.
+    schemas = getattr(
+        _get_theoretical_mk_alignment_for_contiguous_layout_impl, "_schemas", {}
+    )
+    schema = schemas.get("")
+    if num_groups is None or (schema is not None and len(schema.arguments) == 1):
+        alignment = _get_theoretical_mk_alignment_for_contiguous_layout_impl(
+            per_group_m
         )
-    except TypeError:
-        per_group_m = None if expected_m is None else cdiv(expected_m, num_groups)
-        return _get_theoretical_mk_alignment_for_contiguous_layout_impl(per_group_m)
+    else:
+        try:
+            alignment = _get_theoretical_mk_alignment_for_contiguous_layout_impl(
+                expected_m, num_groups
+            )
+        except TypeError:
+            alignment = _get_theoretical_mk_alignment_for_contiguous_layout_impl(
+                per_group_m
+            )
+    # M32 needs both the FP4 caller's opt-in and a matching native selector.
+    if (
+        alignment in (64, 128)
+        and per_group_m is not None
+        and per_group_m <= 64
+        and current_platform.is_device_capability_family(120)
+    ):
+        if allow_sm120_fp4_m32 and per_group_m <= 32:
+            module = _import_deep_gemm()
+            supports_m32 = getattr(module, "supports_sm120_grouped_fp8_fp4_m32", None)
+            if supports_m32 is not None and supports_m32():
+                return 32
+        return 64
+    return alignment
 
 
 def set_mk_alignment_for_contiguous_layout(value: int) -> None:

@@ -1,7 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+from dataclasses import replace
+from typing import TYPE_CHECKING
+
 import torch
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.quantization.utils.mxfp4_csf import (
+        CompressedMxfp4Scales,
+    )
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.logger import init_logger
@@ -19,7 +28,10 @@ from vllm.model_executor.layers.fused_moe.deep_gemm_utils import (
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
 )
-from vllm.model_executor.layers.fused_moe.utils import _resize_cache
+from vllm.model_executor.layers.fused_moe.utils import (
+    _resize_cache,
+    count_expert_num_tokens,
+)
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8,
     per_token_group_quant_fp8_packed_for_deepgemm,
@@ -465,6 +477,65 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
         assert not quant_config.per_out_ch_quant
 
         self.gemm1_clamp_limit = quant_config.gemm1_clamp_limit
+        self._csf_scales: tuple[CompressedMxfp4Scales, ...] | None = None
+        self._csf_pair_fusion = os.getenv("DS4_CSF_PAIR_FUSION", "1") == "1"
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        from vllm.config import get_current_vllm_config_or_none
+        from vllm.model_executor.layers.quantization.utils.mxfp4_csf import (
+            CompressedMxfp4Scales,
+            reject_compressed_scale_export,
+            should_compress_mxfp4_scales,
+        )
+
+        if not should_compress_mxfp4_scales(layer):
+            return
+        config = get_current_vllm_config_or_none()
+        assert config is not None
+        if config.parallel_config.enable_eplb or config.parallel_config.use_ubatching:
+            raise ValueError("MXFP4 scale compression does not support EPLB/ubatching")
+        from vllm.model_executor.utils import replace_parameter
+        from vllm.v1.worker.workspace import current_workspace_manager
+
+        assert self.w1_scale is not None and self.w2_scale is not None
+        compressed = tuple(
+            CompressedMxfp4Scales.from_native(s) for s in (self.w1_scale, self.w2_scale)
+        )
+        if (
+            sum(c.nbytes for c in compressed)
+            >= (self.w1_scale.numel() + self.w2_scale.numel()) * 4
+        ):
+            logger.warning_once("Keeping incompressible MXFP4 scales uncompressed.")
+            return
+        key = (
+            CompressedMxfp4Scales,
+            tuple((c.shape, c.stride, c.bases.device) for c in compressed),
+        )
+        scratch = current_workspace_manager().get_persistent_resource(
+            key, lambda: tuple(c.make_scratch() for c in compressed)
+        )
+        for c, out in zip(compressed, scratch):
+            c.decode(out)
+        self.quant_config._w1.scale, self.quant_config._w2.scale = scratch
+        for name, out in (
+            ("w13_weight_scale", scratch[0]),
+            ("w2_weight_scale", scratch[1]),
+        ):
+            param = getattr(layer, name)
+            if isinstance(param, torch.nn.Parameter):
+                # Alias the shared scratch. replace_parameter would copy into the
+                # same-shaped original storage and keep every layer's scales.
+                param.data = out
+            else:
+                replace_parameter(layer, name, out)
+        self._csf_scales = compressed
+        layer.register_state_dict_pre_hook(reject_compressed_scale_export)
+        logger.info_once(
+            "Lossless native MXFP4 scale compression enabled; "
+            "active experts decode into shared DeepGEMM scratch."
+        )
+        if self._csf_pair_fusion:
+            logger.info_once("Paired CSF scale preparation enabled.")
 
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:
@@ -527,7 +598,12 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
         block_m = get_mk_alignment_for_contiguous_layout()[0]
         M_sum, align_used = compute_aligned_M_and_alignment(
-            M, topk, local_num_experts, block_m, expert_tokens_meta
+            M,
+            topk,
+            local_num_experts,
+            block_m,
+            expert_tokens_meta,
+            allow_sm120_fp4_m32=self._csf_scales is not None and 0 < M <= 128,
         )
         assert M_sum % align_used == 0
 
@@ -551,6 +627,7 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
         activation: MoEActivation,
         expert_ends: torch.Tensor | None = None,
         expert_alignment: int = 0,
+        row_indices: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         block_k = self._ACT_BLOCK_K
         scale_fmt = DeepGemmQuantScaleFMT.from_oracle()
@@ -568,6 +645,7 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
                     clamp_limit=self.gemm1_clamp_limit,
                     expert_ends=expert_ends,
                     expert_alignment=expert_alignment,
+                    row_indices=row_indices,
                 )
             use_ue8m0 = scale_fmt == DeepGemmQuantScaleFMT.FLOAT32_CEIL_UE8M0
             return silu_mul_per_token_group_quant_fp8_colmajor(
@@ -630,12 +708,49 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
         if global_num_experts == -1:
             global_num_experts = local_num_experts
 
+        if self._csf_scales is not None:
+            counts = (
+                expert_tokens_meta.expert_num_tokens
+                if expert_tokens_meta is not None
+                else None
+            )
+            if counts is None:
+                counts = count_expert_num_tokens(
+                    topk_ids, local_num_experts, expert_map
+                )
+                expert_tokens_meta = (
+                    mk.ExpertTokensMetadata(counts, None)
+                    if expert_tokens_meta is None
+                    else replace(expert_tokens_meta, expert_num_tokens=counts)
+                )
+            if self._csf_pair_fusion:
+                from vllm.model_executor.layers.quantization.utils import mxfp4_csf_pair
+
+                ids = torch.empty(
+                    local_num_experts, device=counts.device, dtype=torch.int32
+                )
+                mxfp4_csf_pair.decode_pair(
+                    self._csf_scales,
+                    (self.w1_scale, self.w2_scale),
+                    counts,
+                    ids,
+                    min(local_num_experts, topk_ids.numel()),
+                )
+            else:
+                for compressed, scratch in zip(
+                    self._csf_scales, (self.w1_scale, self.w2_scale)
+                ):
+                    compressed.decode(scratch, counts, topk_ids.numel())
+
         M_sum, _ = compute_aligned_M_and_alignment(
             M=topk_ids.size(0),
             num_topk=topk_ids.size(1),
             local_num_experts=local_num_experts,
             alignment=get_mk_alignment_for_contiguous_layout()[0],
             expert_tokens_meta=expert_tokens_meta,
+            allow_sm120_fp4_m32=(
+                self._csf_scales is not None and 0 < topk_ids.size(0) <= 128
+            ),
         )
 
         a1q_perm = _resize_cache(
@@ -651,6 +766,9 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
             expert_tokens_meta=expert_tokens_meta,
             aq_out=a1q_perm,
             use_psum_layout=use_psum_layout,
+            allow_sm120_fp4_m32=(
+                self._csf_scales is not None and 0 < topk_ids.size(0) <= 128
+            ),
         )
         assert a1q.size(0) == M_sum
 
@@ -681,6 +799,7 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
                 activation=activation,
                 expert_ends=grouped_layout if use_psum_layout else None,
                 expert_alignment=align_used if use_psum_layout else 0,
+                row_indices=inv_perm.reshape(-1) if topk_ids.size(0) <= 128 else None,
             )
 
             # FC2: FP8 activations x FP4 weights
