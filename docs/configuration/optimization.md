@@ -516,3 +516,43 @@ If you observe that GPU utilization is lower than expected, CPU contention may b
 vLLM supports multiple attention backends optimized for different hardware and use cases. The backend is automatically selected based on your GPU architecture, model type, and configuration, but you can also manually specify one for optimal performance.
 
 For detailed information on available backends, their feature support, and how to configure them, see the [Attention Backend Feature Support](../design/attention_backends.md) documentation.
+
+## Experimental Gemma4 Shared-MLP GEMM on SM120
+
+Set `VLLM_GEMMA4_DENSE_CUDNN=1` before starting a fresh worker to opt into a
+pinned cuDNN implementation of Gemma4's small-batch BF16 shared-MLP
+projections. It is disabled by default. The target profile is
+`nvidia/Gemma-4-26B-A4B-NVFP4` on SM120 with tensor parallelism 1; its shared
+MLP weights are BF16 even though its expert weights are NVFP4. This option
+does not change expert quantization or KV precision.
+
+The optimization requires FlashInfer `0.7.0.post1` and its audited cuDNN
+override-shape APIs, which require cuDNN backend 9.23.1 or newer. This branch's
+ordinary dependency pins include FlashInfer `0.6.18.post1` and do not satisfy
+this opt-in. The model measurements use a separately qualified environment
+with the system cuDNN 9.24.0 backend; wheel metadata alone does not identify
+the loaded backend. Upgrading a dependency alone does not qualify another build.
+It applies to contiguous, 16-byte-aligned BF16 CUDA
+operands with shared-MLP weights of shape `(4224, 2816)` or `(2816, 2112)` and
+2, 3, 4, 6 or 8 input rows. Other rows retain Torch linear execution. LoRA,
+bias, tensor parallelism greater than 1, DBO/ubatching and other devices do
+not install this optimization. Graph-replay measurements do not establish
+eager-mode performance.
+
+Each eligible loaded weight is prewarmed and checked against Torch before
+capture. The selected plan must report engine 10, knob 12 = 18 and zero
+required and supplied workspace. Incompatible APIs, missing plans, nonzero
+workspace or failed prewarm comparisons cause an error rather than heuristic
+retuning. `gemma4_dense_cudnn_state()` in the worker exposes observed plan and
+installation receipts; its Python call counters cover prewarm, eager and
+capture calls, not CUDA graph replays. These checks do not prove output
+identity for every possible input or qualify a different dependency build.
+
+Changing the option separates compilation caches and requires a restart.
+First-time compilation can increase the transient activation peak used by
+automatic KV profiling. To reproduce the populated-cache capacity condition,
+populate the compilation cache with the same model, option and serving
+settings, stop that worker, then load fresh weights in a new process using
+the populated cache. Keep the initial profile log and recheck the new boot's
+reported KV capacity. Zero GEMM workspace alone does not establish unchanged
+total GPU memory or KV capacity. No memory-budget override is required.
