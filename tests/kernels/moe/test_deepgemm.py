@@ -829,8 +829,9 @@ def test_resident_csf_matches_native_moe_across_local_routes(
     activation, m, e, monkeypatch, workspace_init
 ):
     """Shared scratch must preserve native output after routing and layer changes."""
-    import weakref
     from types import SimpleNamespace
+
+    from torch.multiprocessing.reductions import StorageWeakRef
 
     from vllm.config import VllmConfig, set_current_vllm_config
     from vllm.model_executor.layers.fused_moe.experts.deep_gemm_moe import (
@@ -886,11 +887,13 @@ def test_resident_csf_matches_native_moe_across_local_routes(
         copy.copy_(original)
         layer.register_parameter(name, torch.nn.Parameter(copy, requires_grad=False))
     packed, candidate = build(layer.w13_weight_scale, layer.w2_weight_scale)
-    old = weakref.ref(layer.w13_weight_scale)
+    # replace_parameter keeps the registered Parameter and rebinds its data, so
+    # check that the original scale storage itself is released.
+    old = StorageWeakRef(layer.w13_weight_scale.untyped_storage())
     with set_current_vllm_config(config):
         packed.process_weights_after_loading(layer)
     assert packed._csf_scales is not None
-    assert old() is None
+    assert old.expired()
     assert layer.w13_weight_scale.data_ptr() == packed.w1_scale.data_ptr()
     with pytest.raises(RuntimeError, match="State export"):
         layer.state_dict()
