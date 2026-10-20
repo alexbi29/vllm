@@ -526,10 +526,10 @@ projections. It is disabled by default. The target profile is
 MLP weights are BF16 even though its expert weights are NVFP4. This option
 does not change expert quantization or KV precision.
 
-The optimization requires FlashInfer `0.7.0.post1` and its audited cuDNN
-override-shape APIs, which require cuDNN backend 9.23.1 or newer. This branch's
-ordinary dependency pins include FlashInfer `0.6.18.post1` and do not satisfy
-this opt-in. The model measurements use a separately qualified environment
+The optimization requires FlashInfer `0.7.0.post1` or `0.7.2` and their
+audited cuDNN override-shape APIs, which require cuDNN backend 9.23.1 or newer.
+The private graph builders it calls are byte-identical in both releases; other
+FlashInfer versions fail closed. The model measurements use a separately qualified environment
 with the system cuDNN 9.24.0 backend; wheel metadata alone does not identify
 the loaded backend. Upgrading a dependency alone does not qualify another build.
 It applies to contiguous, 16-byte-aligned BF16 CUDA
