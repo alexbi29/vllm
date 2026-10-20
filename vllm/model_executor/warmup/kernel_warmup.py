@@ -84,6 +84,7 @@ def _warmup_ll_bf16_router_gemm(model: torch.nn.Module) -> None:
         is_available as is_ll_bf16_gemm_available,
     )
     from vllm.model_executor.kernels.linear.cute_dsl.ll_bf16 import (
+        ll_bf16_gemm_c1_pdl_kernel,
         ll_bf16_gemm_kernel,
     )
 
@@ -98,6 +99,8 @@ def _warmup_ll_bf16_router_gemm(model: torch.nn.Module) -> None:
         return
 
     logger.info_once("Warming up ll_bf16 router GEMM kernels for shapes: %s.", shapes)
+    # ll_bf16_gemm() runs M=1 on the weight-prefetching PDL variant.
+    ll_bf16_gemm_c1_pdl_kernel.warmup(shapes=shapes, m_values=[1])
     ll_bf16_gemm_kernel.warmup(
         shapes=shapes,
         m_values=_LL_BF16_WARMUP_M_RANGE,

@@ -25,7 +25,7 @@ logger = init_logger(__name__)
 class GateLinear(ReplicatedLinear):
     """MoE gate linear layer with multi-tier GEMM dispatch:
 
-    1. cuteDSL ll_bf16_gemm (SM90+, M<=16, bf16 in, fp32 out,
+    1. cuteDSL ll_bf16_gemm (SM90+ and SM120, M<=16, bf16 in, fp32 out,
        any shape w/ K divisible by 8)
     2. fp32 specialized kernel (bf16/fp32 in, fp32 out; SM90+
        model-specific shapes and batch limits, gfx950 any shape with M<=32)
@@ -115,6 +115,16 @@ class GateLinear(ReplicatedLinear):
         can_use_specialized_kernels &= self.is_unquantized
 
         self.allow_specialized_router_gemm = can_use_specialized_kernels
+        # SM120 has PDL and thread block clusters, so tier 1 runs there too;
+        # the other specialized tiers have no SM120 kernels. For 2-6 rows
+        # cuBLAS picks a few-CTA kernel that is up to 6x slower than tier 1.
+        self._allow_ll_bf16_router_gemm = can_use_specialized_kernels or (
+            current_platform.is_cuda()
+            and current_platform.is_device_capability((12, 0))
+            and self.is_unquantized
+            and not bias
+            and not batch_invariant
+        )
 
         # fp32 specialized kernel eligibility (exact dims, fp32 weight)
         self.allow_fp32_router_gemm = (
@@ -194,12 +204,9 @@ class GateLinear(ReplicatedLinear):
         # 2. Thread Block Clusters. Split-K kernel for cross-CTA reduction.
         self.allow_ll_bf16_gemm = False
         self.allow_ll_fp32w_gemm = False
-        if can_use_specialized_kernels:
+        if self._allow_ll_bf16_router_gemm:
             from vllm.model_executor.kernels.linear.cute_dsl.ll_bf16 import (
                 is_available as is_ll_bf16_gemm_available,
-            )
-            from vllm.model_executor.kernels.linear.cute_dsl.ll_fp32w import (
-                is_available as is_ll_fp32w_gemm_available,
             )
 
             self.allow_ll_bf16_gemm = (
@@ -207,6 +214,11 @@ class GateLinear(ReplicatedLinear):
                 and self.weight.dtype == torch.bfloat16
                 and self.out_dtype == torch.float32
             )
+        if can_use_specialized_kernels:
+            from vllm.model_executor.kernels.linear.cute_dsl.ll_fp32w import (
+                is_available as is_ll_fp32w_gemm_available,
+            )
+
             self.allow_ll_fp32w_gemm = (
                 is_ll_fp32w_gemm_available()
                 and self.weight.dtype == torch.float32
@@ -272,12 +284,9 @@ class GateLinear(ReplicatedLinear):
             self._rocm_bf16x3_weight_eligible and out_dtype == torch.float32
         )
 
-        if self.allow_specialized_router_gemm:
+        if self._allow_ll_bf16_router_gemm:
             from vllm.model_executor.kernels.linear.cute_dsl.ll_bf16 import (
                 is_available as is_ll_bf16_gemm_available,
-            )
-            from vllm.model_executor.kernels.linear.cute_dsl.ll_fp32w import (
-                is_available as is_ll_fp32w_gemm_available,
             )
 
             self.allow_ll_bf16_gemm = (
@@ -285,6 +294,11 @@ class GateLinear(ReplicatedLinear):
                 and self.weight.dtype == torch.bfloat16
                 and out_dtype == torch.float32
             )
+        if self.allow_specialized_router_gemm:
+            from vllm.model_executor.kernels.linear.cute_dsl.ll_fp32w import (
+                is_available as is_ll_fp32w_gemm_available,
+            )
+
             self.allow_ll_fp32w_gemm = (
                 is_ll_fp32w_gemm_available()
                 and self.weight.dtype == torch.float32
