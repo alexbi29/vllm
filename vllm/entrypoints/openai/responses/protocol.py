@@ -553,15 +553,22 @@ class ResponsesRequest(OpenAIBaseModel):
         if isinstance(stop, str):
             stop = [stop]
 
-        extra_args: dict[str, Any] = self.vllm_xargs if self.vllm_xargs else {}
+        # Copy so popping known extension params below does not mutate the
+        # request's ``vllm_xargs`` in place.
+        extra_args: dict[str, Any] = dict(self.vllm_xargs) if self.vllm_xargs else {}
         if self.kv_transfer_params:
             extra_args["kv_transfer_params"] = self.kv_transfer_params
         if self.ec_transfer_params:
             extra_args["ec_transfer_params"] = self.ec_transfer_params
 
+        reasoning_temperature: float | None = extra_args.pop(
+            "reasoning_temperature", None
+        )
+
         return SamplingParams.from_optional(
             temperature=temperature,
             watermarking=self.watermarking,
+            reasoning_temperature=reasoning_temperature,
             top_p=top_p,
             top_k=top_k,
             min_p=min_p,
