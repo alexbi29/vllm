@@ -546,6 +546,22 @@ def test_gate_linear_m_gt_16_falls_back(monkeypatch):
     assert out.dtype == torch.float32
 
 
+def test_gate_linear_uses_ll_bf16_on_sm120(monkeypatch):
+    """SM120 gets the ll_bf16 tier but none of the SM90/SM100-only tiers."""
+    if torch.cuda.get_device_capability() != (12, 0):
+        pytest.skip("SM120 only")
+    gate = _make_gate_linear(monkeypatch, params_dtype=torch.bfloat16)
+    assert gate.allow_ll_bf16_gemm
+    assert not gate.allow_specialized_router_gemm
+    assert not gate.allow_ll_fp32w_gemm
+    torch.nn.init.normal_(gate.weight, std=0.02)
+    for m in (1, 3, 6, 16, 17):
+        x = torch.randn(m, 2048, dtype=torch.bfloat16, device="cuda")
+        out, _ = gate(x)
+        assert out.dtype == torch.float32
+        _assert_close(out, _ref(x, gate.weight), min_cos_sim=0.9999)
+
+
 def test_gate_linear_m_zero_falls_back(monkeypatch):
     gate = _make_gate_linear(monkeypatch, params_dtype=torch.bfloat16)
     x = torch.empty(0, 2048, dtype=torch.bfloat16, device="cuda")
