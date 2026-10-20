@@ -2,6 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for cuteDSL low-latency router GEMM (dot-product + split-K)."""
 
+import shutil
+import subprocess
+import sys
+import textwrap
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -164,6 +169,44 @@ def test_splitk_K_sweep(K):
     a = torch.randn(8, K, dtype=torch.bfloat16, device="cuda")
     b = torch.randn(64, K, dtype=torch.bfloat16, device="cuda")
     _assert_close(_gemm(a, b), _ref(a, b), context=f"splitk K={K}")
+
+
+def test_splitk_producer_consumer_barriers():
+    """Partial-block MMA barriers must not rendezvous with DMA exit barriers."""
+    sanitizer = shutil.which("compute-sanitizer")
+    if sanitizer is None:
+        pytest.skip("compute-sanitizer is required to check barrier participation")
+    assert sanitizer is not None
+    code = textwrap.dedent("""
+        import torch
+        from vllm.model_executor.kernels.linear.cute_dsl.ll_bf16 import ll_bf16_gemm
+
+        for rows, width, experts in ((5, 2048, 17), (16, 4096, 256)):
+            a = torch.ones((rows, width), device="cuda", dtype=torch.bfloat16)
+            b = torch.ones((experts, width), device="cuda", dtype=torch.bfloat16)
+            output = ll_bf16_gemm(a, b)
+            torch.accelerator.synchronize()
+            torch.testing.assert_close(
+                output, torch.full_like(output, width), rtol=0, atol=0
+            )
+    """)
+    result = subprocess.run(
+        [
+            sanitizer,
+            "--tool",
+            "synccheck",
+            "--error-exitcode",
+            "86",
+            sys.executable,
+            "-c",
+            code,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "ERROR SUMMARY: 0 errors" in result.stdout + result.stderr
 
 
 # =================================================================
@@ -501,6 +544,89 @@ def test_gate_linear_m_gt_16_falls_back(monkeypatch):
     out, _ = gate(x)
     assert out.shape == (17, 64)
     assert out.dtype == torch.float32
+
+
+def test_gate_linear_uses_ll_bf16_on_sm120(monkeypatch):
+    """SM120 gets the ll_bf16 tier but none of the SM90/SM100-only tiers."""
+    if torch.cuda.get_device_capability() != (12, 0):
+        pytest.skip("SM120 only")
+    gate = _make_gate_linear(monkeypatch, params_dtype=torch.bfloat16)
+    assert gate.allow_ll_bf16_gemm
+    assert not gate.allow_specialized_router_gemm
+    assert not gate.allow_ll_fp32w_gemm
+    torch.nn.init.normal_(gate.weight, std=0.02)
+    for m in (1, 3, 6, 16, 17):
+        x = torch.randn(m, 2048, dtype=torch.bfloat16, device="cuda")
+        out, _ = gate(x)
+        assert out.dtype == torch.float32
+        _assert_close(out, _ref(x, gate.weight), min_cos_sim=0.9999)
+
+
+def test_gate_linear_m_zero_falls_back(monkeypatch):
+    gate = _make_gate_linear(monkeypatch, params_dtype=torch.bfloat16)
+    x = torch.empty(0, 2048, dtype=torch.bfloat16, device="cuda")
+
+    def fail_ll_bf16_gemm(hidden_states, router_weight):
+        raise AssertionError("ll_bf16_gemm should not run for M == 0")
+
+    monkeypatch.setattr(
+        "vllm.model_executor.kernels.linear.cute_dsl.ll_bf16.ll_bf16_gemm",
+        fail_ll_bf16_gemm,
+    )
+    out, _ = gate(x)
+    assert out.shape == (0, 64)
+    assert out.dtype == torch.float32
+
+
+def test_gate_linear_torch_compile_dynamic_m_dispatch(monkeypatch):
+    """Ensure torch.compile tracing at M > 16 does not freeze the M <= 16
+    branch. Dropping guards via ``guard_filter_fn`` and running subsequent
+    M <= 16 calls under ``fail_on_recompile`` emulates vLLM's
+    ``TorchCompileWithNoGuardsWrapper`` (which drops all Dynamo guards and
+    never recompiles), so a frozen branch or recompile fails the test.
+    """
+    gate = _make_gate_linear(monkeypatch, params_dtype=torch.bfloat16)
+    torch.nn.init.normal_(gate.weight, std=0.02)
+    calls = []
+
+    def fake_ll_bf16_gemm(hidden_states, router_weight):
+        calls.append(hidden_states.shape[0])
+        return torch.mm(hidden_states, router_weight.T, out_dtype=torch.float32)
+
+    monkeypatch.setattr(
+        "vllm.model_executor.kernels.linear.cute_dsl.ll_bf16.ll_bf16_gemm",
+        fake_ll_bf16_gemm,
+    )
+
+    compiled_gate = torch.compile(
+        gate,
+        fullgraph=True,
+        dynamic=True,
+        options={"guard_filter_fn": lambda x: [False for _ in x]},
+    )
+
+    # Trace once at M=32 (> 16)
+    x_prefill = torch.randn(32, 2048, dtype=torch.bfloat16, device="cuda")
+    out_prefill, bias_prefill = compiled_gate(x_prefill)
+    assert bias_prefill is None
+    assert out_prefill.shape == (32, 64)
+    assert torch.equal(
+        out_prefill,
+        torch.mm(x_prefill, gate.weight.T, out_dtype=torch.float32),
+    )
+    assert calls == []
+
+    # Subsequent decode calls must reuse the compiled graph without recompiling
+    # and still dispatch to ll_bf16_gemm.
+    with torch.compiler.set_stance("fail_on_recompile"):
+        for m in (1, 4, 16):
+            x_decode = torch.randn(m, 2048, dtype=torch.bfloat16, device="cuda")
+            out_decode, bias_decode = compiled_gate(x_decode)
+            assert bias_decode is None
+            assert out_decode.shape == (m, 64)
+            _assert_close(out_decode, _ref(x_decode, gate.weight))
+
+    assert calls == [1, 4, 16]
 
 
 # =================================================================

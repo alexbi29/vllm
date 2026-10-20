@@ -22,7 +22,7 @@ logger = init_logger(__name__)
 class GateLinear(ReplicatedLinear):
     """MoE gate linear layer with multi-tier GEMM dispatch:
 
-    1. cuteDSL ll_bf16_gemm (SM90+, M<=16, bf16 in, fp32 out,
+    1. cuteDSL ll_bf16_gemm (SM90+ and SM120, M<=16, bf16 in, fp32 out,
        any shape w/ K divisible by 8)
     2. fp32 specialized kernel (bf16/fp32 in, fp32 out; SM90+
        model-specific shapes and batch limits, gfx950 any shape with M<=32)
@@ -111,6 +111,16 @@ class GateLinear(ReplicatedLinear):
         can_use_specialized_kernels &= self.is_unquantized
 
         self.allow_specialized_router_gemm = can_use_specialized_kernels
+        # SM120 has PDL and thread block clusters, so tier 1 runs there too;
+        # the other specialized tiers have no SM120 kernels. For 2-6 rows
+        # cuBLAS picks a few-CTA kernel that is up to 6x slower than tier 1.
+        self._allow_ll_bf16_router_gemm = can_use_specialized_kernels or (
+            current_platform.is_cuda()
+            and current_platform.is_device_capability((12, 0))
+            and self.is_unquantized
+            and not bias
+            and not batch_invariant
+        )
 
         # fp32 specialized kernel eligibility (exact dims, fp32 weight)
         self.allow_fp32_router_gemm = (
@@ -190,12 +200,9 @@ class GateLinear(ReplicatedLinear):
         # 2. Thread Block Clusters. Split-K kernel for cross-CTA reduction.
         self.allow_ll_bf16_gemm = False
         self.allow_ll_fp32w_gemm = False
-        if can_use_specialized_kernels:
+        if self._allow_ll_bf16_router_gemm:
             from vllm.model_executor.kernels.linear.cute_dsl.ll_bf16 import (
                 is_available as is_ll_bf16_gemm_available,
-            )
-            from vllm.model_executor.kernels.linear.cute_dsl.ll_fp32w import (
-                is_available as is_ll_fp32w_gemm_available,
             )
 
             self.allow_ll_bf16_gemm = (
@@ -203,6 +210,11 @@ class GateLinear(ReplicatedLinear):
                 and self.weight.dtype == torch.bfloat16
                 and self.out_dtype == torch.float32
             )
+        if can_use_specialized_kernels:
+            from vllm.model_executor.kernels.linear.cute_dsl.ll_fp32w import (
+                is_available as is_ll_fp32w_gemm_available,
+            )
+
             self.allow_ll_fp32w_gemm = (
                 is_ll_fp32w_gemm_available()
                 and self.weight.dtype == torch.float32
@@ -251,12 +263,9 @@ class GateLinear(ReplicatedLinear):
             self._rocm_bf16x3_weight_eligible and out_dtype == torch.float32
         )
 
-        if self.allow_specialized_router_gemm:
+        if self._allow_ll_bf16_router_gemm:
             from vllm.model_executor.kernels.linear.cute_dsl.ll_bf16 import (
                 is_available as is_ll_bf16_gemm_available,
-            )
-            from vllm.model_executor.kernels.linear.cute_dsl.ll_fp32w import (
-                is_available as is_ll_fp32w_gemm_available,
             )
 
             self.allow_ll_bf16_gemm = (
@@ -264,6 +273,11 @@ class GateLinear(ReplicatedLinear):
                 and self.weight.dtype == torch.bfloat16
                 and out_dtype == torch.float32
             )
+        if self.allow_specialized_router_gemm:
+            from vllm.model_executor.kernels.linear.cute_dsl.ll_fp32w import (
+                is_available as is_ll_fp32w_gemm_available,
+            )
+
             self.allow_ll_fp32w_gemm = (
                 is_ll_fp32w_gemm_available()
                 and self.weight.dtype == torch.float32
@@ -281,16 +295,12 @@ class GateLinear(ReplicatedLinear):
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
         # Tier 1: cuteDSL ll_bf16_gemm (SM90+, bf16 in, fp32 out,
         # any dims w/ K divisible by 8)
-        if (
-            self.allow_ll_bf16_gemm
-            and x.shape[0] <= self.LL_BF16_MAX_TOKENS
-            and x.dtype == torch.bfloat16
-        ):
-            from vllm.model_executor.kernels.linear.cute_dsl.ll_bf16 import (
-                ll_bf16_gemm,
+        # Dispatch is wrapped in a custom op so that torch.compile/CUDA-graph
+        # capture does not freeze the runtime num_tokens (m <= 16) branch.
+        if self.allow_ll_bf16_gemm and x.dtype == torch.bfloat16:
+            output = torch.ops.vllm.ll_bf16_router_gemm_dispatch(
+                x, self.weight, self.LL_BF16_MAX_TOKENS
             )
-
-            output = ll_bf16_gemm(x, self.weight)
             return self._return(output)
 
         # Tier 5: ROCm bf16x3 router GEMM. Checked before tier 2 because both
@@ -518,4 +528,46 @@ direct_register_custom_op(
     op_name="fp32_router_gemm_dispatch",
     op_func=fp32_router_gemm_dispatch_impl,
     fake_impl=fp32_router_gemm_dispatch_fake,
+)
+
+
+def ll_bf16_router_gemm_dispatch_impl(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    max_tokens: int,
+) -> torch.Tensor:
+    """Dynamically run cuteDSL ll_bf16_gemm if 0 < num_tokens <= max_tokens,
+    otherwise fall back to Tier 5 cuBLAS bf16->fp32 GEMM.
+
+    This must be a custom op because our torch.compile integration does not
+    support runtime dispatching on num_tokens: models calling the gate from
+    ``@support_torch_compile`` model code have all Dynamo guards dropped by
+    vLLM, so a plain Python branch on ``x.shape[0]`` would be frozen at first
+    trace (whichever size traces first).
+    """
+    m = x.shape[0]
+    # Guard m > 0: ll_bf16_gemm would otherwise JIT a dotprod kernel with M=0
+    # as a Constexpr.
+    if 0 < m <= max_tokens:
+        from vllm.model_executor.kernels.linear.cute_dsl.ll_bf16 import (
+            ll_bf16_gemm,
+        )
+
+        x = x.contiguous()
+        return ll_bf16_gemm(x, weight)
+    return torch.mm(x, weight.T, out_dtype=torch.float32)
+
+
+def ll_bf16_router_gemm_dispatch_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    max_tokens: int,
+) -> torch.Tensor:
+    return x.new_empty((x.shape[0], weight.shape[0]), dtype=torch.float32)
+
+
+direct_register_custom_op(
+    op_name="ll_bf16_router_gemm_dispatch",
+    op_func=ll_bf16_router_gemm_dispatch_impl,
+    fake_impl=ll_bf16_router_gemm_dispatch_fake,
 )

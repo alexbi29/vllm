@@ -17,6 +17,7 @@ from vllm.distributed.parallel_state import get_pp_group
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.model_loader.utils import get_draft_load_config
+from vllm.v1.attention.backends.gemma4_compact import share_compact_kv_with_draft
 from vllm.v1.worker.gpu.spec_decode.target_dependent_ar.speculator import (
     TargetDependentARSpeculator,
 )
@@ -66,6 +67,23 @@ class Gemma4Speculator(TargetDependentARSpeculator):
             )
         self._setup_gemma4_kv_sharing(draft_model, target_attn_layer_names)
         self._share_embeddings(draft_model, target_model)
+        quantization = self.speculative_config.draft_lm_head_quantization
+        if quantization is not None:
+            if getattr(draft_model, "masked_embedding", None) is not None:
+                raise ValueError(
+                    "draft_lm_head_quantization does not support Gemma4 MTP "
+                    "drafters with centroid-masked embeddings"
+                )
+            from vllm.model_executor.layers.quantization.online.lm_head import (
+                quantized_lm_head_copy,
+            )
+
+            # The assistant drafts with its own draft-dim head (tied to its
+            # embedding), not the target's; quantize a copy of that head and
+            # keep the BF16 weight for the embedding lookup.
+            draft_model.lm_head = quantized_lm_head_copy(
+                draft_model.lm_head, quantization
+            )
         return draft_model
 
     def _create_draft_vllm_config(self) -> VllmConfig:
@@ -163,6 +181,8 @@ class Gemma4Speculator(TargetDependentARSpeculator):
             ]
             _copy_target_kv_scales(attn, target_attn)
 
+            if getattr(target_config, "gemma4_compact_kv", False):
+                share_compact_kv_with_draft(attn, target_attn, target_layer_name)
             logger.info(
                 "Gemma4 MTP: draft layer %d (%s) -> %s",
                 draft_idx,

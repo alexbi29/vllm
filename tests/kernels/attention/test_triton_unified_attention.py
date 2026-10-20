@@ -383,6 +383,221 @@ def test_clamped_mm_prefix_preserves_noncausal_right_window(
     assert bounds.tolist() == [3, 68, 4096]
 
 
+@pytest.mark.skipif(
+    not current_platform.is_cuda() or not current_platform.is_device_capability(120),
+    reason="Compact FP8 prefill tuning requires SM120",
+)
+@pytest.mark.parametrize(
+    "qlen,context,layout",
+    [
+        (1024, 8192, "HND"),
+        (8192, 8192, "HND"),
+        (1024, 65536, "HND"),
+        (8192, 65536, "HND"),
+        (1024, 131072, "HND"),
+        (1024, 8192, "NHD"),
+    ],
+)
+def test_gemma4_compact_fp8_prefill_warps_preserve_math(
+    monkeypatch, qlen, context, layout
+):
+    """The tuned launch matches the actual four-warp reader, without staging."""
+    from vllm.v1.attention.ops import triton_unified_attention as attention
+
+    set_random_seed(42)
+    page = 512
+    cache = torch.randn(context // page, page, 2, 640, device=DEVICE_TYPE).to(
+        torch.float8_e4m3fn
+    )
+    if layout == "HND":
+        cache = cache.transpose(1, 2).contiguous().transpose(1, 2)
+    k, v = cache.split([128, 512], dim=-1)
+    q = torch.randn(qlen, 16, 512, device=DEVICE_TYPE, dtype=torch.bfloat16)
+    args = dict(
+        q=q,
+        k=k,
+        v=v,
+        out=torch.empty_like(q),
+        cu_seqlens_q=torch.tensor([0, qlen], device=DEVICE_TYPE, dtype=torch.int32),
+        max_seqlen_q=qlen,
+        seqused_k=torch.tensor([context], device=DEVICE_TYPE, dtype=torch.int32),
+        max_seqlen_k=context,
+        softmax_scale=512**-0.5,
+        causal=True,
+        window_size=(-1, -1),
+        block_table=torch.arange(
+            context // page, device=DEVICE_TYPE, dtype=torch.int32
+        ).unsqueeze(0),
+        softcap=0.0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        compact_k_norm=torch.randn(512, device=DEVICE_TYPE, dtype=torch.bfloat16),
+        compact_fp8_storage=True,
+    )
+    kernel = attention.kernel_unified_attention
+    observed = []
+    force_four = False
+
+    class Launch:
+        def __getitem__(self, grid):
+            def run(**kwargs):
+                observed.append(kwargs.get("num_warps"))
+                if force_four:
+                    kwargs["num_warps"] = 4
+                return kernel[grid](**kwargs)
+
+            return run
+
+    monkeypatch.setattr(attention, "kernel_unified_attention", Launch())
+    unified_attention(**args)
+    tuned = args["out"].clone()
+    assert observed == [8]
+    force_four = True
+    unified_attention(**args)
+    torch.testing.assert_close(tuned, args["out"], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("query_len,segments", [(1, 1), (1, 4), (3, 4), (4, 4), (5, 4)])
+@pytest.mark.parametrize("kv_heads", [1, 2])
+@pytest.mark.parametrize("layout", ["HND", "NHD"])
+@pytest.mark.parametrize("block_size", [16, 256, 512])
+@pytest.mark.parametrize("scratch_rows", [1, 4, 8])
+@pytest.mark.parametrize("fp8_storage", [False, True])
+def test_gemma4_compact_kv(
+    query_len,
+    segments,
+    kv_heads,
+    layout,
+    block_size,
+    scratch_rows,
+    fp8_storage,
+    monkeypatch,
+):
+    """Compact paged attention agrees with explicit BF16 K reconstruction.
+
+    TRITON_INTERPRET=1 runs the same kernels on CPU without a GPU allocation.
+    Covers TP1/TP2 head counts, page indirection, a partial page, masked
+    cache writes, chunked prefill and segmented decode.
+    """
+    import os
+
+    from vllm.v1.attention.ops.gemma4_compact_cache import write_compact_cache
+
+    device = "cpu" if os.environ.get("TRITON_INTERPRET") == "1" else DEVICE_TYPE
+    if fp8_storage and (
+        device == "cpu"
+        or not current_platform.is_cuda()
+        or not current_platform.is_device_capability_family(120)
+    ):
+        pytest.skip("Compact FP8 storage is currently SM120-only")
+    if device == "cpu":
+        # Triton 3.7.1's interpreter feeds BF16 uint16 storage directly to
+        # numpy.matmul. Decode BF16 operands for the CPU-only test runner.
+        import numpy as np
+        from triton.runtime.interpreter import TensorHandle, interpreter_builder
+
+        from vllm.triton_utils import tl
+
+        original_dot = interpreter_builder.create_dot
+        original_cast = interpreter_builder.cast_impl
+
+        def bf16_cast(src, dst):
+            if src.dtype.scalar == tl.float32 and dst.scalar == tl.bfloat16:
+                # Its default FP32->BF16 cast also truncates instead of RNE.
+                data = torch.from_numpy(src.data).to(torch.bfloat16)
+                return TensorHandle(data.view(torch.uint16).numpy(), tl.bfloat16)
+            return original_cast(src, dst)
+
+        def bf16_dot(a, b, d, precision, max_imprecise):
+            def decode(x):
+                if x.dtype == tl.bfloat16:
+                    data = (x.data.astype(np.uint32) << 16).view(np.float32)
+                    return TensorHandle(data, tl.float32)
+                return x
+
+            return original_dot(decode(a), decode(b), d, precision, max_imprecise)
+
+        monkeypatch.setattr(interpreter_builder, "create_dot", bf16_dot)
+        monkeypatch.setattr(interpreter_builder, "cast_impl", bf16_cast)
+    torch.manual_seed(17)
+    dtype = torch.bfloat16
+    heads, length = kv_heads * 8, 37
+    key = torch.randn(length + 1, kv_heads, 512, dtype=dtype, device=device)
+    value = torch.randn_like(key)
+    norm = torch.randn(512, dtype=dtype, device=device)
+    query = torch.randn(query_len, heads, 512, dtype=dtype, device=device) * 0.1
+    cache = torch.full((4, kv_heads, block_size, 640), -7, dtype=dtype, device=device)
+    if fp8_storage:
+        cache = cache.to(torch.float8_e4m3fn)
+    if layout == "NHD":
+        cache = cache.transpose(1, 2).contiguous().transpose(1, 2)
+    block_table = torch.tensor([[2, 0, 3, 1]], dtype=torch.int32, device=device)
+    positions = torch.arange(length, device=device)
+    slots = (
+        block_table[0, positions // block_size] * block_size + positions % block_size
+    )
+    slots = torch.cat((slots, torch.tensor([-1], device=device))).long()
+    write_compact_cache(key, value, cache, slots, fp8_storage=fp8_storage)
+    if fp8_storage:
+        key = key.clamp(-448, 448).to(torch.float8_e4m3fn).to(dtype)
+        value = value.clamp(-448, 448).to(torch.float8_e4m3fn).to(dtype)
+    # Padding writes must not touch an unused page.
+    torch.testing.assert_close(cache[1].float(), torch.full_like(cache[1].float(), -7))
+    storage = cache.view(torch.uint8) if fp8_storage else cache
+    packed = storage[block_table[0, :3].long()].view(cache.dtype)
+    packed = packed.transpose(1, 2).reshape(-1, kv_heads, 640).to(dtype)
+    packed = packed[:length]
+    torch.testing.assert_close(packed[..., :64], key[:length, ..., :64])
+    torch.testing.assert_close(packed[..., 64:128], key[:length, ..., 256:320])
+    torch.testing.assert_close(packed[..., 128:], value[:length])
+
+    reconstructed = (value[:length].float() * norm.float()).to(dtype)
+    reconstructed[..., :64] = key[:length, ..., :64]
+    reconstructed[..., 256:320] = key[:length, ..., 256:320]
+    dense_k = reconstructed.repeat_interleave(8, dim=1).float()
+    dense_v = value[:length].repeat_interleave(8, dim=1).float()
+    logits = torch.einsum("qhd,khd->hqk", query.float(), dense_k)
+    mask = (
+        positions[None, :]
+        > (length - query_len + torch.arange(query_len, device=device))[:, None]
+    )
+    logits.masked_fill_(mask, -float("inf"))
+    expected = torch.einsum(
+        "hqk,khd->qhd", logits.softmax(-1).to(dtype).float(), dense_v
+    ).to(dtype)
+    output = torch.empty_like(query)
+    k, v = cache.transpose(1, 2).split([128, 512], dim=-1)
+    unified_attention(
+        q=query,
+        k=k,
+        v=v,
+        out=output,
+        cu_seqlens_q=torch.tensor([0, query_len], dtype=torch.int32, device=device),
+        max_seqlen_q=query_len,
+        seqused_k=torch.tensor([length], dtype=torch.int32, device=device),
+        max_seqlen_k=length,
+        softmax_scale=1.0,
+        causal=True,
+        window_size=(-1, -1),
+        block_table=block_table,
+        softcap=0.0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        seq_threshold_3D=8 if segments > 1 else None,
+        num_par_softmax_segments=segments,
+        softmax_segm_output=torch.empty(
+            (scratch_rows, heads, segments, 512), device=device
+        ),
+        softmax_segm_max=torch.empty((scratch_rows, heads, segments), device=device),
+        softmax_segm_expsum=torch.empty((scratch_rows, heads, segments), device=device),
+        compact_k_norm=norm,
+        compact_fp8_storage=fp8_storage,
+    )
+    torch.testing.assert_close(output, expected, atol=0.016, rtol=0.02)
+
+
 def ref_paged_attn(
     query: torch.Tensor,
     key_cache: torch.Tensor,
@@ -503,7 +718,7 @@ def ref_paged_clamped_mm_attn(
 ) -> torch.Tensor:
     block_tables_cpu = block_tables.cpu().numpy()
     _, block_size, num_kv_heads, head_size = key_cache.shape
-    chunk_size = sliding_window // (chunk_lookback + 1)
+    chunk_size = sliding_window // (chunk_lookback + 1) if chunk_lookback >= 0 else None
 
     outputs: list[torch.Tensor] = []
     query_start = 0
@@ -523,10 +738,13 @@ def ref_paged_clamped_mm_attn(
             value_i = torch.repeat_interleave(value_i, repeats, dim=1)
 
         delta = query_pos[:, None] - key_pos[None, :]
-        keep = (delta >= 0) & (
-            query_pos[:, None] // chunk_size - key_pos[None, :] // chunk_size
-            <= chunk_lookback
-        )
+        if chunk_size is None:
+            keep = (delta >= 0) & (delta < sliding_window)
+        else:
+            keep = (delta >= 0) & (
+                query_pos[:, None] // chunk_size - key_pos[None, :] // chunk_size
+                <= chunk_lookback
+            )
         for range_start, range_end in mm_ranges[req_idx]:
             q_in_range = (query_pos >= range_start) & (query_pos <= range_end)
             k_in_range = (key_pos >= range_start) & (key_pos <= range_end)
@@ -543,17 +761,20 @@ def ref_paged_clamped_mm_attn(
 
 
 @torch.inference_mode()
-def test_triton_unified_attn_clamped_mm_matches_dense_reference() -> None:
+@pytest.mark.parametrize("gemma4_sliding", [False, True])
+def test_triton_unified_attn_clamped_mm_matches_dense_reference(
+    gemma4_sliding: bool,
+) -> None:
     set_random_seed(0)
-    query_lens = [384, 96]
-    kv_lens_list = [384, 320]
-    mm_ranges = [[(32, 351)], [(160, 287)]]
-    sliding_window = 128
-    chunk_lookback = 0
-    block_size = 16
-    num_query_heads = 4
-    num_kv_heads = 2
-    head_size = 128
+    query_lens = [1024 if gemma4_sliding else 384, 96]
+    kv_lens_list = [query_lens[0], 320]
+    mm_ranges = [[(32, query_lens[0] - 33)], [(160, 287)]]
+    sliding_window = 1024 if gemma4_sliding else 128
+    chunk_lookback = -1 if gemma4_sliding else 0
+    block_size = 80 if gemma4_sliding else 16
+    num_query_heads = 16 if gemma4_sliding else 4
+    num_kv_heads = 8 if gemma4_sliding else 2
+    head_size = 256 if gemma4_sliding else 128
     scale = head_size**-0.5
 
     query = torch.randn(
@@ -597,12 +818,10 @@ def test_triton_unified_attn_clamped_mm_matches_dense_reference() -> None:
         [0] + query_lens, dtype=torch.int32, device=DEVICE_TYPE
     ).cumsum(0, dtype=torch.int32)
     kv_lens = torch.tensor(kv_lens_list, dtype=torch.int32, device=DEVICE_TYPE)
-    mm_prefix_range = torch.tensor(
-        [[[32, 351]], [[160, 287]]], dtype=torch.int32, device=DEVICE_TYPE
-    )
+    mm_prefix_range = torch.tensor(mm_ranges, dtype=torch.int32, device=DEVICE_TYPE)
     actual = torch.empty_like(query)
 
-    unified_attention(
+    attention_args = dict(
         q=query,
         k=key_cache,
         v=value_cache,
@@ -623,6 +842,7 @@ def test_triton_unified_attn_clamped_mm_matches_dense_reference() -> None:
         chunk_lookback=chunk_lookback,
         mm_prefix_clamp_sliding_window=True,
     )
+    unified_attention(**attention_args)
 
     expected = ref_paged_clamped_mm_attn(
         query,
@@ -651,6 +871,13 @@ def test_triton_unified_attn_clamped_mm_matches_dense_reference() -> None:
 
     torch.testing.assert_close(actual.float(), expected.float(), atol=2e-2, rtol=2e-2)
     assert not torch.allclose(expected, chunk_only, atol=2e-2, rtol=2e-2)
+    if gemma4_sliding:
+        # Ordinary text can take the native path; image ranges must retain
+        # their bidirectional semantics through the existing Triton fallback.
+        unified_attention(**{**attention_args, "mm_prefix_range": None})
+        torch.testing.assert_close(
+            actual.float(), chunk_only.float(), atol=2e-2, rtol=2e-2
+        )
 
 
 @pytest.mark.parametrize(

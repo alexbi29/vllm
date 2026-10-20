@@ -56,6 +56,18 @@ def test_ray_bundle_indices_is_not_compile_factor(monkeypatch: pytest.MonkeyPatc
     assert "VLLM_RAY_BUNDLE_INDICES" not in envs.compile_factors()
 
 
+def test_gemma4_dense_cudnn_is_opt_in_and_changes_compile_hash(monkeypatch):
+    from vllm.config.utils import hash_factors
+
+    monkeypatch.delenv("VLLM_GEMMA4_DENSE_CUDNN", raising=False)
+    disabled = envs.compile_factors()
+    assert disabled["VLLM_GEMMA4_DENSE_CUDNN"] is False
+    monkeypatch.setenv("VLLM_GEMMA4_DENSE_CUDNN", "1")
+    enabled = envs.compile_factors()
+    assert enabled["VLLM_GEMMA4_DENSE_CUDNN"] is True
+    assert hash_factors(disabled) != hash_factors(enabled)
+
+
 def test_p2p_side_channel_defaults_and_override(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("VLLM_P2P_SIDE_CHANNEL_HOST", raising=False)
     monkeypatch.delenv("VLLM_P2P_SIDE_CHANNEL_PORT", raising=False)

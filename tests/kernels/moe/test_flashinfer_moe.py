@@ -245,6 +245,59 @@ def test_flashinfer_fp4_moe_no_graph(
             torch_output, flashinfer_output, atol=1e-1, rtol=1e-1
         )
 
+        if (
+            activation == MoEActivation.GELU_TANH
+            and current_platform.is_device_capability_family(120)
+        ):
+            from flashinfer import autotune
+
+            def run():
+                return flashinfer_experts.apply(
+                    hidden_states=a,
+                    w1=w1_q,
+                    w2=w2_q,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    activation=activation,
+                    global_num_experts=e,
+                    expert_map=None,
+                    apply_router_weight_on_input=False,
+                )
+
+            with autotune(tune_mode=True):
+                run()
+            expected = run().clone()
+            for _ in range(8):
+                torch.testing.assert_close(run(), expected, rtol=0, atol=0)
+
 
 if __name__ == "__main__":
     test_flashinfer_fp4_moe_no_graph((2, 1024, 1024), 40, 1, torch.half)
+
+
+def test_flashinfer_nvfp4_geglu_tanh_reference(workspace_init):
+    """Exercise Gemma's activation through the real quantized expert path."""
+    test_flashinfer_fp4_moe_no_graph(
+        m=3,
+        n=704,
+        k=2816,
+        e=128,
+        topk=8,
+        dtype=torch.bfloat16,
+        activation=MoEActivation.GELU_TANH,
+        workspace_init=workspace_init,
+    )
+
+
+def test_flashinfer_nvfp4_geglu_tanh_prefill_repeatability(workspace_init):
+    """Check prefill math and SM120's tuned ordered reduction."""
+    test_flashinfer_fp4_moe_no_graph(
+        m=29,
+        n=704,
+        k=2816,
+        e=128,
+        topk=8,
+        dtype=torch.bfloat16,
+        activation=MoEActivation.GELU_TANH,
+        workspace_init=workspace_init,
+    )
