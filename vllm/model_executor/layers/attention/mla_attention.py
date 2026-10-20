@@ -1385,6 +1385,16 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 self.kv_cache_dtype
             ),
         )
+        if getattr(vllm_config.kernel_config, "glm53_compact_kv", False):
+            if (
+                self.attn_backend.get_name() != "FLASHINFER_MLA_SPARSE_SM120"
+                or self.kv_cache_dtype != "fp8_ds_mla"
+                or self.head_size != 512
+                or self.qk_rope_head_dim != 0
+                or self.kv_lora_rank != 512
+            ):
+                raise ValueError("Compact GLM KV requires SM120 no-RoPE FP8 MLA")
+            common_kwargs["state_content_bytes"] = 528
         if self.sliding_window is not None:
             return SlidingWindowMLASpec(
                 **common_kwargs,

@@ -1,0 +1,160 @@
+--- a/data/include/flashinfer/attention/sparse_mla_sm120/model/model_type.h
++++ b/data/include/flashinfer/attention/sparse_mla_sm120/model/model_type.h
+@@ -35,7 +35,7 @@
+ //   DSV4:    d_nope=448, UE8M0 scale footer, 584B/token
+ //   GLM_NSA: d_nope=512, d_rope=64, arbitrary FP32 scale inline, 656B/token
+ //   GLM53_NOPE: d_nope=512, d_rope=0, arbitrary FP32 scale inline,
+-//               656B/token (the final 128 bytes are reserved cache padding)
++//               528B/token (no reserved RoPE padding in this private build)
+ //   DOTS3_SWA: d_nope=1024, d_rope=64, UE8M0 scale footer, 1160B/token
+ //
+ // DOTS3_SWA is the sliding-window family: its candidate list is a 513-token
+@@ -49,8 +49,9 @@
+   switch (mt) {
+     case ModelType::DSV3_2:
+     case ModelType::GLM_NSA:
++      return 656;
+     case ModelType::GLM53_NOPE:
+-      return 656;
++      return 528;
+     case ModelType::DSV4:
+       return 584;
+     case ModelType::DOTS3_SWA:
+--- a/data/include/flashinfer/attention/sparse_mla_sm120/model/kv_cache_traits.cuh
++++ b/data/include/flashinfer/attention/sparse_mla_sm120/model/kv_cache_traits.cuh
+@@ -107,13 +107,11 @@
+   static constexpr int NUM_SCALES = D_NOPE / QUANT_TILE;
+   static constexpr ScaleFormat SCALE_FORMAT = ScaleFormat::ARBITRARY_FP32;
+ 
+-  // vLLM's fp8_ds_mla cache ABI remains 656 bytes/token. The first 528
+-  // bytes contain the 512 FP8 latent values plus four inline FP32 scales;
+-  // the trailing 128 bytes are reserved padding and must never be treated as
+-  // RoPE data by this specialization.
++  // Private compact ABI: retain all 512 FP8 latent values and four inline
++  // FP32 scales, and omit the unused 128-byte positional-key tail.
+   static constexpr bool SCALE_INLINE = true;
+   static constexpr int SCALE_BYTES_PER_TOKEN = NUM_SCALES * sizeof(float);
+-  static constexpr int KV_GMEM_STRIDE = 656;
++  static constexpr int KV_GMEM_STRIDE = 528;
+   static constexpr int KV_SCALE_GMEM_OFFSET = D_NOPE;
+   static constexpr int KV_ROPE_GMEM_OFFSET = D_NOPE + SCALE_BYTES_PER_TOKEN;
+   static constexpr int KV_SMEM_STRIDE = D_NOPE + SCALE_BYTES_PER_TOKEN;
+--- a/mla/_sparse_mla_sm120_plan.py
++++ b/mla/_sparse_mla_sm120_plan.py
+@@ -70,13 +70,14 @@
+ _MODEL_TYPE_GLM_NSA = 2
+ _MODEL_TYPE_GLM53_NOPE = 3
+ _MODEL_TYPE_DOTS3_SWA = 4
+-# The V32 kernel family: the 656B/token inline-scale cache ABI. GLM53_NOPE is
+-# the rope-free member (d_qk=512; bytes [528:656) are reserved padding).
++# The V32 kernel family uses inline FP32 scales. The private GLM53_NOPE
++# member has d_qk=512 and a compact 528-byte row without positional padding.
+ # swapAB is instantiated for all V32 model types.
+ _V32_MODEL_TYPES = frozenset(
+     {_MODEL_TYPE_DSV3_2, _MODEL_TYPE_GLM_NSA, _MODEL_TYPE_GLM53_NOPE}
+ )
+ _BPT_DSV3_2 = 656
++_BPT_GLM53_NOPE = 528
+ _BPT_DSV4 = 584
+ _BPT_DOTS3_SWA = 1160
+ 
+--- a/mla/_sparse_mla_sm120.py
++++ b/mla/_sparse_mla_sm120.py
+@@ -93,6 +93,7 @@
+ from ._sparse_mla_sm120_plan import (
+     _BI,
+     _BPT_DSV3_2,
++    _BPT_GLM53_NOPE,
+     _BPT_DSV4,
+     _BPT_DOTS3_SWA,
+     _DECODE_DSV3_2_DISPATCH,  # noqa: F401  (vLLM probe surface)
+@@ -335,7 +336,7 @@
+             topks=frozenset({_DECODE_GLM53_NOPE_TOPK}),
+             min_topk=1,
+             max_num_heads=_DECODE_MAX_HEADS,
+-            bytes_per_token=_BPT_DSV3_2,
++            bytes_per_token=_BPT_GLM53_NOPE,
+         ),
+         "dots3_swa": SparseMLASm120DecodeConfig(
+             d_qk=1088,
+@@ -503,7 +504,9 @@
+ 
+ 
+ def _bytes_per_token_for_model_type(model_type: int) -> int:
+-    if model_type in (_MODEL_TYPE_DSV3_2, _MODEL_TYPE_GLM_NSA, _MODEL_TYPE_GLM53_NOPE):
++    if model_type == _MODEL_TYPE_GLM53_NOPE:
++        return _BPT_GLM53_NOPE
++    if model_type in (_MODEL_TYPE_DSV3_2, _MODEL_TYPE_GLM_NSA):
+         return _BPT_DSV3_2
+     if model_type == _MODEL_TYPE_DSV4:
+         return _BPT_DSV4
+--- a/mla/_sparse_mla_sm120_cpb.py
++++ b/mla/_sparse_mla_sm120_cpb.py
+@@ -86,7 +86,7 @@
+ _SCHEMA_VERSION = 1
+ # Only current-schema files load; any other version counts as absent and the
+ # families recalibrate on the next tuning-mode pass.
+-_BYTES_PER_TOKEN = {"dsv4": 584, "dsv3_2": 656, "glm53_nope": 656, "dots3_swa": 1160}
++_BYTES_PER_TOKEN = {"dsv4": 584, "dsv3_2": 656, "glm53_nope": 528, "dots3_swa": 1160}
+ _D_QK = {"dsv4": 512, "dsv3_2": 576, "glm53_nope": 512, "dots3_swa": 1088}
+ _D_V = {"dsv4": 512, "dsv3_2": 512, "glm53_nope": 512, "dots3_swa": 1024}
+ # Kernel candidate-tile width per family: DOTS3_SWA decodes at BI=32 (its
+--- a/mla/_core.py
++++ b/mla/_core.py
+@@ -689,25 +689,27 @@
+     return out
+ 
+ 
+-def _check_sm120_sparse_v32_kv_cache(kv_cache: torch.Tensor) -> torch.Tensor:
++def _check_sm120_sparse_v32_kv_cache(
++    kv_cache: torch.Tensor, *, bytes_per_token: int = 656
++) -> torch.Tensor:
+     if kv_cache.dtype != torch.uint8:
+         raise ValueError(
+             "SM120 sparse MLA v32/GLM backend expects packed uint8 kv_cache, "
+             f"got {kv_cache.dtype}"
+         )
+     if kv_cache.ndim == 3:
+-        if kv_cache.size(-1) != 656:
+-            raise ValueError(
+-                "SM120 sparse MLA v32/GLM expects packed kv_cache last dim 656, "
++        if kv_cache.size(-1) != bytes_per_token:
++            raise ValueError(
++                f"SM120 sparse MLA v32/GLM expects packed kv_cache last dim {bytes_per_token}, "
+                 f"got {tuple(kv_cache.shape)}"
+             )
+         return kv_cache
+     if kv_cache.ndim == 4:
+-        if kv_cache.size(1) != 1 or kv_cache.size(-1) != 656:
++        if kv_cache.size(1) != 1 or kv_cache.size(-1) != bytes_per_token:
+             raise ValueError(
+                 "SM120 sparse MLA v32/GLM expects public HND kv_cache shape "
+-                "[num_pages, 1, page_size, 656] or 3D shorthand "
+-                f"[num_pages, page_size, 656], got {tuple(kv_cache.shape)}"
++                f"[num_pages, 1, page_size, {bytes_per_token}] or 3D shorthand "
++                f"[num_pages, page_size, {bytes_per_token}], got {tuple(kv_cache.shape)}"
+             )
+         return kv_cache
+     raise ValueError(f"Expected kv_cache.ndim == 3 or 4, got {kv_cache.ndim}")
+@@ -824,7 +826,9 @@
+             f"{expected_block_tables_shape}, got {tuple(block_tables.shape)}"
+         )
+ 
+-    kv_cache = _check_sm120_sparse_v32_kv_cache(kv_cache)
++    kv_cache = _check_sm120_sparse_v32_kv_cache(
++        kv_cache, bytes_per_token=528 if glm53_nope else 656
++    )
+     topk_length = _normalize_sm120_sparse_v32_topk_length(
+         seq_lens,
+         batch_size=batch_size,
+--- a/jit/mla.py
++++ b/jit/mla.py
+@@ -43,7 +43,7 @@
+         supported_major_versions=[12]
+     )
+     return gen_jit_spec(
+-        "sparse_mla_sm120",
++        "sparse_mla_sm120_glm53_compact",
+         [
+             jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120.cu",
+             jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120_decode_dsv3_2.cu",

@@ -22,6 +22,139 @@ from vllm.v1.attention.ops.common import pack_ue8m0_x4
 INDEX_HEAD_DIM = 128
 
 
+@triton.jit
+def _canonicalize_pool_indices_kernel(
+    indices, stride_row, stride_col, width: tl.constexpr, BLOCK: tl.constexpr
+):
+    row = tl.program_id(0)
+    col = tl.arange(0, BLOCK)
+    values = tl.load(
+        indices + row * stride_row + col * stride_col, col < width, other=-1
+    )
+    # Top-k emits the selected set in atomic arrival order. Keep valid pools
+    # in logical order so attention uses a repeatable floating-point reduction.
+    values = tl.where(values >= 0, values, 0x7FFFFFFF)
+    values = tl.sort(values, descending=False)
+    values = tl.where(values == 0x7FFFFFFF, -1, values)
+    tl.store(indices + row * stride_row + col * stride_col, values, col < width)
+
+
+def canonicalize_pool_indices_(indices: torch.Tensor) -> None:
+    """Order the selected pools in place, retaining every index and -1 pad."""
+    rows, width = indices.shape
+    if rows and width:
+        _canonicalize_pool_indices_kernel[(rows,)](
+            indices,
+            indices.stride(0),
+            indices.stride(1),
+            width,
+            triton.next_power_of_2(width),
+        )
+
+
+@triton.jit
+def _exact_pool_cutoff(values, valid, count):
+    bits = values.to(tl.uint32, bitcast=True)
+    keys = tl.where((bits & 0x80000000) != 0, ~bits, bits ^ 0x80000000)
+    candidate = valid
+    prefix = tl.full((), 0, tl.uint32)
+    remaining = count
+    bin_ids = tl.arange(0, 256)
+    for step in tl.static_range(4):
+        shift = 24 - step * 8
+        bins = ((keys >> shift) & 255).to(tl.int32)
+        histogram = tl.histogram(bins, 256, mask=candidate)
+        inclusive = tl.cumsum(histogram, reverse=True)
+        above = inclusive - histogram
+        selected_bin = tl.max(
+            tl.where((above < remaining) & (inclusive >= remaining), bin_ids, 0), 0
+        )
+        remaining -= tl.sum(tl.where(bin_ids > selected_bin, histogram, 0), 0)
+        candidate = candidate & (bins == selected_bin)
+        prefix = prefix | (selected_bin.to(tl.uint32) << shift)
+    bits = tl.where((prefix & 0x80000000) != 0, prefix ^ 0x80000000, ~prefix)
+    return bits.to(tl.float32, bitcast=True)
+
+
+@triton.jit(do_not_specialize=["N"])
+def _stabilize_pool_topk_kernel(
+    logits,
+    indices,
+    starts,
+    ends,
+    logits_s0,
+    logits_s1,
+    indices_s0,
+    indices_s1,
+    N,
+    K: tl.constexpr,
+    HAS_START: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    row = tl.program_id(0)
+    start = tl.load(starts + row) if HAS_START else 0
+    end = tl.load(ends + row)
+    k = tl.arange(0, BLOCK_K)
+    selected = tl.load(indices + row * indices_s0 + k * indices_s1, k < K, -1)
+    valid = (k < K) & (selected >= 0) & (selected < end - start)
+    scores = tl.load(
+        logits + row * logits_s0 + (start + selected) * logits_s1, valid, float("inf")
+    )
+    cutoff = tl.min(scores, 0)
+    col = tl.arange(0, BLOCK_N)
+    valid_col = (col < N) & (col >= start) & (col < end)
+    values = tl.load(
+        logits + row * logits_s0 + col * logits_s1, valid_col, -float("inf")
+    )
+    above = valid_col & (values > cutoff)
+    tied = valid_col & (values == cutoff)
+    count = tl.minimum(end - start, K)
+    n_above = tl.sum(above.to(tl.int32), 0)
+    n_tied = tl.sum(tied.to(tl.int32), 0)
+    # The native long-row selector can overflow its intermediate bucket and
+    # supply a cutoff below the true kth score. Repair that row exactly.
+    if (n_above > count) | (n_above + n_tied < count):
+        cutoff = _exact_pool_cutoff(values, valid_col, count)
+        above = valid_col & (values > cutoff)
+        tied = valid_col & (values == cutoff)
+        n_above = tl.sum(above.to(tl.int32), 0)
+    needed = count - n_above
+    keep = above | (tied & (tl.cumsum(tied.to(tl.int32)) <= needed))
+    dst = tl.cumsum(keep.to(tl.int32)) - 1
+    tl.store(
+        indices + row * indices_s0 + dst * indices_s1, col - start, keep & (dst < K)
+    )
+    tl.store(
+        indices + row * indices_s0 + k * indices_s1,
+        -1,
+        (k < K) & (k >= tl.minimum(end - start, K)),
+    )
+
+
+def stabilize_pool_topk_(logits, indices, row_ends, row_starts=None):
+    """Repair invalid top-k cutoffs and choose cutoff ties by ascending ID."""
+    rows, width = indices.shape
+    if not rows or not width:
+        return
+    _stabilize_pool_topk_kernel[(rows,)](
+        logits,
+        indices,
+        row_starts if row_starts is not None else row_ends,
+        row_ends,
+        logits.stride(0),
+        logits.stride(1),
+        indices.stride(0),
+        indices.stride(1),
+        logits.shape[1],
+        width,
+        row_starts is not None,
+        triton.next_power_of_2(logits.shape[1]),
+        triton.next_power_of_2(width),
+        num_warps=8,
+    )
+
+
 # Hadamard-128 rotation
 
 
@@ -898,6 +1031,10 @@ def _expand_pools_and_append_tail_kernel(
     tail_out = tl.where(is_tail, tail_val, -1)
 
     result = tl.where(is_history, hist_out, tail_out)
+    # Capture takes the pooled path even when eager would select all tokens.
+    # Match eager's contiguous causal layout, including its reduction order.
+    causal = tl.where(cols < seq_len, cols, -1).to(tl.int32)
+    result = tl.where(seq_len <= topk, causal, result)
     tl.store(out_ptr + row * out_s0 + cols, result, mask=mask)
 
 
@@ -908,9 +1045,9 @@ def expand_pools_and_append_tail(
 ) -> torch.Tensor:
     """Fuse ``expand_pools_to_tokens`` + ``append_tail_to_topk`` (identity path).
 
-    Produces the same ``[rows, topk + pool_size - 1]`` int32 output as calling
-    the two functions in sequence when neither ``page_table`` nor
-    ``topk_offsets`` is passed — the only path used by the GLM-5.3-Flash indexer.
+    Short rows use contiguous causal indices to match the eager fast path.
+    Longer rows match the two separate operations without ``page_table`` or
+    ``topk_offsets``, as used by the GLM-5.3-Flash indexer.
     The kernel derives ``pool_len = seq_len // pool_size`` internally, so the
     caller no longer needs to precompute it. Replaces ~25 elementwise kernels
     with one Triton launch.

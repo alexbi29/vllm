@@ -1,0 +1,155 @@
+{
+  "qualified": true,
+  "arms": {
+    "baseline-fixed": {
+      "repeat_exact": true,
+      "layout_exact": true,
+      "scores_finite": true,
+      "cases": 13,
+      "logical_kv_tokens": 277267
+    },
+    "compact-fixed": {
+      "repeat_exact": true,
+      "layout_exact": true,
+      "scores_finite": true,
+      "cases": 13,
+      "logical_kv_tokens": 345324
+    }
+  },
+  "capacity_gain_percent": 24.54565454958577,
+  "source_base": "dcaba9f772530d240e6259668c776e7f513c2462",
+  "hardware": "2 x RTX PRO 6000 Blackwell Max-Q 96GB SM120",
+  "pool_gpu_tests_passed": 28,
+  "captured_pool_replays_passed": 52,
+  "cpu_palette_tests_passed": 4,
+  "quality_status": "Fresh full graph-profile hard8x15/C2 started 2026-10-17; terminal result pending. Original eager run checkpointed at17 saved attempts; no attempts reused.",
+  "quality_caps": {
+    "default": 5000,
+    "train-accel": 10000,
+    "code-circular": 20000,
+    "code-levenshtein": 10000,
+    "code-gcdrec": 10000
+  },
+  "quality_sampling": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "reasoning": "enabled"
+  },
+  "quality_request_timeout_seconds": 3600,
+  "gpu_ci_coverage": "75 packaged regressions passed locally; SM120/full checkpoint validation requires external hardware",
+  "validated_serving_source_sha256": {
+    "vllm/models/glm5next/nvidia/ops/kpool_compress.py": "e90d8b6b5d4eccba8067b9ce001c9085db39cfb8d1bb6f99198cb202c9920c6c",
+    "vllm/models/glm5next/nvidia/sparse_indexer.py": "7ae0dd9d092f4e4b5852ff149376f3fc7d337762b54a48e4e0bf1c72da06b158",
+    "vllm/config/kernel.py": "47787eb7e59fd4b4fd3a4b7a340bb707e2b26f6e58adb975397f58c9f59b73f6",
+    "vllm/model_executor/layers/attention/mla_attention.py": "504164e175667bdc1c0a5f54b9a292b2306f96ca63111ca086c47990ad348530",
+    "vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm120.py": "222d6527df1b09922d1fb3190c62efa2153b62168ecf065f4d657d4f15d9bbb8",
+    "vllm/v1/attention/ops/glm53_compact_kv.py": "8efba2a86c7a91ff55bad70a958eab059b15a90844a6d46ce0f048563a1ff1bd",
+    "vllm/model_executor/layers/fused_moe/experts/flashinfer_cutlass_moe.py": "fd9265d6f2f60f1cb8ec004524490b8ef7f56587e19481ac9c3f9df0ea7310b7",
+    "vllm/model_executor/layers/quantization/utils/nvfp4_csf.py": "5740a0d847da1a3c7a217d05d7d64f1c0a1d5fce91f98ad03762a3a324fc1ba1",
+    "vllm/model_executor/layers/quantization/utils/nvfp4_resident.py": "0a20707ee490ed2f9bfb2947829e11e80197436b774f9bcb2f68f1c866c536a2",
+    "tests/kernels/test_kpool_decode_update_batched.py": "4e22b4fe291e3c8c254bfb0a1d19927cb922001941126ffa79ad35d3a29ce3fd",
+    "tests/v1/attention/test_sparse_mla_kv_cache_layout.py": "a34e66c002d921f6112c6047fc59d296b46fd46a9bc2095ec161c73fb891b2ae",
+    "vllm/models/glm5next/common/model.py": "2d2a402d56832452a09e7e821f50593dd15249a583aa90b1dd95e28e876d26ec"
+  },
+  "publication_only_changes": {},
+  "pr_source_sha256": {
+    "vllm/models/glm5next/nvidia/ops/kpool_compress.py": "e90d8b6b5d4eccba8067b9ce001c9085db39cfb8d1bb6f99198cb202c9920c6c",
+    "vllm/models/glm5next/nvidia/sparse_indexer.py": "7ae0dd9d092f4e4b5852ff149376f3fc7d337762b54a48e4e0bf1c72da06b158",
+    "vllm/config/kernel.py": "47787eb7e59fd4b4fd3a4b7a340bb707e2b26f6e58adb975397f58c9f59b73f6",
+    "vllm/model_executor/layers/attention/mla_attention.py": "504164e175667bdc1c0a5f54b9a292b2306f96ca63111ca086c47990ad348530",
+    "vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm120.py": "222d6527df1b09922d1fb3190c62efa2153b62168ecf065f4d657d4f15d9bbb8",
+    "vllm/v1/attention/ops/glm53_compact_kv.py": "8efba2a86c7a91ff55bad70a958eab059b15a90844a6d46ce0f048563a1ff1bd",
+    "vllm/model_executor/layers/fused_moe/experts/flashinfer_cutlass_moe.py": "fd9265d6f2f60f1cb8ec004524490b8ef7f56587e19481ac9c3f9df0ea7310b7",
+    "vllm/model_executor/layers/quantization/utils/nvfp4_csf.py": "5740a0d847da1a3c7a217d05d7d64f1c0a1d5fce91f98ad03762a3a324fc1ba1",
+    "vllm/model_executor/layers/quantization/utils/nvfp4_resident.py": "0a20707ee490ed2f9bfb2947829e11e80197436b774f9bcb2f68f1c866c536a2",
+    "tests/kernels/test_kpool_decode_update_batched.py": "4e22b4fe291e3c8c254bfb0a1d19927cb922001941126ffa79ad35d3a29ce3fd",
+    "tests/v1/attention/test_sparse_mla_kv_cache_layout.py": "a34e66c002d921f6112c6047fc59d296b46fd46a9bc2095ec161c73fb891b2ae",
+    "vllm/models/glm5next/common/model.py": "2d2a402d56832452a09e7e821f50593dd15249a583aa90b1dd95e28e876d26ec"
+  },
+  "original_eager_source_sha256": {
+    "vllm/models/glm5next/nvidia/ops/kpool_compress.py": "abd23072275b97dc8a8543c2d3f8d1008d0c73298d0d32343fb110554927ed38",
+    "vllm/models/glm5next/nvidia/sparse_indexer.py": "7ae0dd9d092f4e4b5852ff149376f3fc7d337762b54a48e4e0bf1c72da06b158",
+    "vllm/config/kernel.py": "47787eb7e59fd4b4fd3a4b7a340bb707e2b26f6e58adb975397f58c9f59b73f6",
+    "vllm/model_executor/layers/attention/mla_attention.py": "504164e175667bdc1c0a5f54b9a292b2306f96ca63111ca086c47990ad348530",
+    "vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm120.py": "222d6527df1b09922d1fb3190c62efa2153b62168ecf065f4d657d4f15d9bbb8",
+    "vllm/v1/attention/ops/glm53_compact_kv.py": "8efba2a86c7a91ff55bad70a958eab059b15a90844a6d46ce0f048563a1ff1bd",
+    "vllm/model_executor/layers/fused_moe/experts/flashinfer_cutlass_moe.py": "fd9265d6f2f60f1cb8ec004524490b8ef7f56587e19481ac9c3f9df0ea7310b7",
+    "vllm/model_executor/layers/quantization/utils/nvfp4_csf.py": "dd662c2eb2574e9f812359ff64d48960e8d7965bbe021563edbb905e034a8248",
+    "vllm/model_executor/layers/quantization/utils/nvfp4_resident.py": "df17e027cc4015ff6d95d829025d74eb8b314cc348a0a8e9b1d80304c777fc4c",
+    "tests/kernels/test_kpool_decode_update_batched.py": "ad2f65758bfc6f4d917f1754c6822126f9cbd7960903f692f21d613d827753b2",
+    "tests/v1/attention/test_sparse_mla_kv_cache_layout.py": "a34e66c002d921f6112c6047fc59d296b46fd46a9bc2095ec161c73fb891b2ae",
+    "vllm/models/glm5next/common/model.py": "2d2a402d56832452a09e7e821f50593dd15249a583aa90b1dd95e28e876d26ec"
+  },
+  "original_publication_only_changes": {
+    "nvfp4_csf.py": "Explicit constructor arguments for type checking; same ordered GPU transfers and kernels",
+    "nvfp4_resident.py": "Use repository-standard regex import for the same fixed layer-name pattern",
+    "tests": "Use torch.accelerator device selection in new tests; add portable codec/cache regressions"
+  },
+  "packaged_regressions": {
+    "pool": 28,
+    "palette": 6,
+    "compact_writer": 3,
+    "cache_layout": 38,
+    "total_passed": 75,
+    "skipped": 0
+  },
+  "decode_graphs": {
+    "mode": "FULL_DECODE_ONLY",
+    "torch_compile_mode": 0,
+    "capture_sizes": [
+      1,
+      2
+    ],
+    "physical_cache_blocks": 137,
+    "logical_kv_tokens": 345324,
+    "frozen_C1_model_cases": 13,
+    "C1_tokens_and_top5_scores_exact": true,
+    "C1_repeats_exact": true,
+    "short_C2_outcome_groups": 2,
+    "each_short_C2_group_has_exact_eager_and_graph_counterpart": true,
+    "C2_long_case": {
+      "requests": 2,
+      "input_tokens_each": 64512,
+      "output_tokens_each": 64,
+      "tokens_and_top5_scores_exact": true
+    },
+    "global_batching_invariance_claimed": false,
+    "nvml_free_gib_per_gpu_after_long_cases": 1.3486328125,
+    "speed_fixed_work": {
+      "raw_completions": true,
+      "chat_or_reasoning_template": false,
+      "runs": 3,
+      "requests_per_run": 2,
+      "completion_tokens_per_request": 128,
+      "temperature": 0,
+      "seed": 0,
+      "prompts_replayed": true,
+      "eager_before_tps": {
+        "C1": 8.25,
+        "C2_aggregate": 16.16
+      },
+      "graph_tps": {
+        "C1": 63.04,
+        "C2_aggregate": 100.21
+      },
+      "eager_return": {
+        "C1": 8.05,
+        "C2_aggregate": 15.7
+      },
+      "final_graph_cold_load": {
+        "C1": 62.98,
+        "C2_aggregate": 97.76
+      }
+    },
+    "final_cold_load": {
+      "frozen_C1_cases": 13,
+      "repeat_exact": true,
+      "tokens_and_top5_scores_exact": true,
+      "logical_kv_tokens": 345324,
+      "compressed_instances": 84,
+      "workers": 2,
+      "config_sha256": "9de8a53ce60ff3d2cafc53766e8a3de923ba631b4a8d360ea1d0111ca540d7e7"
+    }
+  },
+  "quality_tag": "glm53-nvfp4-csf-compactkv-graphs-hard8x15-c2-defaulttemp-20261017"
+}
