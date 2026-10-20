@@ -1884,8 +1884,9 @@ class SpeculativeConfig:
             )
 
         if self.draft_lm_head_quantization is not None:
-            # Gemma-4 MTP scores tied embedding rows directly; no lm_head to share.
-            if self.method not in ("eagle", "eagle3", "mtp") or self.use_gemma4_mtp():
+            # Gemma-4 MTP has no target lm_head to share; its speculator
+            # quantizes the assistant's own draft-dim head instead.
+            if self.method not in ("eagle", "eagle3", "mtp"):
                 raise ValueError(
                     "draft_lm_head_quantization is not supported for method "
                     f"{self.method!r}."
