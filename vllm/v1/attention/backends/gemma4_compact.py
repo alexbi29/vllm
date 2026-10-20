@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, ClassVar, cast
 import torch
 
 from vllm.config.cache import CacheDType
+from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.triton_attn import (
     TritonAttentionBackend,
     TritonAttentionImpl,
@@ -76,10 +77,21 @@ class Gemma4CompactMetadataBuilder(TritonAttentionMetadataBuilder):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         # Gemma has 256-dimensional local heads and 512-dimensional global
         # heads. The generic builder uses the model-wide (local) head size.
-        shape = (*self.softmax_segm_output.shape[:-1], kv_cache_spec.head_size)
+        rows, num_heads, segments = self.softmax_segm_output.shape[:-1]
+        # Short multi-token queries keep one score maximum per row, head and
+        # segment past the last output row (see unified_attention). Reserve
+        # it here; otherwise a full scratch drops those batches to 2D.
+        rows += cdiv(rows, kv_cache_spec.head_size)
         self.softmax_segm_output = torch.empty(
-            shape, dtype=torch.float32, device=device
+            (rows, num_heads, segments, kv_cache_spec.head_size),
+            dtype=torch.float32,
+            device=device,
         )
+
+    def _get_num_heads_kv(self, kv_cache_spec, vllm_config) -> int:
+        # Global layers have fewer KV heads than the model-wide (local) count,
+        # which sets the split-KV sequence threshold and SM120 segment count.
+        return kv_cache_spec.num_kv_heads
 
 
 class Gemma4CompactBackend(TritonAttentionBackend):
