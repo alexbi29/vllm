@@ -557,10 +557,13 @@ the populated cache. Keep the initial profile log and recheck the new boot's
 reported KV capacity. Zero GEMM workspace alone does not establish unchanged
 total GPU memory or KV capacity. No memory-budget override is required.
 
+vLLM automatically compiles and caches this path with ordinary cache settings;
+no experiment cache, copied compiled artifact or per-model cache override is
+required. A local clean startup with normal caching reproduced the saved
+128-token IDs, selected logprobs and top-20 scores exactly at 8K and 64K on
+both replicas. This validates those probes, not every possible continuation.
 Surrounding compiled reductions can select different launch configurations
-when rebuilding a cache. The local normalization-controlled deployment
-preserves its populated compilation cache and checks whole-model token IDs,
-selected logprobs and top-20 scores at 8K and 64K against saved references.
-Changing the compilation cache, serving profile or dependencies requires
-rechecking those outputs and the actual KV budget. Fixed-input GEMM equality
-does not establish sample-efficiency equivalence for concurrent generation.
+when rebuilding a cache, so changing the compilation cache, serving profile
+or dependencies still requires rechecking outputs and the actual KV budget.
+Fixed-input GEMM equality does not establish sample-efficiency equivalence
+for concurrent generation.
