@@ -300,6 +300,8 @@ def test_compact_metadata_uses_global_head_width(monkeypatch):
             rswa_window=None,
         ),
         parallel_config=None,
+        speculative_config=None,
+        scheduler_config=SimpleNamespace(max_num_seqs=256),
     )
     spec = FullAttentionSpec(
         block_size=256, num_kv_heads=2, head_size=512, dtype=torch.bfloat16
