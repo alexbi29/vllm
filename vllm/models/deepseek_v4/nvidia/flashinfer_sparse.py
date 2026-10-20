@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, ClassVar, cast
 
 import torch
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.forward_context import get_forward_context
@@ -43,7 +44,6 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-_FLASHINFER_DSV4_WORKSPACE_BUFFER_SIZE = 128 * 1024 * 1024
 _flashinfer_dsv4_workspace_by_device: dict[torch.device, torch.Tensor] = {}
 
 
@@ -51,7 +51,7 @@ def _get_flashinfer_dsv4_workspace(device: torch.device) -> torch.Tensor:
     workspace = _flashinfer_dsv4_workspace_by_device.get(device)
     if workspace is None:
         workspace = torch.zeros(
-            _FLASHINFER_DSV4_WORKSPACE_BUFFER_SIZE,
+            envs.VLLM_DSV4_FLASHINFER_WORKSPACE_MB * 1024 * 1024,
             dtype=torch.uint8,
             device=device,
         )
@@ -851,20 +851,29 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             raise RuntimeError(
                 "Compressed sparse MLA decode requires compressed sparse indices."
             )
-        flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
-            query=q,
-            swa_kv_cache=swa_cache,
-            workspace_buffer=self._get_workspace(q.device),
-            sparse_indices=swa_indices,
-            compressed_kv_cache=extra_cache,
-            out=output,
-            bmm1_scale=self.scale,
-            sinks=self.attn_sink,
-            kv_layout="NHD",
-            swa_topk_lens=swa_lens,
-            extra_sparse_indices=extra_sparse_indices,
-            extra_sparse_topk_lens=extra_sparse_lengths,
-        )
+        try:
+            flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
+                query=q,
+                swa_kv_cache=swa_cache,
+                workspace_buffer=self._get_workspace(q.device),
+                sparse_indices=swa_indices,
+                compressed_kv_cache=extra_cache,
+                out=output,
+                bmm1_scale=self.scale,
+                sinks=self.attn_sink,
+                kv_layout="NHD",
+                swa_topk_lens=swa_lens,
+                extra_sparse_indices=extra_sparse_indices,
+                extra_sparse_topk_lens=extra_sparse_lengths,
+            )
+        except ValueError as e:
+            if "workspace insufficient" not in str(e):
+                raise
+            raise ValueError(
+                f"{e} ({num_decode_tokens} decode tokens): raise "
+                "VLLM_DSV4_FLASHINFER_WORKSPACE_MB (currently "
+                f"{envs.VLLM_DSV4_FLASHINFER_WORKSPACE_MB})"
+            ) from e
 
     def _forward_prefill(
         self,
