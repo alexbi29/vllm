@@ -60,6 +60,7 @@ if TYPE_CHECKING:
     VLLM_XLA_CACHE_PATH: str = os.path.join(VLLM_CACHE_ROOT, "xla_cache")
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
+    VLLM_DSV4_FLASHINFER_WORKSPACE_MB: int = 128
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
     VLLM_XPU_PP_MICROBATCH: bool = True
     VLLM_DISTRIBUTED_USE_SPLIT_GROUP: bool = False
@@ -1128,6 +1129,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Default: 512 MB
     "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB": lambda: int(
         os.getenv("VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", "512")
+    ),
+    # Size (in MB) of the per-device FlashInfer workspace for DeepSeek-V4 sparse
+    # MLA on SM120. FlashInfer 0.7.2 keeps its split-K partials there and cannot
+    # fall back to a temporary allocation inside CUDA graph capture; the need
+    # grows with the captured decode tokens (about 4.1 MiB per token measured
+    # for DeepSeek-V4-Flash TP2, so 64 tokens need 261 MiB).
+    "VLLM_DSV4_FLASHINFER_WORKSPACE_MB": lambda: int(
+        os.getenv("VLLM_DSV4_FLASHINFER_WORKSPACE_MB", "128")
     ),
     # KV context length each adaptive-verification profiling request pretends to
     # carry, so the profiled step reads a realistic amount of cache.
