@@ -599,9 +599,22 @@ def _select_config(
     """
     base_programs = num_rows * num_kv_heads
     if _is_sm120():
-        BLOCK_N, target_splits, num_warps = _select_sm120_config(
-            base_programs, use_prefill_config, is_fp8
-        )
+        from vllm.config import get_current_vllm_config_or_none
+
+        config = get_current_vllm_config_or_none()
+        if (
+            config is not None
+            and config.kernel_config.qwen4_exp_sm120_qsa_prefill
+            and use_prefill_config
+            and not is_fp8
+            and num_kv_heads == 2
+            and num_rows >= 2048
+        ):
+            BLOCK_N, target_splits, num_warps = 32, 1, 4
+        else:
+            BLOCK_N, target_splits, num_warps = _select_sm120_config(
+                base_programs, use_prefill_config, is_fp8
+            )
     elif _is_sm90():
         BLOCK_N, target_splits, num_warps = _select_sm90_config(
             base_programs, use_prefill_config, is_fp8
