@@ -299,6 +299,7 @@ class Worker(WorkerBase):
         self._sleep_saved_parameters.clear()
 
     def sleep(self, level: int = 1) -> None:
+        self._check_nvfp4_weight_access()
         if level == 2:
             self._check_mxfp4_weight_access()
         torch.accelerator.synchronize()
@@ -369,6 +370,7 @@ class Worker(WorkerBase):
         self.synchronize_device()
 
     def discard(self, tags: tuple[str, ...]) -> None:
+        self._check_nvfp4_weight_access()
         if "weights" in tags:
             self._check_mxfp4_weight_access()
         if has_kv_transfer_group() and "kv_cache" in tags:
@@ -390,12 +392,14 @@ class Worker(WorkerBase):
         return f"dp{dp}:pp{pp}:pcp{pcp}:tp{tp}:"
 
     def compute_weight_checksums(self) -> dict[str, str]:
+        self._check_nvfp4_weight_access()
         self._check_mxfp4_weight_access()
         prefix = self._weight_checksum_prefix()
         digests = compute_tensor_digests(self.model_runner.get_model())
         return {prefix + name: digest for name, digest in digests.items()}
 
     def reset_weights(self) -> None:
+        self._check_nvfp4_weight_access()
         self._check_mxfp4_weight_access()
         zero_weights(self.model_runner.get_model())
 
@@ -403,6 +407,13 @@ class Worker(WorkerBase):
         if self.vllm_config.kernel_config.mxfp4_scale_compression:
             raise RuntimeError(
                 "Weight mutation/checksums are unsupported with MXFP4 scale compression"
+            )
+
+    def _check_nvfp4_weight_access(self) -> None:
+        if self.vllm_config.kernel_config.nvfp4_scale_compression:
+            raise RuntimeError(
+                "Weight mutation/checksums/export are unsupported with "
+                "NVFP4 scale compression"
             )
 
     def _maybe_get_memory_pool_context(self, tag: str) -> AbstractContextManager:
@@ -646,6 +657,7 @@ class Worker(WorkerBase):
             setattr(self, config_name, new_config)
 
     def reload_weights(self, *args, **kwargs) -> None:
+        self._check_nvfp4_weight_access()
         self._check_mxfp4_weight_access()
         with set_current_vllm_config(self.vllm_config):
             self.model_runner.reload_weights(*args, **kwargs)
@@ -1497,6 +1509,7 @@ class Worker(WorkerBase):
         pattern: str | None = None,
         max_size: int | None = None,
     ) -> None:
+        self._check_nvfp4_weight_access()
         self._check_mxfp4_weight_access()
         from vllm.model_executor.model_loader import ShardedStateLoader
 
@@ -1508,6 +1521,7 @@ class Worker(WorkerBase):
         )
 
     def save_tensorized_model(self, tensorizer_config: "TensorizerConfig") -> None:
+        self._check_nvfp4_weight_access()
         self._check_mxfp4_weight_access()
         TensorizerLoader.save_model(
             self.get_model(),
@@ -1552,6 +1566,7 @@ class Worker(WorkerBase):
         the configured weight transfer engine. The worker only tracks that a
         session is active.
         """
+        self._check_nvfp4_weight_access()
         with set_current_vllm_config(self.vllm_config):
             self._start_weight_update()
 
@@ -1609,6 +1624,7 @@ class Worker(WorkerBase):
                 global worker rank across data parallel replicas.
 
         """
+        self._check_nvfp4_weight_access()
         self._check_mxfp4_weight_access()
         self._check_weight_transfer_engine()
         assert self.weight_transfer_engine is not None
