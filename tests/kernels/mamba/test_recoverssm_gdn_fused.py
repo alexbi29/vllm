@@ -34,7 +34,7 @@ H, K, V, T = 4, 128, 128, 4
 EPS = 1e-6
 
 
-def _make(qlens, hv_per_h=3, state_dtype=torch.float32, nb=48, seed=0):
+def _make(qlens, hv_per_h=3, state_dtype=torch.float32, nb=48, seed=0, window=T):
     g = torch.Generator(device="cuda").manual_seed(seed)
     rnd = lambda *s: torch.randn(*s, device="cuda", generator=g)  # noqa: E731
     hv = H * hv_per_h
@@ -50,7 +50,8 @@ def _make(qlens, hv_per_h=3, state_dtype=torch.float32, nb=48, seed=0):
         A_log=(torch.rand(hv, device="cuda", generator=g) * 2 - 1).float(),
         dt_bias=(rnd(hv) * 0.5).bfloat16(),
         state=(rnd(nb, hv, V, K) * 0.05).to(state_dtype),
-        replay=torch.zeros(nb, hv, T, V + K + 1, device="cuda"),
+        replay=torch.zeros(nb, hv, window, V + K + 1, device="cuda"),
+        window=window,
         gate=rnd(tot, hv, V).bfloat16(),
         norm_weight=(1 + 0.1 * rnd(V)).float(),
         qsl=torch.tensor(qsl, dtype=torch.int32, device="cuda"),
@@ -63,7 +64,9 @@ def _replay_op(d, slots=None, qsl=None, replay=None, strided=False):
     qsl = d["qsl"] if qsl is None else qsl
     if strided:
         # the layer passes the checkpoint column of [N, 1 + num_spec] indices
-        wide = torch.full((slots.numel(), T), -7, dtype=torch.int32, device="cuda")
+        wide = torch.full(
+            (slots.numel(), d["window"]), -7, dtype=torch.int32, device="cuda"
+        )
         wide[:, 0] = slots
         state_indices = wide[:, :1]
     else:
@@ -89,11 +92,12 @@ def _replay_op(d, slots=None, qsl=None, replay=None, strided=False):
 def _native_op(d):
     """The snapshot path: every window position gets its own destination slot."""
     n = d["slots"].numel()
+    window = d["window"]
     state = d["state"].clone()
     extra = torch.arange(
-        state.shape[0] - n * T, state.shape[0], dtype=torch.int32, device="cuda"
+        state.shape[0] - n * window, state.shape[0], dtype=torch.int32, device="cuda"
     )
-    idx = torch.cat([d["slots"][:, None], extra.view(n, T)[:, 1:]], dim=1)
+    idx = torch.cat([d["slots"][:, None], extra.view(n, window)[:, 1:]], dim=1)
     out = ops.fused_gdn_decode_post_conv_mtp(
         mixed_qkv=d["mixed_qkv"],
         a=d["a"],
@@ -131,7 +135,7 @@ def _triton_verify(d, replay):
         replay_cache=replay,
         query_start_loc=d["qsl"],
         state_indices=d["slots"],
-        spec_query_len=T,
+        spec_query_len=d["window"],
     )
 
 
@@ -277,3 +281,35 @@ def test_replay_graph_uses_changed_inputs_slots_and_lengths(hv_per_h):
         torch.testing.assert_close(
             d["replay"], expected_replay, rtol=0, atol=0, equal_nan=True
         )
+
+
+@pytest.mark.parametrize("window", [2, 3, 5])
+def test_replay_and_partial_commits_at_mtp_sweep_depths(window):
+    """Depths 1/2/4 must preserve native outputs and each accepted-prefix state."""
+    lengths = (window, window - 1, 1)
+    d = _make(lengths, window=window)
+    out = _replay_op(d, strided=True)
+    expected_out, expected_state, indices = _native_op(d)
+    assert torch.equal(out, expected_out)
+    for accepted in range(1, window + 1):
+        checkpoint = d["state"].clone()
+        conv = [
+            torch.zeros(
+                checkpoint.shape[0], 8, 3 + window - 1, device="cuda"
+            ).bfloat16()
+        ]
+        context = GDNRecoverSSMCommitContext.from_tensors(
+            conv,
+            [checkpoint],
+            [d["replay"]],
+            spec_query_len=window,
+            max_num_reqs=8,
+        )
+        counts = torch.tensor(
+            [min(accepted, n) for n in lengths], dtype=torch.int32, device="cuda"
+        )
+        context.commit(counts, d["slots"], d["qsl"])
+        for i, slot in enumerate(d["slots"].tolist()):
+            assert torch.equal(
+                checkpoint[slot], expected_state[indices[i, counts[i] - 1]]
+            )
