@@ -299,6 +299,13 @@ class KernelConfig:
     enable_jit_warmup: bool = True
     """If True, run JIT compile warmup during kernel warmup."""
 
+    nvfp4_scale_compression: bool = False
+    """Losslessly compress Qwen4Exp routed NVFP4 scales on SM120.
+
+    Requires synchronous TP1 FlashInfer CUTLASS; draft experts stay unchanged.
+    Weight mutation, export, sleep and overlapping execution are unsupported.
+    """
+
     monokernel: bool = False
     """If True, run the eligible layers of decode steps on the model's
     MonoKernel: a persistent kernel that runs most or all of one decoder layer
@@ -507,6 +514,13 @@ class KernelConfig:
                         "offload without UVA. Enable UVA or disable CPU weight "
                         "offload or scale compression."
                     )
+
+        if self.nvfp4_scale_compression:
+            from vllm.model_executor.layers.quantization.utils.nvfp4_resident import (
+                validate_nvfp4_scale_compression,
+            )
+
+            validate_nvfp4_scale_compression(vllm_config)
 
         if vllm_config.model_config is not None:
             validate_flashinfer_moe_ep_model(

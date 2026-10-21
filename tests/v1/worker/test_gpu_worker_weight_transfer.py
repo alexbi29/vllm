@@ -306,3 +306,35 @@ def test_missing_engine_raises():
     worker = _make_worker(None)
     with pytest.raises(RuntimeError, match="Weight transfer not configured"):
         Worker.start_weight_update(worker)
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "reload_weights",
+        "reset_weights",
+        "compute_weight_checksums",
+        "start_weight_update",
+        "update_weights",
+        "sleep",
+        "discard",
+        "save_sharded_state",
+        "save_tensorized_model",
+    ],
+)
+def test_nvfp4_scales_reject_weight_access_before_mutation(operation):
+    engine = _RecordingEngine()
+    worker = _make_worker(engine)
+    worker.vllm_config.kernel_config.nvfp4_scale_compression = True
+    args = {
+        "update_weights": ({"names": ["w"]},),
+        "sleep": (2,),
+        "discard": (("weights",),),
+        "save_sharded_state": ("/unused",),
+        "save_tensorized_model": (None,),
+    }.get(operation, ())
+    with pytest.raises(RuntimeError, match="NVFP4 scale compression"):
+        getattr(worker, operation)(*args)
+    assert isinstance(worker.model_runner, _RecordingModelRunner)
+    assert worker.model_runner.seen_config is None
+    assert not engine.started and not engine.update_calls
