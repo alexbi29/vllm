@@ -53,6 +53,118 @@ MNK_FACTORS = [
 ]
 
 
+@pytest.mark.skipif(
+    not current_platform.is_device_capability(120), reason="SM120 tactic plans"
+)
+@pytest.mark.parametrize("m", [4, 64, 8192])
+@torch.inference_mode()
+def test_qwen4_exp_resident_tactics_graph_replays_new_routes(
+    m, monkeypatch, workspace_init
+):
+    """Compressed scales and fixed tactics must follow changing graph inputs."""
+    from types import SimpleNamespace
+
+    from vllm.compilation import backends
+    from vllm.model_executor.layers.quantization.utils import nvfp4_resident
+
+    set_random_seed(20261021)
+    config = VllmConfig()
+    with set_current_vllm_config(config):
+        w1, w2, quant = make_test_quant_config(
+            512, 640, 2560, torch.bfloat16, "nvfp4", make_gate=True
+        )
+        moe = FusedMoEConfig(
+            num_experts=512,
+            experts_per_token=10,
+            hidden_dim=2560,
+            intermediate_size=640,
+            num_local_experts=512,
+            num_logical_experts=512,
+            activation=MoEActivation.SILU,
+            device="cuda",
+            moe_parallel_config=FusedMoEParallelConfig.make_no_parallel(),
+            in_dtype=torch.bfloat16,
+            routing_method=RoutingMethodType.TopK,
+            max_num_tokens=m,
+        )
+        experts = FlashInferExperts(moe_config=moe, quant_config=quant)
+        kernel = FusedMoEKernel(
+            maybe_make_prepare_finalize(
+                moe=moe,
+                quant_config=quant,
+                allow_new_interface=True,
+                use_monolithic=False,
+            ),
+            experts,
+        )
+        original = (experts.w1_scale, experts.w2_scale)
+        layer = torch.nn.Module()
+        layer.layer_name = "model.layers.0.mlp.experts"
+        for name, value in zip(
+            ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale"),
+            (w1, w2, *original),
+        ):
+            layer.register_parameter(
+                name, torch.nn.Parameter(value, requires_grad=False)
+            )
+        compression_config = SimpleNamespace(
+            kernel_config=SimpleNamespace(
+                nvfp4_scale_compression=True, qwen4_exp_sm120_moe_tactics=True
+            ),
+            model_config=SimpleNamespace(
+                hf_text_config=SimpleNamespace(
+                    model_type="qwen4_exp_text", num_hidden_layers=48
+                )
+            ),
+        )
+        monkeypatch.setattr(
+            nvfp4_resident,
+            "get_current_vllm_config_or_none",
+            lambda: compression_config,
+        )
+        monkeypatch.setattr(backends, "model_tag", "backbone")
+        resident = nvfp4_resident.prepare_resident_nvfp4_scales(experts, layer)
+        assert resident is not None and m in resident.moe_tactics
+        compressed = (experts.w1_scale, experts.w2_scale)
+        experts._nvfp4_resident = resident
+        a = torch.randn(m, 2560, device="cuda", dtype=torch.bfloat16) * 0.1
+        scores = torch.randn(m, 512, device="cuda", dtype=torch.bfloat16)
+        weights, ids, _ = fused_topk(a, scores, 10, renormalize=True)
+
+        def run():
+            return kernel.apply(
+                hidden_states=a,
+                w1=w1,
+                w2=w2,
+                topk_weights=weights,
+                topk_ids=ids,
+                activation=MoEActivation.SILU,
+                global_num_experts=512,
+                expert_map=None,
+                apply_router_weight_on_input=False,
+            )
+
+        run()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            actual = run()
+        for _ in range(3):
+            a.copy_(torch.randn_like(a) * 0.1)
+            scores.normal_()
+            next_weights, next_ids, _ = fused_topk(a, scores, 10, renormalize=True)
+            weights.copy_(next_weights)
+            ids.copy_(next_ids)
+            experts._nvfp4_resident = None
+            quant._w1.scale, quant._w2.scale = original
+            reference = run().clone()
+            quant._w1.scale, quant._w2.scale = compressed
+            experts._nvfp4_resident = resident
+            for scratch in resident.scratch:
+                scratch.fill_(0xA5)
+            graph.replay()
+            torch.testing.assert_close(actual, reference, atol=0.02, rtol=0.02)
+
+
 @pytest.mark.parametrize(
     "activation",
     [MoEActivation.SWIGLUOAI, MoEActivation.SWIGLUOAI_UNINTERLEAVE],
