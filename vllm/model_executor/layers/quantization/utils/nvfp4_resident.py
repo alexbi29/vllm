@@ -20,23 +20,22 @@ from vllm.v1.worker.workspace import current_workspace_manager
 logger = init_logger(__name__)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["NUM", "CAPACITY"])
 def _select_active(
     TopK,
     Output,
-    NUM: tl.constexpr,
+    NUM,
     EXPERTS: tl.constexpr,
-    CAPACITY: tl.constexpr,
-    BLOCK: tl.constexpr,
+    CAPACITY,
+    ROUTE_BLOCK: tl.constexpr,
+    EXPERT_BLOCK: tl.constexpr,
 ):
-    expert = tl.arange(0, BLOCK)
-    active = tl.full((BLOCK,), False, tl.int1)
-    lane = tl.arange(0, 16)
-    for start in range(0, NUM, 16):
-        ids = tl.load(TopK + start + lane, start + lane < NUM, -1)
-        found = tl.sum((ids[:, None] == expert[None, :]).to(tl.int32), axis=0) > 0
-        active = active | found
-    active = active & (expert < EXPERTS)
+    lane = tl.arange(0, ROUTE_BLOCK)
+    ids = tl.load(TopK + lane, lane < NUM, -1)
+    valid = (lane < NUM) & (ids >= 0) & (ids < EXPERTS)
+    counts = tl.histogram(ids.to(tl.int32), EXPERT_BLOCK, mask=valid)
+    expert = tl.arange(0, EXPERT_BLOCK)
+    active = (counts > 0) & (expert < EXPERTS)
     positions = tl.cumsum(active.to(tl.int32)) - 1
     tl.store(Output + expert, -1, expert < CAPACITY)
     tl.debug_barrier()
@@ -64,7 +63,7 @@ class ResidentNvfp4Scales:
         if count == 0:
             return
         # Large prefills generally visit every expert; avoid route preparation.
-        if count >= experts:
+        if count >= 8 * experts:
             ids = self.all_ids
         else:
             capacity = min(count, experts)
@@ -75,6 +74,7 @@ class ResidentNvfp4Scales:
                 count,
                 experts,
                 capacity,
+                triton.next_power_of_2(count),
                 triton.next_power_of_2(experts),
                 num_warps=4,
             )
