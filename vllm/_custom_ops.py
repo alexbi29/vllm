@@ -3241,7 +3241,7 @@ def fused_gdn_decode_post_conv_mtp_replay(
 
     Each window starts from its checkpoint ``state[state_indices[i, 0]]``, which
     is only read. Instead of per-token states the kernel writes each token's
-    replay record ``[correction (V), normalized key (K), log decay (1)]`` into
+    replay record ``[correction (V), normalized key (K), decay (1)]`` into
     ``replay[state_indices[i, 0], :, t]``, the layout the RecoverSSM commit folds.
     """
     if out is None:
