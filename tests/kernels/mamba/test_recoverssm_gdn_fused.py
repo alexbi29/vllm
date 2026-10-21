@@ -239,3 +239,41 @@ def test_replay_rejects_bad_shapes():
             norm_eps=EPS,
             output_gate_activation="sigmoid",
         )
+
+
+@pytest.mark.parametrize("hv_per_h", [1, 3])
+def test_replay_graph_uses_changed_inputs_slots_and_lengths(hv_per_h):
+    """Replay must refresh strided slot views and read current checkpoint data."""
+    d = _make((4, 2, 3), hv_per_h=hv_per_h)
+    _replay_op(d, strided=True)
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = _replay_op(d, strided=True)
+
+    for seed, lengths in enumerate(((2, 4, 3), (3, 2, 4)), start=1):
+        fresh = _make(lengths, hv_per_h=hv_per_h, seed=seed)
+        for key in (
+            "mixed_qkv",
+            "a",
+            "b",
+            "A_log",
+            "dt_bias",
+            "state",
+            "gate",
+            "norm_weight",
+            "qsl",
+        ):
+            d[key].copy_(fresh[key])
+        d["slots"].copy_(fresh["slots"] + seed * 3)
+        before = d["state"].clone()
+        d["replay"].fill_(float("nan"))
+        expected = _replay_op(d, strided=True)
+        expected_replay = d["replay"].clone()
+        d["replay"].fill_(float("nan"))
+        graph.replay()
+        assert torch.equal(captured, expected)
+        assert torch.equal(d["state"], before)
+        torch.testing.assert_close(
+            d["replay"], expected_replay, rtol=0, atol=0, equal_nan=True
+        )
