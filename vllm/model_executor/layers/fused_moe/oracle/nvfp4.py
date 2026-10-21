@@ -223,16 +223,25 @@ def select_nvfp4_moe_backend(
     # FLASHINFER_B12X is intentionally excluded from auto-selection until
     # the upstream CUTLASS SM121 MMA op guard is resolved; use
     # moe_backend="flashinfer_b12x" to opt in explicitly.
-    AVAILABLE_BACKENDS = [
-        NvFp4MoeBackend.FLASHINFER_TRTLLM,
-        NvFp4MoeBackend.FLASHINFER_CUTEDSL,
-        NvFp4MoeBackend.FLASHINFER_CUTEDSL_BATCHED,
-        NvFp4MoeBackend.FLASHINFER_CUTLASS,
-        NvFp4MoeBackend.VLLM_CUTLASS,
-        NvFp4MoeBackend.MARLIN,
-        NvFp4MoeBackend.HUMMING,
-        NvFp4MoeBackend.EMULATION,
-    ]
+    from vllm.config import get_current_vllm_config_or_none
+
+    runtime_config = get_current_vllm_config_or_none()
+    if (
+        runtime_config is not None
+        and runtime_config.kernel_config.nvfp4_scale_compression
+    ):
+        AVAILABLE_BACKENDS = [NvFp4MoeBackend.FLASHINFER_CUTLASS]
+    else:
+        AVAILABLE_BACKENDS = [
+            NvFp4MoeBackend.FLASHINFER_TRTLLM,
+            NvFp4MoeBackend.FLASHINFER_CUTEDSL,
+            NvFp4MoeBackend.FLASHINFER_CUTEDSL_BATCHED,
+            NvFp4MoeBackend.FLASHINFER_CUTLASS,
+            NvFp4MoeBackend.VLLM_CUTLASS,
+            NvFp4MoeBackend.MARLIN,
+            NvFp4MoeBackend.HUMMING,
+            NvFp4MoeBackend.EMULATION,
+        ]
     AVAILABLE_BACKENDS = prioritize_humming(AVAILABLE_BACKENDS)
 
     NVFP4_BACKENDS_WITH_CLAMP = {
