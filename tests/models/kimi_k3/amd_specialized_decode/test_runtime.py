@@ -72,7 +72,7 @@ def _vllm_config(**over) -> SimpleNamespace:
             ),
         ),
         cache_config=SimpleNamespace(
-            mamba_cache_dtype="auto", use_replayssm=False, use_kda_recoverssm=False
+            mamba_cache_dtype="auto", use_replayssm=False, use_recoverssm=False
         ),
         lora_config=None,
         kv_transfer_config=None,
