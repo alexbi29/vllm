@@ -1899,3 +1899,46 @@ def test_native_nvfp4_scale_palette_graph_preserves_routes_and_scratch(device):
                         np.testing.assert_array_equal(actual[expert], reference[expert])
                     else:
                         assert np.all(actual[expert] == 0xA5)
+
+
+@pytest.mark.parametrize("device", range(torch.accelerator.device_count()))
+def test_native_nvfp4_resident_graph_selects_only_current_experts(device):
+    """A replay must replace stale route IDs and preserve inactive scratch rows."""
+    import numpy as np
+
+    from vllm.model_executor.layers.quantization.utils.nvfp4_csf import PaletteScales
+    from vllm.model_executor.layers.quantization.utils.nvfp4_resident import (
+        ResidentNvfp4Scales,
+    )
+
+    rng = np.random.default_rng(381)
+    values = [
+        rng.integers(96, 115, shape, dtype=np.uint8)
+        for shape in ((13, 129, 32), (13, 257, 64))
+    ]
+    with torch.accelerator.device_index(device):
+        codecs = tuple(PaletteScales.from_native(v).to_gpu(device) for v in values)
+        scratch = tuple(
+            torch.empty(v.shape, dtype=torch.uint8, device=device) for v in values
+        )
+        resident = ResidentNvfp4Scales(
+            codecs,
+            scratch,
+            torch.arange(13, dtype=torch.int32, device=device),
+            torch.empty(13, dtype=torch.int32, device=device),
+        )
+        ids = torch.tensor([1, 1, 7, -1], dtype=torch.int32, device=device)
+        resident.decode(ids)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=torch.cuda.Stream(device=device)):
+            resident.decode(ids)
+        for route in ([1, 1, 7, -1], [11, 5, 2, 0], [-1, -1, -1, -1]):
+            ids.copy_(torch.tensor(route, dtype=torch.int32, device=device))
+            for out in scratch:
+                out.fill_(0xA5)
+            graph.replay()
+            for out, reference in zip(scratch, values):
+                expected = np.full(reference.shape, 0xA5, dtype=np.uint8)
+                for expert in set(route) - {-1}:
+                    expected[expert] = reference[expert]
+                np.testing.assert_array_equal(out.cpu().numpy(), expected)
