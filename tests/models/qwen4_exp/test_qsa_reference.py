@@ -969,27 +969,40 @@ def test_qsa_block_expansion_correctness() -> None:
         "use_prefill_config",
         "num_requests",
         "fp8",
+        "sm120_prefill_tuned",
     ),
     [
         # Production page sizes from hybrid-cache block alignment: 784/800
         # at TP4 and 1568/1600 at TP1/TP2 (no-MTP / MTP num_spec=3). Head
         # splits are per-rank TP1/TP2/TP4; the largest batch runs both
         # use_prefill_config variants.
-        pytest.param(1, 24, 2, 1600, True, 2, False, id="tp1_r1"),
-        pytest.param(16, 12, 1, 1600, True, 3, False, id="tp2_r16"),
-        pytest.param(32, 6, 1, 800, True, 5, False, id="tp4_r32"),
-        pytest.param(128, 24, 2, 1568, True, 7, False, id="tp1_r128"),
-        pytest.param(257, 6, 1, 800, True, 13, False, id="tp4_r257"),
-        pytest.param(513, 6, 1, 784, True, 17, False, id="tp4_r513"),
-        pytest.param(700, 6, 1, 800, True, 23, False, id="tp4_r700"),
-        pytest.param(1024, 24, 2, 1600, True, 33, False, id="tp1_r1024"),
-        pytest.param(2048, 24, 2, 1600, True, 63, False, id="tp1_r2048_prefill"),
-        pytest.param(2048, 24, 2, 1600, False, 63, False, id="tp1_r2048_uniform"),
+        pytest.param(1, 24, 2, 1600, True, 2, False, False, id="tp1_r1"),
+        pytest.param(16, 12, 1, 1600, True, 3, False, False, id="tp2_r16"),
+        pytest.param(32, 6, 1, 800, True, 5, False, False, id="tp4_r32"),
+        pytest.param(128, 24, 2, 1568, True, 7, False, False, id="tp1_r128"),
+        pytest.param(257, 6, 1, 800, True, 13, False, False, id="tp4_r257"),
+        pytest.param(513, 6, 1, 784, True, 17, False, False, id="tp4_r513"),
+        pytest.param(700, 6, 1, 800, True, 23, False, False, id="tp4_r700"),
+        pytest.param(1024, 24, 2, 1600, True, 33, False, False, id="tp1_r1024"),
+        pytest.param(2048, 24, 2, 1600, True, 63, False, False, id="tp1_r2048_prefill"),
+        pytest.param(
+            2048, 24, 2, 1600, False, 63, False, False, id="tp1_r2048_uniform"
+        ),
+        pytest.param(
+            2048, 24, 2, 1600, True, 63, False, True, id="sm120_one_split_stock_page"
+        ),
+        pytest.param(
+            2048, 24, 2, 1728, True, 63, False, True, id="sm120_one_split_replay_page"
+        ),
         # fp8_e4m3 K/V caches on the TP1 head split.
-        pytest.param(1, 24, 2, 1600, True, 2, True, id="tp1_r1_fp8"),
-        pytest.param(128, 24, 2, 1568, True, 7, True, id="tp1_r128_fp8"),
-        pytest.param(2048, 24, 2, 1600, True, 63, True, id="tp1_r2048_prefill_fp8"),
-        pytest.param(2048, 24, 2, 1600, False, 63, True, id="tp1_r2048_uniform_fp8"),
+        pytest.param(1, 24, 2, 1600, True, 2, True, False, id="tp1_r1_fp8"),
+        pytest.param(128, 24, 2, 1568, True, 7, True, False, id="tp1_r128_fp8"),
+        pytest.param(
+            2048, 24, 2, 1600, True, 63, True, False, id="tp1_r2048_prefill_fp8"
+        ),
+        pytest.param(
+            2048, 24, 2, 1600, False, 63, True, False, id="tp1_r2048_uniform_fp8"
+        ),
     ],
 )
 def test_qsa_sparse_paged_attention_correctness(
@@ -1000,6 +1013,7 @@ def test_qsa_sparse_paged_attention_correctness(
     use_prefill_config: bool,
     num_requests: int,
     fp8: bool,
+    sm120_prefill_tuned: bool,
 ) -> None:
     """QSA sparse paged attention matches the dense reference.
 
@@ -1104,18 +1118,30 @@ def test_qsa_sparse_paged_attention_correctness(
     else:
         k_scale, v_scale = 1.0, 1.0
 
-    actual = qsa_ops.qsa_sparse_paged_attention(
-        q,
-        k_cache,
-        v_cache,
-        logical_indices,
-        block_table,
-        token_to_req,
-        use_prefill_config=use_prefill_config,
-        k_scale=k_scale,
-        v_scale=v_scale,
-        output_gate=output_gate,
-    )
+    from vllm.config import KernelConfig, VllmConfig, set_current_vllm_config
+
+    with set_current_vllm_config(
+        VllmConfig(
+            kernel_config=KernelConfig(qwen4_exp_sm120_qsa_prefill=sm120_prefill_tuned)
+        )
+    ):
+        if sm120_prefill_tuned and current_platform.get_device_capability() == (12, 0):
+            assert (
+                qsa_ops._select_config(num_rows, num_kv_heads, True, selection_width)[3]
+                == 1
+            )
+        actual = qsa_ops.qsa_sparse_paged_attention(
+            q,
+            k_cache,
+            v_cache,
+            logical_indices,
+            block_table,
+            token_to_req,
+            use_prefill_config=use_prefill_config,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            output_gate=output_gate,
+        )
     expected = _qsa_sparse_paged_attention_reference(
         q,
         k_cache,
