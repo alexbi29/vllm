@@ -370,7 +370,15 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
             fc1_expert_weights = w1
             fc2_expert_weights = w2
 
-        finalize_kwargs = {}
+        finalize_kwargs: dict[str, bool | list[int]] = {}
+        if (
+            activation == MoEActivation.SILU
+            and self._nvfp4_resident is not None
+            and self._nvfp4_resident.moe_tactics is not None
+        ):
+            profile = self._nvfp4_resident.moe_tactics.get(hidden_states.shape[0])
+            if profile is not None:
+                finalize_kwargs["profile_ids"] = list(profile)
         if (
             activation == MoEActivation.GELU_TANH
             and self.quant_config.use_nvfp4_w4a4
