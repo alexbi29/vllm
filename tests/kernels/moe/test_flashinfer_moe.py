@@ -56,13 +56,16 @@ MNK_FACTORS = [
 @pytest.mark.skipif(
     not current_platform.is_device_capability(120), reason="SM120 tactic plans"
 )
-@pytest.mark.parametrize("m", [4, 64, 8192])
+@pytest.mark.parametrize("m", [4, 64, 6912, 8000, 8191, 8192])
 @torch.inference_mode()
 def test_qwen4_exp_resident_tactics_graph_replays_new_routes(
     m, monkeypatch, workspace_init
 ):
     """Compressed scales and fixed tactics must follow changing graph inputs."""
     from types import SimpleNamespace
+
+    if pytest.importorskip("flashinfer").__version__ != "0.7.2":
+        pytest.skip("The opt-in tactic plans require FlashInfer 0.7.2")
 
     from vllm.compilation import backends
     from vllm.model_executor.layers.quantization.utils import nvfp4_resident
