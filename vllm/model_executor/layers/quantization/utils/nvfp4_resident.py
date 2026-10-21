@@ -3,6 +3,7 @@
 """Lossless resident Qwen4Exp NVFP4 scales for SM120 FlashInfer CUTLASS."""
 
 from dataclasses import dataclass
+from functools import cache
 
 import regex as re
 import torch
@@ -18,6 +19,64 @@ from vllm.triton_utils import tl, triton
 from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
+
+_SM120_MOE_TACTICS = {
+    4: (12, 44),
+    8: (12, 44),
+    16: (12, 47),
+    64: (12, 45),
+    2048: (13, 47),
+    8192: (10, 25),
+}
+
+
+@cache
+def _validated_sm120_moe_tactics(device_index: int) -> dict[int, tuple[int, int]]:
+    import flashinfer
+    from flashinfer.fused_moe.core import ActivationType, get_cutlass_fused_moe_module
+    from flashinfer.utils import device_support_pdl
+
+    if flashinfer.__version__ != "0.7.2":
+        raise RuntimeError("Qwen4Exp SM120 MoE tactics require FlashInfer 0.7.2")
+    device = torch.device("cuda", device_index)
+    with torch.accelerator.device_index(device_index):
+        runner = (
+            get_cutlass_fused_moe_module("120")
+            .MoERunner(
+                x_dtype=torch.uint8,
+                weight_dtype=torch.long,
+                output_dtype=torch.bfloat16,
+                top_k=10,
+                tp_size=1,
+                tp_rank=0,
+                ep_size=1,
+                ep_rank=0,
+                cluster_size=1,
+                cluster_rank=0,
+                enable_alltoall=False,
+                use_deepseek_fp8_block_scale=False,
+                use_w4_group_scaling=False,
+                use_mxfp8_act_scaling=False,
+                min_latency_mode=False,
+                enable_pdl=device_support_pdl(device),
+                activation_type=ActivationType.Swiglu,
+                use_packed_weights=False,
+                use_fused_finalize=True,
+                use_wfp4afp8_humming=False,
+            )
+            .fused_moe_runner
+        )
+        counts = (runner.get_gemm1_tactic_count(), runner.get_gemm2_tactic_count())
+        if counts != (16, 32) or any(
+            runner.get_tactic_occupancy(tactic) <= 0
+            for pair in _SM120_MOE_TACTICS.values()
+            for tactic in pair
+        ):
+            raise RuntimeError("FlashInfer CUTLASS tactics differ from the SM120 plans")
+    logger.info_once(
+        "Qwen4Exp SM120 offline MoE tactics enabled: %s", str(_SM120_MOE_TACTICS)
+    )
+    return _SM120_MOE_TACTICS
 
 
 @triton.jit(do_not_specialize=["NUM", "CAPACITY"])
@@ -54,6 +113,7 @@ class ResidentNvfp4Scales:
     scratch: tuple[torch.Tensor, torch.Tensor]
     all_ids: torch.Tensor
     selected_ids: torch.Tensor
+    moe_tactics: dict[int, tuple[int, int]] | None = None
 
     def decode(self, topk_ids):
         if not topk_ids.is_contiguous():
@@ -133,6 +193,17 @@ def prepare_resident_nvfp4_scales(experts, layer):
     )
     codecs = tuple(c.to_gpu(device) for c in encoded)
     resident = ResidentNvfp4Scales(codecs, scratch, all_ids, selected)
+    if getattr(config.kernel_config, "qwen4_exp_sm120_moe_tactics", False):
+        if (
+            tuple(layer.w13_weight.shape) != (512, 1280, 1280)
+            or tuple(layer.w2_weight.shape) != (512, 2560, 320)
+            or experts.out_dtype != torch.bfloat16
+            or experts.moe_config.experts_per_token != 10
+        ):
+            raise ValueError(
+                "SM120 MoE tactics require BF16 NVFP4 E512/top10/H2560/I640"
+            )
+        resident.moe_tactics = _validated_sm120_moe_tactics(device.index)
     decode_palette_pair(codecs, scratch, all_ids)
     experts.quant_config._w1.scale = scratch[0].view(torch.float8_e4m3fn)
     experts.quant_config._w2.scale = scratch[1].view(torch.float8_e4m3fn)
