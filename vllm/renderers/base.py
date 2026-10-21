@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
+import json
 import os
 import threading
 import time
@@ -15,6 +16,7 @@ from functools import cached_property
 from threading import Lock
 from typing import TYPE_CHECKING, Any, Generic, overload
 
+import regex as re
 from typing_extensions import TypeVar
 
 from vllm.exceptions import VLLMValidationError
@@ -77,49 +79,181 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-# A long chat prompt repeats its first turn (the system prompt) on every request
-# of a conversation, and tokenizing ~10k tokens costs ~13 ms each time. Prompts
-# at least this long are split where their second turn opens: the first turn's
-# token ids come from a small LRU and only the rest is tokenized. HF tokenizers
-# cut the input at special tokens before running the model, so a split at one
-# is token-identical to tokenizing the whole text. 0 turns the cache off.
+# Long chat prompts repeat most of their text from request to request: the
+# system prompt, the tools and every earlier turn. HF fast tokenizers split
+# the input at added tokens before normalizing and pre-tokenizing it, so for a
+# tokenizer whose added tokens are neither normalized nor whitespace-stripping
+# and that adds no marker only at the very start of the input, the ids of each
+# piece between two added tokens do not depend on its neighbours. Prompts at
+# least this long are therefore encoded piece by piece: pieces seen before come
+# from an LRU bounded by cached characters, the rest are encoded in one batch.
+# 0 turns the cache off.
 _PREFIX_TOKEN_CACHE_MIN_CHARS = int(
     os.getenv("VLLM_PREFIX_TOKEN_CACHE_MIN_CHARS", "16384")
 )
-_PREFIX_TOKEN_CACHE_SIZE = 32
-# Gemma4's turn opener; a tokenizer without it as a special token is never split
-_PREFIX_TOKEN_CACHE_MARKER = "<|turn>"
-_prefix_token_cache: "OrderedDict[tuple[int, str], tuple[int, ...]]" = OrderedDict()
-_prefix_token_cache_lock = threading.Lock()
+_TOKEN_CHUNK_CACHE_MAX_CHARS = int(
+    os.getenv("VLLM_TOKEN_CHUNK_CACHE_MAX_CHARS", str(32 * 2**20))
+)
+# Shorter pieces cost less to encode than to hash and look up.
+_TOKEN_CHUNK_MIN_CHARS = 256
+# Every Nth prompt served partly from the cache is also encoded whole and
+# compared; a mismatch turns the cache off for that tokenizer.
+_TOKEN_CHUNK_VERIFY_EVERY = 1024
+
+
+def _added_token_splitter(tokenizer: Any) -> tuple[re.Pattern, dict] | None:
+    """Splitter at the tokenizer's added tokens and their ids, or None when
+    piecewise encoding could differ from encoding the whole text."""
+    backend = getattr(tokenizer, "backend_tokenizer", None)
+    if backend is None:
+        return None
+    try:
+        spec = json.loads(backend.to_str())
+    except Exception:
+        return None
+    added = spec.get("added_tokens") or []
+    if not added or any(
+        t.get("normalized")
+        or t.get("lstrip")
+        or t.get("rstrip")
+        or t.get("single_word")
+        for t in added
+    ):
+        return None
+
+    def first_only(node: Any) -> bool:
+        if isinstance(node, dict):
+            if node.get("prepend_scheme") == "first":
+                return True
+            return any(first_only(v) for v in node.values())
+        if isinstance(node, list):
+            return any(first_only(v) for v in node)
+        return False
+
+    if first_only(spec.get("pre_tokenizer")) or first_only(spec.get("normalizer")):
+        return None
+    ids = {t["content"]: t["id"] for t in added}
+    contents = sorted(ids, key=len, reverse=True)
+    return re.compile("(" + "|".join(map(re.escape, contents)) + ")"), ids
+
+
+class _TokenChunkCache:
+    """Token ids of prompt pieces between added tokens, LRU by cached chars."""
+
+    def __init__(self, max_chars: int) -> None:
+        self.max_chars = max_chars
+        self._entries: OrderedDict[tuple[int, str], list[int]] = OrderedDict()
+        self._chars = 0
+        self._lock = threading.Lock()
+        self._splitters: dict[int, tuple[re.Pattern, dict] | None] = {}
+        self._served = 0
+        self.hit_chars = 0
+        self.miss_chars = 0
+
+    def _splitter(self, tokenizer: Any) -> tuple[re.Pattern, dict] | None:
+        key = id(tokenizer)
+        if key not in self._splitters:
+            splitter = _added_token_splitter(tokenizer)
+            if splitter is not None and not self._self_test(tokenizer, *splitter):
+                splitter = None
+            self._splitters[key] = splitter
+        return self._splitters[key]
+
+    def _self_test(self, tokenizer: Any, pattern: re.Pattern, ids: dict) -> bool:
+        token = next(iter(ids))
+        probe = (
+            f"  lead{token}\n line\tend {token} é ü 漢字 mixed\n\n{token}{token}x "
+            f"y{token}  {token}\n"
+        )
+        return (
+            self._encode(tokenizer, probe, pattern, ids, cache=False)
+            == (tokenizer(probe, add_special_tokens=False)["input_ids"])
+        )
+
+    def _encode(
+        self,
+        tokenizer: Any,
+        text: str,
+        pattern: re.Pattern,
+        ids: dict,
+        cache: bool = True,
+    ) -> list[int]:
+        key = id(tokenizer)
+        pieces: list[list[int] | None] = []
+        missing: list[tuple[int, str]] = []
+        for i, part in enumerate(pattern.split(text)):
+            if not part:
+                continue
+            if i % 2:
+                pieces.append([ids[part]])
+                continue
+            hit = None
+            if cache and len(part) >= _TOKEN_CHUNK_MIN_CHARS:
+                with self._lock:
+                    hit = self._entries.get((key, part))
+                    if hit is not None:
+                        self._entries.move_to_end((key, part))
+            if hit is None:
+                missing.append((len(pieces), part))
+            else:
+                self.hit_chars += len(part)
+            pieces.append(hit)
+        if missing:
+            # The backend call returns the same ids as tokenizer(...) without
+            # building a BatchEncoding; the periodic check compares the two.
+            backend = tokenizer.backend_tokenizer
+            encoded = backend.encode_batch(
+                [p for _, p in missing], add_special_tokens=False
+            )
+            for (slot, part), piece_ids in zip(missing, (e.ids for e in encoded)):
+                pieces[slot] = piece_ids
+                if cache:
+                    self.miss_chars += len(part)
+                if cache and len(part) >= _TOKEN_CHUNK_MIN_CHARS:
+                    with self._lock:
+                        if (key, part) not in self._entries:
+                            self._entries[(key, part)] = piece_ids
+                            self._chars += len(part)
+                        while self._chars > self.max_chars and self._entries:
+                            (_, old), _ = self._entries.popitem(last=False)
+                            self._chars -= len(old)
+        return [t for piece in pieces if piece is not None for t in piece]
+
+    def encode(self, tokenizer: Any, text: str) -> list[int] | None:
+        """Token ids of `text` without added special tokens, or None when the
+        cache does not apply."""
+        if (
+            not _PREFIX_TOKEN_CACHE_MIN_CHARS
+            or len(text) < _PREFIX_TOKEN_CACHE_MIN_CHARS
+            or self.max_chars <= 0
+        ):
+            return None
+        splitter = self._splitter(tokenizer)
+        if splitter is None:
+            return None
+        hits_before = self.hit_chars
+        result = self._encode(tokenizer, text, *splitter)
+        if self.hit_chars > hits_before:
+            self._served += 1
+            if self._served % _TOKEN_CHUNK_VERIFY_EVERY == 0:
+                full = tokenizer(text, add_special_tokens=False)["input_ids"]
+                if full != result:
+                    logger.warning(
+                        "Token chunk cache disagreed with a full encode; "
+                        "disabling it for this tokenizer."
+                    )
+                    self._splitters[id(tokenizer)] = None
+                    return full
+        return result
+
+
+_token_chunk_cache = _TokenChunkCache(_TOKEN_CHUNK_CACHE_MAX_CHARS)
 
 
 def _encode_with_prefix_cache(tokenizer: Any, text: str) -> list[int] | None:
-    """Token ids of `text` (no special tokens added), reusing the cached ids of
-    everything before its second turn; None when `text` does not qualify."""
-    marker = _PREFIX_TOKEN_CACHE_MARKER
-    if (
-        not _PREFIX_TOKEN_CACHE_MIN_CHARS
-        or len(text) < _PREFIX_TOKEN_CACHE_MIN_CHARS
-        or marker not in getattr(tokenizer, "all_special_tokens", ())
-    ):
-        return None
-    first = text.find(marker)
-    second = text.find(marker, first + len(marker)) if first >= 0 else -1
-    if second < 0:
-        return None
-    prefix, rest = text[:second], text[second:]
-    key = (id(tokenizer), prefix)
-    with _prefix_token_cache_lock:
-        ids = _prefix_token_cache.get(key)
-        if ids is not None:
-            _prefix_token_cache.move_to_end(key)
-    if ids is None:
-        ids = tuple(tokenizer(prefix, add_special_tokens=False)["input_ids"])
-        with _prefix_token_cache_lock:
-            _prefix_token_cache[key] = ids
-            while len(_prefix_token_cache) > _PREFIX_TOKEN_CACHE_SIZE:
-                _prefix_token_cache.popitem(last=False)
-    return [*ids, *tokenizer(rest, add_special_tokens=False)["input_ids"]]
+    """Token ids of `text` (no special tokens added) from the chunk cache; None
+    when `text` does not qualify."""
+    return _token_chunk_cache.encode(tokenizer, text)
 
 
 _T = TypeVar("_T", bound=TokenizerLike, default=TokenizerLike)
