@@ -159,5 +159,7 @@ and state export fail explicitly while scales alias mutable shared buffers.
 
 Compression adds reconstruction work. Measure GPU KV capacity, decode,
 uncached prefill and energy on the intended workload before enabling it.
+Decode and short-prefill batches select active experts with a GPU histogram;
+large prefills reconstruct all experts without route preparation.
 The independent `--use-replayssm` option enables Qwen GDN/PLE RecoverSSM with
 MTP; it can be evaluated separately or together with resident compression.
