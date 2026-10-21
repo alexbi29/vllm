@@ -163,3 +163,33 @@ Decode and short-prefill batches select active experts with a GPU histogram;
 large prefills reconstruct all experts without route preparation.
 The independent `--use-replayssm` option enables Qwen GDN/PLE RecoverSSM with
 MTP; it can be evaluated separately or together with resident compression.
+
+The following kernel options also default off:
+
+- `qwen4_exp_sm120_bf16_gemm` selects measured small-row BF16 projection
+  plans in the target and MTP models. Other row counts use the standard linear
+  implementation.
+- `qwen4_exp_sm120_moe_tactics` selects offline FlashInfer CUTLASS MoE
+  tactics for the measured E512/top10/H2560/I640 shapes. It requires resident
+  scale compression and FlashInfer 0.7.2; startup checks the native tactic
+  table. Other row counts retain default dispatch.
+- `qwen4_exp_sm120_qsa_prefill` selects a one-split, 32-key QSA tile for BF16
+  prefills with two local KV heads and at least 2048 rows.
+
+To evaluate all three with the serving configuration above, use
+`--use-replayssm` and replace its kernel configuration with:
+
+```json
+{
+  "nvfp4_scale_compression": true,
+  "qwen4_exp_sm120_bf16_gemm": true,
+  "qwen4_exp_sm120_moe_tactics": true,
+  "qwen4_exp_sm120_qsa_prefill": true
+}
+```
+
+These plans were measured on an RTX PRO 6000 at a fixed 450 W power limit.
+They preserve the weight format and BF16 KV cache, but different GEMM and
+attention reductions can change logits and generated continuations. Evaluate
+quality, throughput, prefill and GPU-board energy on the intended workload
+before enabling them.
