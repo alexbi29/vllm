@@ -306,6 +306,9 @@ class KernelConfig:
     Weight mutation, export, sleep and overlapping execution are unsupported.
     """
 
+    qwen4_exp_sm120_bf16_gemm: bool = False
+    """Use measured BF16 small-row projection plans for Qwen4Exp on SM120."""
+
     monokernel: bool = False
     """If True, run the eligible layers of decode steps on the model's
     MonoKernel: a persistent kernel that runs most or all of one decoder layer
