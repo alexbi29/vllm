@@ -163,6 +163,11 @@ Decode and short-prefill batches select active experts with a GPU histogram;
 large prefills reconstruct all experts without route preparation.
 The independent `--use-replayssm` option enables Qwen GDN/PLE RecoverSSM with
 MTP; it can be evaluated separately or together with resident compression.
+Rebuild the native extension to use fused CUDA RecoverSSM verification for
+pure speculative-decode batches: recurrence, gated RMSNorm and the output gate
+run together. A native library without the replay operator falls back to
+Triton. `VLLM_GDN_DECODE_KERNEL=triton` explicitly selects Triton verification.
+Evaluate output quality as well as speed when changing this kernel path.
 
 The following kernel options also default off:
 
