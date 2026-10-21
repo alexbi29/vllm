@@ -309,6 +309,9 @@ class KernelConfig:
     qwen4_exp_sm120_bf16_gemm: bool = False
     """Use measured BF16 small-row projection plans for Qwen4Exp on SM120."""
 
+    qwen4_exp_sm120_moe_tactics: bool = False
+    """Use offline CUTLASS tactics with resident Qwen4Exp NVFP4 scales."""
+
     monokernel: bool = False
     """If True, run the eligible layers of decode steps on the model's
     MonoKernel: a persistent kernel that runs most or all of one decoder layer
@@ -518,6 +521,10 @@ class KernelConfig:
                         "offload or scale compression."
                     )
 
+        if self.qwen4_exp_sm120_moe_tactics and not self.nvfp4_scale_compression:
+            raise ValueError(
+                "Qwen4Exp SM120 MoE tactics require nvfp4_scale_compression"
+            )
         if self.nvfp4_scale_compression:
             from vllm.model_executor.layers.quantization.utils.nvfp4_resident import (
                 validate_nvfp4_scale_compression,
