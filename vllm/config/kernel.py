@@ -315,6 +315,9 @@ class KernelConfig:
     qwen4_exp_sm120_qsa_prefill: bool = False
     """Use one-split BF16 QSA prefills for two KV heads on SM120."""
 
+    qwen4_exp_sm120_hc_up_mix: bool = False
+    """Fuse measured BF16 HC up projections and stream mixing on SM120."""
+
     monokernel: bool = False
     """If True, run the eligible layers of decode steps on the model's
     MonoKernel: a persistent kernel that runs most or all of one decoder layer

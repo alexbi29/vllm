@@ -26,6 +26,7 @@ import torch
 from torch import nn
 
 import vllm.envs as envs
+from vllm.config import get_current_vllm_config_or_none
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     ReplicatedLinear,
@@ -78,6 +79,16 @@ class GatedResidual(nn.Module):
         self.hc_count = config.hc_count
         self.hidden_size = config.hidden_size
         self.use_combine = use_combine
+        vllm_config = get_current_vllm_config_or_none()
+        self._use_sm120_hc_up_mix = (
+            vllm_config is not None
+            and vllm_config.kernel_config.qwen4_exp_sm120_hc_up_mix
+            and current_platform.is_device_capability(120)
+            and config.hc_count == 4
+            and config.hc_lowrank == 320
+            and config.hidden_size == 2560
+            and config.params_dtype == torch.bfloat16
+        )
 
         norm_size = (
             self.hyper_hidden_size if config.hc_per_branch_norm else config.hidden_size
@@ -169,8 +180,7 @@ class GatedResidual(nn.Module):
         )
 
         lowrank, injection = self._down_and_inject(xn)
-        gate = self.input_mix_weight_up(lowrank)  # [M, D]
-        block_input = hc_gate_mix(xn, gate, self.hc_count)
+        block_input = self._gate_mix(lowrank, xn)
 
         return hidden_states, block_input, injection
 
@@ -197,10 +207,21 @@ class GatedResidual(nn.Module):
         )
 
         lowrank, injection = self._down_and_inject(xn)
-        gate = self.input_mix_weight_up(lowrank)  # [M, D]
-        block_input = hc_gate_mix(xn, gate, self.hc_count)
+        block_input = self._gate_mix(lowrank, xn)
 
         return hidden_states, block_input, injection
+
+    def _gate_mix(self, lowrank: torch.Tensor, xn: torch.Tensor) -> torch.Tensor:
+        if (
+            self._use_sm120_hc_up_mix
+            and not envs.VLLM_BATCH_INVARIANT
+            and lowrank.shape[0] in (6912, 8191, 8192)
+        ):
+            from .ops.hc_up_mix import hc_up_mix
+
+            return hc_up_mix(lowrank, self.input_mix_weight_up.weight, xn)
+        gate = self.input_mix_weight_up(lowrank)
+        return hc_gate_mix(xn, gate, self.hc_count)
 
     def combine(
         self,

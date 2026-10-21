@@ -470,6 +470,12 @@ class Qwen4ExpLowLatencyEmbeddingMethod(
 
 
 def _qwen4_exp_low_latency_gemm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    if current_platform.is_device_capability(120) and not envs.VLLM_BATCH_INVARIANT:
+        from .ops.sm120_gemm import sm120_projection_gemm
+
+        out = sm120_projection_gemm(x, weight)
+        if out is not None:
+            return out
     plans = QWEN4_EXP_GEMM_PLANS_BY_CAPABILITY.get(
         current_platform.get_device_capability(), {}
     )
