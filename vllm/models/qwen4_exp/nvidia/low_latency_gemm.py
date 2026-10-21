@@ -11,6 +11,8 @@ import torch
 from torch import nn
 
 import vllm.envs as envs
+from vllm.config import get_current_vllm_config_or_none
+from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear.cute_dsl.skinny_gemm import (
     SkinnyGemmConfig,
     row_stride_ok,
@@ -23,6 +25,66 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
+
+logger = init_logger(__name__)
+
+# RTX PRO 6000 SM120/TP1 plans, confirmed on checkpoint weights with warm
+# and cold-L2 CUDA graph timing. Unmeasured rows retain the standard linear.
+QWEN4_EXP_SM120_GEMM_PLANS: dict[tuple[int, int], dict[int, SkinnyGemmConfig]] = {
+    # gdn qkvz.
+    (16384, 2560): {
+        1: SkinnyGemmConfig(1, 128, 4, k_unroll=2, vector_width=4, static_k=2560),
+        2: SkinnyGemmConfig(2, 128, 4, k_unroll=2, vector_width=4, static_k=2560),
+        4: SkinnyGemmConfig(4, 128, 2, k_unroll=2, vector_width=4, static_k=2560),
+    },
+    # attn out.
+    (2560, 6144): {
+        1: SkinnyGemmConfig(1, 64, 4, k_unroll=2, vector_width=4, static_k=6144),
+        2: SkinnyGemmConfig(2, 128, 1, k_unroll=4, vector_width=2, static_k=6144),
+        4: SkinnyGemmConfig(4, 128, 1, k_unroll=2, vector_width=4, static_k=6144),
+    },
+    # qsa qkv.
+    (13952, 2560): {
+        1: SkinnyGemmConfig(1, 128, 2, k_unroll=2, vector_width=4, static_k=2560),
+        2: SkinnyGemmConfig(2, 64, 2, k_unroll=2, vector_width=4, static_k=2560),
+        4: SkinnyGemmConfig(4, 128, 2, k_unroll=2, vector_width=4, static_k=2560),
+        8: SkinnyGemmConfig(8, 64, 4, k_unroll=2, vector_width=4, static_k=2560),
+        16: SkinnyGemmConfig(16, 32, 2, k_unroll=2, vector_width=4, static_k=2560),
+    },
+    # router.
+    (512, 2560): {
+        1: SkinnyGemmConfig(1, 64, 4, k_unroll=2, vector_width=4, static_k=2560),
+        2: SkinnyGemmConfig(2, 128, 1, k_unroll=2, vector_width=4, static_k=2560),
+        4: SkinnyGemmConfig(4, 128, 4, k_unroll=2, vector_width=4, static_k=2560),
+        8: SkinnyGemmConfig(8, 64, 1, k_unroll=2, vector_width=8, static_k=2560),
+    },
+    # gdn ba.
+    (96, 2560): {
+        1: SkinnyGemmConfig(1, 128, 2, k_unroll=2, vector_width=4, static_k=2560),
+        2: SkinnyGemmConfig(2, 128, 2, k_unroll=2, vector_width=4, static_k=2560),
+        4: SkinnyGemmConfig(4, 128, 2, k_unroll=2, vector_width=4, static_k=2560),
+        8: SkinnyGemmConfig(8, 128, 1, k_unroll=2, vector_width=4, static_k=2560),
+        16: SkinnyGemmConfig(16, 128, 1, k_unroll=2, vector_width=4, static_k=2560),
+    },
+    # shared up.
+    (1280, 2560): {
+        1: SkinnyGemmConfig(1, 128, 1, k_unroll=2, vector_width=4, static_k=2560),
+        2: SkinnyGemmConfig(2, 128, 1, k_unroll=2, vector_width=4, static_k=2560),
+        4: SkinnyGemmConfig(4, 64, 1, k_unroll=2, vector_width=4, static_k=2560),
+        8: SkinnyGemmConfig(8, 128, 1, k_unroll=2, vector_width=4, static_k=2560),
+    },
+    # shared down.
+    (2560, 640): {
+        1: SkinnyGemmConfig(1, 64, 4, k_unroll=4, vector_width=2, static_k=640),
+        2: SkinnyGemmConfig(2, 64, 4, k_unroll=4, vector_width=2, static_k=640),
+        4: SkinnyGemmConfig(4, 32, 2, k_unroll=2, vector_width=4, static_k=640),
+        8: SkinnyGemmConfig(8, 32, 2, k_unroll=2, vector_width=4, static_k=640),
+    },
+    # lm head.
+    (248320, 2560): {
+        1: SkinnyGemmConfig(1, 32, 1, k_unroll=2, vector_width=2, static_k=2560),
+    },
+}
 
 QWEN4_EXP_SM103_GEMM_PLANS: dict[tuple[int, int], dict[int, SkinnyGemmConfig]] = {
     # GDN fused QKVZ projection, TP=4.
@@ -360,6 +422,7 @@ QWEN4_EXP_GEMM_PLANS_BY_CAPABILITY: dict[
     (10, 0): QWEN4_EXP_SM100_GEMM_PLANS,
     (9, 0): QWEN4_EXP_SM90_GEMM_PLANS,
     (12, 1): QWEN4_EXP_SM121_GEMM_PLANS,
+    (12, 0): QWEN4_EXP_SM120_GEMM_PLANS,
 }
 
 
@@ -438,15 +501,19 @@ def enable_qwen4_exp_low_latency_gemm(
     module: nn.Module,
     dtype: torch.dtype,
 ) -> None:
-    plans = QWEN4_EXP_GEMM_PLANS_BY_CAPABILITY.get(
-        current_platform.get_device_capability(), {}
-    )
+    capability = current_platform.get_device_capability()
+    if capability == (12, 0):
+        config = get_current_vllm_config_or_none()
+        if config is None or not config.kernel_config.qwen4_exp_sm120_bf16_gemm:
+            return
+    plans = QWEN4_EXP_GEMM_PLANS_BY_CAPABILITY.get(capability, {})
     if dtype != torch.bfloat16 or not plans:
         return
     if not shape_dynamic_skinny_gemm.is_available():
         return
 
     warmup_configs: set[SkinnyGemmConfig] = set()
+    installed = 0
     for child in module.modules():
         is_linear = (
             isinstance(child, LinearBase)
@@ -469,6 +536,13 @@ def enable_qwen4_exp_low_latency_gemm(
         else:
             child.quant_method = Qwen4ExpLowLatencyEmbeddingMethod()
         warmup_configs.update(plan.values())
+        installed += 1
 
     if warmup_configs:
         shape_dynamic_skinny_gemm.request_warmup_configs(dtype, warmup_configs)
+        if capability == (12, 0):
+            logger.info(
+                "Qwen4Exp SM120 BF16 GEMM: %d projections, %d warmup plans",
+                installed,
+                len(warmup_configs),
+            )

@@ -109,6 +109,12 @@ QWEN4_EXP_SM121_CASES = [
     for num_tokens, config in plans.items()
 ]
 
+QWEN4_EXP_SM120_CASES = [
+    (n, k, num_tokens, config)
+    for (n, k), plans in qwen4_exp_gemm.QWEN4_EXP_SM120_GEMM_PLANS.items()
+    for num_tokens, config in plans.items()
+]
+
 EXPECTED_CUTE_CONFIGS = {
     (3072, 7168, 1): (224, 3, 4, 8),
     (3072, 7168, 2): (128, 3, 2, 8),
@@ -789,7 +795,7 @@ def test_qwen4_exp_hopper_plans_are_valid() -> None:
         ((10, 0), qwen4_exp_gemm.QWEN4_EXP_SM100_GEMM_PLANS),
         ((9, 0), qwen4_exp_gemm.QWEN4_EXP_SM90_GEMM_PLANS),
         ((12, 1), qwen4_exp_gemm.QWEN4_EXP_SM121_GEMM_PLANS),
-        ((12, 0), {}),
+        ((12, 0), qwen4_exp_gemm.QWEN4_EXP_SM120_GEMM_PLANS),
         ((8, 0), {}),
     ],
 )
@@ -1102,6 +1108,50 @@ def test_maybe_use_skinny_gemm(
     maybe_use_skinny_gemm(layer)
 
     assert getattr(layer, "use_skinny_gemm", False) is expected
+
+
+@pytest.mark.parametrize("n,k,num_tokens,config", QWEN4_EXP_SM120_CASES)
+def test_qwen4_exp_sm120_selected_shapes_replay(
+    n: int,
+    k: int,
+    num_tokens: int,
+    config: SkinnyGemmConfig,
+) -> None:
+    _require_capability_and_cute((12, 0))
+    torch.manual_seed(42 + num_tokens)
+    storage = torch.randn(num_tokens, k + 16, device="cuda", dtype=torch.bfloat16)
+    x = storage[:, 8 : k + 8]
+    weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+    shape_dynamic_skinny_gemm = qwen4_exp_gemm.shape_dynamic_skinny_gemm
+    shape_dynamic_skinny_gemm(x, weight, config)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        output = torch.ops.vllm.qwen4_exp_low_latency_gemm(x, weight)
+    torch.cuda.current_stream().wait_stream(stream)
+    for _ in range(3):
+        x.copy_(torch.randn_like(x))
+        graph.replay()
+        allow_tf32 = torch.backends.cuda.matmul.allow_tf32
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = False
+            reference = torch.nn.functional.linear(x.float(), weight.float())
+        finally:
+            torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+        # Torch's BF16 reduced-precision reduction is not an FP32 reference.
+        torch.testing.assert_close(output.float(), reference, rtol=4e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize("num_tokens", [3, 17])
+def test_qwen4_exp_sm120_unmeasured_rows_keep_torch(num_tokens: int) -> None:
+    _require_capability_and_cute((12, 0))
+    x = torch.randn(num_tokens, 2560, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(96, 2560, device="cuda", dtype=torch.bfloat16)
+    output = torch.ops.vllm.qwen4_exp_low_latency_gemm(x, weight)
+    torch.testing.assert_close(
+        output, torch.nn.functional.linear(x, weight), rtol=0, atol=0
+    )
 
 
 def test_glm52_q_b_nonpacked_single_row_falls_back() -> None:
