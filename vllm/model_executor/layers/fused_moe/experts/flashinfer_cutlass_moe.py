@@ -370,6 +370,15 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
             fc1_expert_weights = w1
             fc2_expert_weights = w2
 
+        finalize_kwargs: dict[str, bool | list[int]] = {}
+        if (
+            activation == MoEActivation.SILU
+            and self._nvfp4_resident is not None
+            and self._nvfp4_resident.moe_tactics is not None
+        ):
+            profile = self._nvfp4_resident.moe_tactics.get(hidden_states.shape[0])
+            if profile is not None:
+                finalize_kwargs["profile_ids"] = list(profile)
         _ = flashinfer_cutlass_fused_moe(
             input=hidden_states,
             token_selected_experts=topk_ids.to(torch.int),
@@ -394,6 +403,7 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
             use_deepseek_fp8_block_scale=self.use_deepseek_fp8_block_scale,
             use_mxfp8_act_scaling=use_mxfp8_act_scaling,
             use_w4_group_scaling=use_w4_group_scaling,
+            **finalize_kwargs,
         )
 
     def moe_sum(self, input: torch.Tensor, output: torch.Tensor) -> None:
