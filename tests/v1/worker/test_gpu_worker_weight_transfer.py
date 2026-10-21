@@ -271,5 +271,6 @@ def test_nvfp4_scales_reject_weight_access_before_mutation(operation):
     }.get(operation, ())
     with pytest.raises(RuntimeError, match="NVFP4 scale compression"):
         getattr(worker, operation)(*args)
+    assert isinstance(worker.model_runner, _RecordingModelRunner)
     assert worker.model_runner.seen_config is None
     assert not engine.started and not engine.update_calls
