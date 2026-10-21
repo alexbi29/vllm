@@ -1902,7 +1902,11 @@ def test_native_nvfp4_scale_palette_graph_preserves_routes_and_scratch(device):
 
 
 @pytest.mark.parametrize("device", range(torch.accelerator.device_count()))
-def test_native_nvfp4_resident_graph_selects_only_current_experts(device):
+@pytest.mark.parametrize("route_width", [4, 20])
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_native_nvfp4_resident_graph_selects_only_current_experts(
+    device, route_width, dtype
+):
     """A replay must replace stale route IDs and preserve inactive scratch rows."""
     import numpy as np
 
@@ -1927,18 +1931,27 @@ def test_native_nvfp4_resident_graph_selects_only_current_experts(device):
             torch.arange(13, dtype=torch.int32, device=device),
             torch.empty(13, dtype=torch.int32, device=device),
         )
-        ids = torch.tensor([1, 1, 7, -1], dtype=torch.int32, device=device)
+        repeats = route_width // 4
+        ids = torch.tensor([1, 1, 7, -1] * repeats, dtype=dtype, device=device)
         resident.decode(ids)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=torch.cuda.Stream(device=device)):
             resident.decode(ids)
-        for route in ([1, 1, 7, -1], [11, 5, 2, 0], [-1, -1, -1, -1]):
-            ids.copy_(torch.tensor(route, dtype=torch.int32, device=device))
+        for frame in (
+            [1, 1, 7, -1],
+            [11, 5, 2, 0],
+            [-1, -1, -1, -1],
+            [0, 13, -1, torch.iinfo(dtype).max],
+        ):
+            route = frame * repeats
+            ids.copy_(torch.tensor(route, dtype=dtype, device=device))
             for out in scratch:
                 out.fill_(0xA5)
             graph.replay()
             for out, reference in zip(scratch, values):
                 expected = np.full(reference.shape, 0xA5, dtype=np.uint8)
-                for expert in set(route) - {-1}:
+                for expert in set(route):
+                    if not 0 <= expert < 13:
+                        continue
                     expected[expert] = reference[expert]
                 np.testing.assert_array_equal(out.cpu().numpy(), expected)

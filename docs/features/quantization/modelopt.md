@@ -154,3 +154,33 @@ export VLLM_TEST_MODELOPT_FP8_PC_PT_MODEL_PATH=<path_to_fp8_pc_pt_checkpoint>
 export VLLM_TEST_MODELOPT_FP8_PB_WO_MODEL_PATH=<path_to_fp8_pb_wo_checkpoint>
 pytest -q tests/quantization/test_modelopt.py
 ```
+
+## Resident Qwen4Exp NVFP4 scales on SM120
+
+Qwen3.8-Flash-Next NVFP4 can retain routed-expert block scales in a lossless
+four-bit encoding with exact byte exceptions. Active experts reconstruct into
+one shared native-layout buffer pair before the existing FlashInfer CUTLASS
+GEMMs. The FP4 weights, scale values and MTP expert weights are unchanged.
+
+```bash
+vllm serve nvidia/Qwen3.8-Flash-Next-NVFP4 \
+  --engram-config '{"cpu_offload":true}' \
+  --tensor-parallel-size 1 --no-async-scheduling \
+  --max-model-len 262144 --max-num-seqs 16 --max-num-batched-tokens 8192 \
+  --gpu-memory-utilization 0.97 --dtype bfloat16 --kv-cache-dtype bfloat16 \
+  --kernel-config '{"nvfp4_scale_compression":true}' \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":3}'
+```
+
+This option defaults off and requires SM120, synchronous TP1 execution and
+FlashInfer CUTLASS (selected automatically for the opt-in). EP/EPLB,
+overlapping microbatches, sleep, LoRA and CPU expert-weight offload are
+unsupported. PLE host offload is supported. Weight reload, mutation, checksums
+and state export fail explicitly while scales alias mutable shared buffers.
+
+Compression adds reconstruction work. Measure GPU KV capacity, decode,
+uncached prefill and energy on the intended workload before enabling it.
+Decode and short-prefill batches select active experts with a GPU histogram;
+large prefills reconstruct all experts without route preparation.
+The independent `--use-replayssm` option enables Qwen GDN/PLE RecoverSSM with
+MTP; it can be evaluated separately or together with resident compression.
