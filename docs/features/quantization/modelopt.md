@@ -145,6 +145,8 @@ GEMMs. The FP4 weights, scale values and MTP expert weights are unchanged.
 vllm serve nvidia/Qwen3.8-Flash-Next-NVFP4 \
   --engram-config '{"cpu_offload":true}' \
   --tensor-parallel-size 1 --no-async-scheduling \
+  --max-model-len 262144 --max-num-seqs 16 --max-num-batched-tokens 8192 \
+  --gpu-memory-utilization 0.97 --dtype bfloat16 --kv-cache-dtype bfloat16 \
   --kernel-config '{"nvfp4_scale_compression":true}' \
   --speculative-config '{"method":"mtp","num_speculative_tokens":3}'
 ```
