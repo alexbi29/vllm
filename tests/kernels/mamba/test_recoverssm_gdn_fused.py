@@ -148,10 +148,12 @@ def _valid_positions(d):
 @pytest.mark.parametrize("hv_per_h", [1, 3])
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("strided", [False, True])
+@pytest.mark.parametrize("norm_dtype", [torch.float32, torch.bfloat16])
 def test_replay_matches_native_outputs_and_triton_records(
-    qlens, hv_per_h, state_dtype, strided
+    qlens, hv_per_h, state_dtype, strided, norm_dtype
 ):
     d = _make(qlens, hv_per_h, state_dtype)
+    d["norm_weight"] = d["norm_weight"].to(norm_dtype)
     before = d["state"].clone()
     out = _replay_op(d, strided=strided)
     ref_out, _, _ = _native_op(d)
