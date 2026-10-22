@@ -205,8 +205,8 @@ The following kernel options also default off:
   prefills with two local KV heads and at least 2048 rows.
 - `qwen4_exp_sm120_hc_up_mix` fuses the HC up projection with sigmoid and
   four-stream mixing at 6912, 8191 and 8192 rows. It preserves BF16 gate
-  rounding and requires HC4/H2560/rank320. Other configurations retain the
-  existing HC path.
+  rounding and requires HC4/H2560/rank320 without LoRA. Other configurations
+  retain the existing HC path.
 
 To evaluate these options with the serving configuration above, use
 `--use-replayssm` and replace its kernel configuration with:

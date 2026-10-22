@@ -83,6 +83,7 @@ class GatedResidual(nn.Module):
         self._use_sm120_hc_up_mix = (
             vllm_config is not None
             and vllm_config.kernel_config.qwen4_exp_sm120_hc_up_mix
+            and vllm_config.lora_config is None
             and current_platform.is_device_capability(120)
             and config.hc_count == 4
             and config.hc_lowrank == 320
