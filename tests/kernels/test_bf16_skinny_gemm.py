@@ -1117,6 +1117,7 @@ def test_qwen4_exp_sm120_selected_shapes_replay(
     num_tokens: int,
     config: SkinnyGemmConfig,
 ) -> None:
+    """Selected plans preserve BF16 accuracy and identical-input replay."""
     _require_capability_and_cute((12, 0))
     torch.manual_seed(42 + num_tokens)
     storage = torch.randn(num_tokens, k + 16, device="cuda", dtype=torch.bfloat16)
@@ -1133,14 +1134,12 @@ def test_qwen4_exp_sm120_selected_shapes_replay(
     for _ in range(3):
         x.copy_(torch.randn_like(x))
         graph.replay()
-        allow_tf32 = torch.backends.cuda.matmul.allow_tf32
-        try:
-            torch.backends.cuda.matmul.allow_tf32 = False
-            reference = torch.nn.functional.linear(x.float(), weight.float())
-        finally:
-            torch.backends.cuda.matmul.allow_tf32 = allow_tf32
-        # Torch's BF16 reduced-precision reduction is not an FP32 reference.
-        torch.testing.assert_close(output.float(), reference, rtol=4e-3, atol=1e-3)
+        reference = torch.nn.functional.linear(x.double(), weight.double())
+        torch.testing.assert_close(output.double(), reference, rtol=4e-3, atol=1e-3)
+        repeated = output.clone()
+        for _ in range(3):
+            graph.replay()
+            torch.testing.assert_close(output, repeated, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("num_tokens", [3, 17])
