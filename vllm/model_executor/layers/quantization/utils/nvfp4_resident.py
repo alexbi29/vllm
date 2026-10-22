@@ -21,15 +21,15 @@ from vllm.v1.worker.workspace import current_workspace_manager
 logger = init_logger(__name__)
 
 _SM120_MOE_TACTICS = {
-    4: (12, 44),
-    8: (12, 44),
-    16: (12, 47),
-    64: (12, 45),
-    2048: (13, 47),
-    6912: (14, 25),
-    8000: (9, 42),
-    8191: (10, 42),
-    8192: (10, 25),
+    4: (12, 28),
+    8: (12, 28),
+    16: (12, 31),
+    64: (12, 29),
+    2048: (13, 31),
+    6912: (14, 17),
+    8000: (9, 26),
+    8191: (10, 26),
+    8192: (10, 17),
 }
 
 
@@ -64,13 +64,13 @@ def _validated_sm120_moe_tactics(device_index: int) -> dict[int, tuple[int, int]
                 enable_pdl=device_support_pdl(device),
                 activation_type=ActivationType.Swiglu,
                 use_packed_weights=False,
-                use_fused_finalize=True,
+                use_fused_finalize=False,
                 use_wfp4afp8_humming=False,
             )
             .fused_moe_runner
         )
         counts = (runner.get_gemm1_tactic_count(), runner.get_gemm2_tactic_count())
-        if counts != (16, 32) or any(
+        if counts != (16, 16) or any(
             runner.get_tactic_occupancy(tactic) <= 0
             for pair in _SM120_MOE_TACTICS.values()
             for tactic in pair
