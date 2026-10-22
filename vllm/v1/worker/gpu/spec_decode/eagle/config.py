@@ -34,7 +34,9 @@ def check_draft_lm_head_quantization(spec: SpeculativeConfig) -> None:
 class EagleSpeculatorConfig(DraftModelSpeculatorConfig):
     base_method = "eagle"
     speculator_class = "vllm.v1.worker.gpu.spec_decode.eagle.speculator.EagleSpeculator"
-    supported_options = frozenset({"draft_lm_head_quantization"})
+    supported_options = frozenset(
+        {"draft_lm_head_quantization", "draft_lm_head_token_ranges"}
+    )
     uses_target_hidden_states = True
     supports_watermarking = True
 
@@ -51,6 +53,17 @@ class EagleSpeculatorConfig(DraftModelSpeculatorConfig):
     @classmethod
     def apply_options(cls, spec: SpeculativeConfig) -> None:
         check_draft_lm_head_quantization(spec)
+        if spec.draft_lm_head_token_ranges is not None:
+            from vllm.config.speculative import normalize_token_ranges
+
+            if spec.draft_lm_head_quantization is not None:
+                raise ValueError(
+                    "draft_lm_head_token_ranges and draft_lm_head_quantization "
+                    "are mutually exclusive."
+                )
+            spec.draft_lm_head_token_ranges = normalize_token_ranges(
+                spec.draft_lm_head_token_ranges
+            )
 
     @property
     def num_lookahead_tokens(self) -> int:
