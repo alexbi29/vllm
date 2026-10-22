@@ -361,13 +361,14 @@ def _commit_gdn_state_kernel(
     BK: tl.constexpr,
     BV: tl.constexpr,
     NUM_HEADS: tl.constexpr,
-    BOUNDARY: tl.constexpr,
     GROUPED: tl.constexpr,
 ):
-    # Every program runs one fold and keeps one tile live. In align mode the
-    # block-boundary state (the window's first boundary_len tokens) is folded by a
-    # second launch (BOUNDARY): a crossing window's boundary state goes into its
-    # source block, which the first launch's final-state fold must still read.
+    # Every program runs one fold and keeps one tile live. In align mode a window
+    # crossing a block boundary also stores its state after the first
+    # boundary_len tokens into the boundary block, from the same fold. The
+    # source block may be the final block (MRV2 pre-copies the running state
+    # into the window's last block), so a separate fold reading the source
+    # after the final store would start from the already-committed state.
     pid_v = tl.program_id(0)
     pid_b = tl.program_id(1)
     pid_lh = tl.program_id(2)
@@ -391,14 +392,11 @@ def _commit_gdn_state_kernel(
     final_idx = tl.load(final_state_indices_ptr + plan_idx).to(tl.int64)
     if final_idx <= null_block_id:
         return
-    dst_idx = final_idx
-    if BOUNDARY:
-        dst_idx = tl.load(boundary_state_indices_ptr + plan_idx).to(tl.int64)
-        # A window ending exactly on the boundary keeps its final state in that
-        # block: the first launch already wrote it (and may have overwritten src).
-        if dst_idx <= null_block_id or dst_idx == final_idx:
-            return
-        n = tl.load(boundary_recovery_lens_ptr + plan_idx)
+    # Non-align plans store a null boundary block. A window ending exactly on
+    # the boundary keeps its final state in that block, written below.
+    boundary_idx = tl.load(boundary_state_indices_ptr + plan_idx).to(tl.int64)
+    boundary_len = tl.load(boundary_recovery_lens_ptr + plan_idx)
+    has_boundary = (boundary_idx > null_block_id) & (boundary_idx != final_idx)
     state_ptr = tl.load(state_base_addrs_ptr + pid_l).to(
         tl.pointer_type(state_ref_ptr.dtype.element_ty)
     )
@@ -427,8 +425,13 @@ def _commit_gdn_state_kernel(
         kk = tl.load(rec + (V + offs_k) * stride_replay_dim, mask=mask_k, other=0.0)
         decay = tl.load(rec + (V + K) * stride_replay_dim)
         h = tl.fma(c[:, None], kk[None, :], h * decay)
+        tl.store(
+            state_ptr + boundary_idx * sbs + pid_h * stride_state_head + sp,
+            h.to(state_ref_ptr.dtype.element_ty),
+            mask=mask_state & has_boundary & (t + 1 == boundary_len),
+        )
     tl.store(
-        state_ptr + dst_idx * sbs + pid_h * stride_state_head + sp,
+        state_ptr + final_idx * sbs + pid_h * stride_state_head + sp,
         h.to(state_ref_ptr.dtype.element_ty),
         mask=mask_state,
     )
@@ -734,7 +737,6 @@ class GDNRecoverSSMCommitContext:
         # keep more of them in flight (about 13% more bandwidth than 32 on H200).
         BV = min(triton.next_power_of_2(V), 16)
         rr = self.replays[0]
-        align = block_table is not None
         args = (
             ref,
             self.state_base_addrs,
@@ -760,20 +762,16 @@ class GDNRecoverSSMCommitContext:
             stride_plan_group,
         )
         grid = (triton.cdiv(V, BV), batch, num_layers * HV)
-        # Final states first: a boundary state can land in the window's source
-        # slot, which the final-state fold reads (stream order separates them).
-        for boundary in (False, True) if align else (False,):
-            _commit_gdn_state_kernel[grid](
-                *args,
-                K=K,
-                V=V,
-                BK=BK,
-                BV=BV,
-                NUM_HEADS=HV,
-                BOUNDARY=boundary,
-                num_warps=4,
-                num_stages=2,
-            )
+        _commit_gdn_state_kernel[grid](
+            *args,
+            K=K,
+            V=V,
+            BK=BK,
+            BV=BV,
+            NUM_HEADS=HV,
+            num_warps=4,
+            num_stages=2,
+        )
 
 
 class GDNRecoverSSMGroupedCommit:
