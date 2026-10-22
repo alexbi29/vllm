@@ -62,6 +62,7 @@ from vllm.model_executor.models.qwen3_vl import (
 )
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
+    PPMissingLayer,
     StageMissingLayer,
     WeightsMapper,
     _merge_multimodal_embeddings,
@@ -90,6 +91,7 @@ from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
 from .ops.cute_dsl.hc_down_silu import request_hc_down_silu_warmup
 from .ple_layer import Qwen4ExpPLELayer
 from .qsa import Qwen4ExpQSAAttention
+from .weight_placement import move_embedding_to_host, quantize_dense_fp8
 
 # Transformers v5.18 renamed `qwen_sparse_attention` to `indexed_attention`
 # TODO: Delete qwen_... once Transformers 5.18.0 is the minimum required version.
@@ -682,6 +684,16 @@ class Qwen4ExpModel(nn.Module):
             weights,
             mapper=mapper,
         )
+        if envs.VLLM_QWEN4_EXP_EMBED_TOKENS_HOST and not isinstance(
+            self.embed_tokens, PPMissingLayer
+        ):
+            move_embedding_to_host(self.embed_tokens)
+        if envs.VLLM_QWEN4_EXP_FP8_DENSE:
+            quantize_dense_fp8(
+                self,
+                envs.VLLM_QWEN4_EXP_FP8_DENSE,
+                envs.VLLM_QWEN4_EXP_FP8_DENSE_KERNEL,
+            )
         return loaded
 
 
