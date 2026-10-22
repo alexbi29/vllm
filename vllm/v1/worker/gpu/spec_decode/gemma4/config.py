@@ -8,3 +8,6 @@ class Gemma4MTPSpeculatorConfig(MTPSpeculatorConfig):
         "vllm.v1.worker.gpu.spec_decode.gemma4.speculator.Gemma4Speculator"
     )
     # Inherit MTP head quantization: Gemma quantizes its assistant's own head.
+    supported_options = MTPSpeculatorConfig.supported_options - {
+        "draft_lm_head_token_ranges"
+    }

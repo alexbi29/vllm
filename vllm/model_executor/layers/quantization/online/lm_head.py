@@ -203,3 +203,67 @@ def restore_quantized_lm_heads(model: Module, refresh: bool = True) -> None:
         setattr(module, name, head)
     if refresh:
         refresh_quantized_lm_heads(model)
+
+
+class _LMHeadSubsetMethod(UnquantizedEmbeddingMethod):
+    """Logits over fixed token-id ranges, written into a full -inf row.
+
+    Only for drafters: target verification still uses the full head, so a
+    token outside the ranges can never be proposed, but sampling stays exact.
+    The ranges are row slices of the shared weight, so no memory is copied.
+    """
+
+    def __init__(self, ranges: list[tuple[int, int]]):
+        super().__init__()
+        self.ranges = ranges
+
+    def apply(
+        self, layer: Module, x: torch.Tensor, bias: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        assert bias is None
+        out = torch.full(
+            (*x.shape[:-1], layer.weight.shape[0]),
+            float("-inf"),
+            dtype=x.dtype,
+            device=x.device,
+        )
+        for start, end in self.ranges:
+            out[..., start:end] = torch.nn.functional.linear(x, layer.weight[start:end])
+        return out
+
+
+def subset_lm_head_copy(
+    lm_head: ParallelLMHead, ranges: list[tuple[int, int]]
+) -> ParallelLMHead:
+    """A drafter head that scores only the token ids in `ranges` (TP1)."""
+    if lm_head.tp_size != 1 or not isinstance(
+        lm_head.quant_method, (UnquantizedEmbeddingMethod, UnquantizedLinearMethod)
+    ):
+        raise ValueError("A subset lm_head copy needs an unquantized TP1 lm_head.")
+    vocab = lm_head.weight.shape[0]
+    ranges = sorted((max(0, a), min(vocab, b)) for a, b in ranges if a < b)
+    dtype = lm_head.weight.dtype
+    with set_default_torch_dtype(dtype):
+        head = ParallelLMHead(
+            lm_head.num_embeddings,
+            lm_head.embedding_dim,
+            params_dtype=dtype,
+            org_num_embeddings=lm_head.org_vocab_size,
+            padding_size=lm_head.padding_size,
+            prefix=lm_head.prefix,
+            disable_tp=lm_head.disable_tp,
+            quant_method=_LMHeadSubsetMethod(ranges),
+        )
+    # Never loaded: a new param sharing the source storage, never a copy of it.
+    head.weight = torch.nn.Parameter(lm_head.weight.data, requires_grad=False)
+    for param in head.parameters(recurse=False):
+        if hasattr(param, "weight_loader"):
+            del param.weight_loader
+    get_layerwise_info(head).reset()
+    logger.info(
+        "Drafter lm_head restricted to %d of %d tokens: %s",
+        sum(b - a for a, b in ranges),
+        vocab,
+        ranges,
+    )
+    return head
