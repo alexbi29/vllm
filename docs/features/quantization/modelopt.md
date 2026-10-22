@@ -168,12 +168,18 @@ pure speculative-decode batches: recurrence, gated RMSNorm and the output gate
 run together. A native library without the replay operator falls back to
 Triton. `VLLM_GDN_DECODE_KERNEL=triton` explicitly selects Triton verification.
 Evaluate output quality as well as speed when changing this kernel path.
+Compatible GDN KV groups commit together after sampling; groups with
+incompatible state layouts retain individual commits.
 
 The following kernel options also default off:
 
 - `qwen4_exp_sm120_bf16_gemm` selects measured small-row BF16 projection
-  plans in the target and MTP models. Other row counts use the standard linear
-  implementation.
+  plans in the target and MTP models. Other shapes and row counts retain
+  standard dispatch.
+- `qwen4_exp_sm120_verify_gemm` separately evaluates additional tensor-core
+  and split-K plans at selected verification widths. It needs the BF16 GEMM
+  option. Operator gains did not consistently improve full-model throughput;
+  keep it disabled unless it passes the intended workload's model gates.
 - `qwen4_exp_sm120_moe_tactics` selects offline FlashInfer CUTLASS MoE
   tactics for the measured E512/top10/H2560/I640 shapes. It requires resident
   scale compression and FlashInfer 0.7.2; startup checks the native tactic
@@ -183,8 +189,12 @@ The following kernel options also default off:
   can change logits and response length between identical requests.
 - `qwen4_exp_sm120_qsa_prefill` selects a one-split, 32-key QSA tile for BF16
   prefills with two local KV heads and at least 2048 rows.
+- `qwen4_exp_sm120_hc_up_mix` fuses the HC up projection with sigmoid and
+  four-stream mixing at 6912, 8191 and 8192 rows. It preserves BF16 gate
+  rounding and requires HC4/H2560/rank320. Other configurations retain the
+  existing HC path.
 
-To evaluate all three with the serving configuration above, use
+To evaluate these options with the serving configuration above, use
 `--use-replayssm` and replace its kernel configuration with:
 
 ```json
@@ -192,7 +202,8 @@ To evaluate all three with the serving configuration above, use
   "nvfp4_scale_compression": true,
   "qwen4_exp_sm120_bf16_gemm": true,
   "qwen4_exp_sm120_moe_tactics": true,
-  "qwen4_exp_sm120_qsa_prefill": true
+  "qwen4_exp_sm120_qsa_prefill": true,
+  "qwen4_exp_sm120_hc_up_mix": true
 }
 ```
 
