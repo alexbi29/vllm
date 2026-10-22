@@ -265,7 +265,7 @@ def test_spec_rows_mixed_batch():
         recoverssm_request_indices(rows, 2, torch.device("cuda"))
 
 
-@create_new_process_for_each_test()
+@create_new_process_for_each_test(method="spawn")
 def test_mixed_request_indices_do_not_stage_through_pageable_memory(monkeypatch):
     """Noncontiguous spec rows need a pinned H2D copy during mixed batches."""
     import vllm.utils.gpu_sync_debug as gsd
