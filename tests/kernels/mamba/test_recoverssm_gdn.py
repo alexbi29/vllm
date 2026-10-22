@@ -643,6 +643,20 @@ def test_ptr_table_keeps_top_bit_pointers():
     assert [v & ((1 << 64) - 1) for v in table.tolist()] == ptrs
 
 
+def test_ptr_table_does_not_synchronize_cuda():
+    """Rebuilding address metadata must not wait for queued GPU work."""
+    from vllm.model_executor.layers.mamba.recoverssm_utils import recoverssm_ptr_table
+
+    tensors = [torch.empty(1, device="cuda") for _ in range(2)]
+    saved_mode = torch.cuda.get_sync_debug_mode()
+    try:
+        torch.cuda.set_sync_debug_mode("error")
+        table = recoverssm_ptr_table(tensors, tensors[0].device)
+    finally:
+        torch.cuda.set_sync_debug_mode(saved_mode)
+    assert table.tolist() == [t.data_ptr() for t in tensors]
+
+
 # ---------------------------------------------- grouped commit (several KV groups)
 from vllm.model_executor.layers.mamba.gdn.recoverssm_gdn import (  # noqa: E402
     GDNRecoverSSMGroupedCommit,
@@ -665,6 +679,27 @@ def _group_layers(nb: int, num_layers: int, seed: int):
         for _ in range(num_layers)
     ]
     return conv, ckpt, replay
+
+
+def test_grouped_commit_metadata_does_not_synchronize_cuda():
+    """The grouped context is built lazily by the first real decode step."""
+    groups = [_group_layers(8, n, seed=n) for n in (1, 2)]
+    contexts = [
+        GDNRecoverSSMCommitContext.from_tensors(
+            *group, spec_query_len=T, max_num_reqs=4
+        )
+        for group in groups
+    ]
+    indices = [torch.empty(4, dtype=torch.int32, device="cuda") for _ in groups]
+    saved_mode = torch.cuda.get_sync_debug_mode()
+    try:
+        torch.cuda.set_sync_debug_mode("error")
+        grouped = GDNRecoverSSMGroupedCommit(contexts, max_num_reqs=4)
+        table = grouped._table("state_indices", indices)
+    finally:
+        torch.cuda.set_sync_debug_mode(saved_mode)
+    assert grouped.layer_groups.tolist() == [0, 1, 1]
+    assert table.tolist() == [t.data_ptr() for t in indices]
 
 
 @pytest.mark.parametrize("align", [False, True])
