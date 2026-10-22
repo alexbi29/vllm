@@ -183,6 +183,9 @@ if TYPE_CHECKING:
     VLLM_USE_STANDALONE_COMPILE: bool = True
     VLLM_ENABLE_PREGRAD_PASSES: bool = True
     VLLM_USE_BREAKABLE_CUDAGRAPH: bool = False
+    VLLM_QWEN4_EXP_EMBED_TOKENS_HOST: bool = False
+    VLLM_QWEN4_EXP_FP8_DENSE: str = ""
+    VLLM_QWEN4_EXP_FP8_DENSE_KERNEL: str = ""
     VLLM_DP_MASTER_IP: str = ""
     VLLM_DP_MASTER_PORT: int = 0
     VLLM_RANDOMIZE_DP_DUMMY_INPUTS: bool = False
@@ -801,6 +804,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # https://github.com/pytorch/pytorch/issues/174502
     "VLLM_ENABLE_PREGRAD_PASSES": lambda: (
         os.environ.get("VLLM_ENABLE_PREGRAD_PASSES", "1") == "1"
+    ),
+    # Qwen4Exp: regex of target projections to requantize to block FP8.
+    "VLLM_QWEN4_EXP_FP8_DENSE": lambda: os.environ.get("VLLM_QWEN4_EXP_FP8_DENSE", ""),
+    # Optional FP8 block-scaled kernel class name for those projections.
+    "VLLM_QWEN4_EXP_FP8_DENSE_KERNEL": lambda: os.environ.get(
+        "VLLM_QWEN4_EXP_FP8_DENSE_KERNEL", ""
+    ),
+    # Qwen4Exp: keep the input embedding table in pinned host memory (UVA).
+    "VLLM_QWEN4_EXP_EMBED_TOKENS_HOST": lambda: (
+        os.environ.get("VLLM_QWEN4_EXP_EMBED_TOKENS_HOST", "0") == "1"
     ),
     # Experimental: breakable cudagraph does not rely on torch.compile
     "VLLM_USE_BREAKABLE_CUDAGRAPH": lambda: (
