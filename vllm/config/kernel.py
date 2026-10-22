@@ -292,6 +292,25 @@ class KernelConfig:
     enable_jit_warmup: bool = True
     """If True, run JIT compile warmup during kernel warmup."""
 
+    nvfp4_scale_compression: bool = False
+    """Losslessly compress Qwen4Exp routed NVFP4 scales on SM120.
+
+    Requires synchronous TP1 FlashInfer CUTLASS; draft experts stay unchanged.
+    Weight mutation, export, sleep and overlapping execution are unsupported.
+    """
+
+    qwen4_exp_sm120_bf16_gemm: bool = False
+    """Use measured BF16 small-row projection plans for Qwen4Exp on SM120."""
+
+    qwen4_exp_sm120_moe_tactics: bool = False
+    """Use offline CUTLASS tactics with resident Qwen4Exp NVFP4 scales."""
+
+    qwen4_exp_sm120_qsa_prefill: bool = False
+    """Use one-split BF16 QSA prefills for two KV heads on SM120."""
+
+    qwen4_exp_sm120_hc_up_mix: bool = False
+    """Fuse measured BF16 HC up projections and stream mixing on SM120."""
+
     monokernel: bool = False
     """If True, run the eligible layers of decode steps on the model's
     MonoKernel: a persistent kernel that runs most or all of one decoder layer
@@ -447,6 +466,17 @@ class KernelConfig:
     def set_platform_defaults(self, vllm_config: "VllmConfig") -> None:
         """Set platform-specific defaults for the kernel config."""
         from vllm.platforms import current_platform
+
+        if self.qwen4_exp_sm120_moe_tactics and not self.nvfp4_scale_compression:
+            raise ValueError(
+                "Qwen4Exp SM120 MoE tactics require nvfp4_scale_compression"
+            )
+        if self.nvfp4_scale_compression:
+            from vllm.model_executor.layers.quantization.utils.nvfp4_resident import (
+                validate_nvfp4_scale_compression,
+            )
+
+            validate_nvfp4_scale_compression(vllm_config)
 
         if vllm_config.model_config is not None:
             validate_flashinfer_moe_ep_model(

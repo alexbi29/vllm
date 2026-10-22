@@ -61,6 +61,51 @@ def test_hc_gate_mix() -> None:
     torch.testing.assert_close(actual, expected.to(torch.bfloat16))
 
 
+@pytest.mark.skipif(not current_platform.is_device_capability(120), reason="SM120 plan")
+@pytest.mark.parametrize("rows", [6912, 8191, 8192])
+@pytest.mark.parametrize("strided", [False, True])
+def test_hc_up_mix_keeps_bf16_gate_rounding(rows: int, strided: bool) -> None:
+    from vllm.models.qwen4_exp.nvidia.ops.hc_up_mix import hc_up_mix
+
+    torch.manual_seed(42)
+    padding = 16 if strided else 0
+    a = torch.randn(rows, LORA_RANK + padding, device="cuda").bfloat16() * 0.1
+    x = torch.randn(rows, HYPER_HIDDEN_SIZE + padding, device="cuda").bfloat16()
+    a = a[:, padding // 2 : padding // 2 + LORA_RANK]
+    x = x[:, padding // 2 : padding // 2 + HYPER_HIDDEN_SIZE]
+    w = torch.randn(HYPER_HIDDEN_SIZE, LORA_RANK, device="cuda").bfloat16() * 0.05
+    actual = hc_up_mix(a, w, x)
+    gate = torch.nn.functional.linear(a, w)
+    expected = hc_gate_mix(x, gate, HC)
+    torch.testing.assert_close(actual.float(), expected.float(), atol=0.015, rtol=0.02)
+    delta = actual.float() - expected.float()
+    nrmse = (delta.square().mean() / expected.float().square().mean()).sqrt()
+    assert nrmse.item() < 0.005
+
+
+@pytest.mark.skipif(not current_platform.is_device_capability(120), reason="SM120 plan")
+def test_hc_up_mix_graph_reads_changed_inputs() -> None:
+    from vllm.models.qwen4_exp.nvidia.ops.hc_up_mix import hc_up_mix
+
+    torch.manual_seed(43)
+    a = torch.randn(6912, LORA_RANK, device="cuda").bfloat16() * 0.1
+    x = torch.randn(6912, HYPER_HIDDEN_SIZE, device="cuda").bfloat16()
+    w = torch.randn(HYPER_HIDDEN_SIZE, LORA_RANK, device="cuda").bfloat16() * 0.05
+    hc_up_mix(a, w, x)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = hc_up_mix(a, w, x)
+    for factor in (0.5, -1.5):
+        a.mul_(factor)
+        x.neg_()
+        actual.fill_(float("nan"))
+        graph.replay()
+        expected = hc_gate_mix(x, torch.nn.functional.linear(a, w), HC)
+        torch.testing.assert_close(
+            actual.float(), expected.float(), atol=0.015, rtol=0.02
+        )
+
+
 def test_hc_combine() -> None:
     torch.manual_seed(0)
     block_output = torch.randn(2, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")

@@ -215,3 +215,44 @@ def test_layerwise_reload_of_drafter_keeps_copy(
     assert after.keys() == before.keys()
     for name, tensor in before.items():
         assert torch.equal(after[name], tensor), name
+
+
+@requires_cuda
+def test_token_ranges_head_scores_only_its_ranges(
+    default_vllm_config, dist_init, monkeypatch
+):
+    """Inside the ranges the logits equal the target's; outside they are -inf,
+    and the copy shares (not copies) the target weight, so in-place target
+    updates are seen without re-deriving anything."""
+    from vllm.model_executor.layers.quantization.online.lm_head import (
+        subset_lm_head_copy,
+    )
+
+    head = _target_head(monkeypatch)
+    ranges = [(0, 1000), (3900, VOCAB)]
+    draft_head = subset_lm_head_copy(head, ranges)
+    assert draft_head.weight.data_ptr() == head.weight.data_ptr()
+
+    logits_processor = LogitsProcessor(VOCAB)
+    hidden = torch.randn(64, HIDDEN, device="cuda", dtype=torch.bfloat16)
+    inside = torch.zeros(VOCAB, dtype=torch.bool, device="cuda")
+    for a, b in ranges:
+        inside[a:b] = True
+    for _ in range(2):
+        ref = logits_processor(head, hidden)
+        out = logits_processor(draft_head, hidden)
+        assert out.shape == ref.shape == (64, VOCAB)
+        torch.testing.assert_close(out[:, inside], ref[:, inside], rtol=0, atol=0)
+        assert torch.isneginf(out[:, ~inside]).all()
+        head.weight.data.copy_(_target_head(monkeypatch, seed=1).weight)
+
+
+@pytest.mark.parametrize(
+    "ranges", [[], [[5, 5]], [[-1, 4]], [[0, 4, 8]]], ids=["empty", "eq", "neg", "3"]
+)
+def test_token_ranges_rejects_invalid(ranges):
+    from vllm.config.speculative import normalize_token_ranges
+
+    with pytest.raises(ValueError):
+        normalize_token_ranges(ranges)
+    assert normalize_token_ranges([[0, 8], [10, 12]]) == [(0, 8), (10, 12)]

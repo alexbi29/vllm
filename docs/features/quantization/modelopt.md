@@ -133,3 +133,101 @@ export VLLM_TEST_MODELOPT_FP8_PC_PT_MODEL_PATH=<path_to_fp8_pc_pt_checkpoint>
 export VLLM_TEST_MODELOPT_FP8_PB_WO_MODEL_PATH=<path_to_fp8_pb_wo_checkpoint>
 pytest -q tests/quantization/test_modelopt.py
 ```
+
+## Resident Qwen4Exp NVFP4 scales on SM120
+
+Qwen3.8-Flash-Next NVFP4 can retain routed-expert block scales in a lossless
+four-bit encoding with exact byte exceptions. Active experts reconstruct into
+one shared native-layout buffer pair before the existing FlashInfer CUTLASS
+GEMMs. The FP4 weights, scale values and MTP expert weights are unchanged.
+
+```bash
+vllm serve nvidia/Qwen3.8-Flash-Next-NVFP4 \
+  --engram-config '{"cpu_offload":true}' \
+  --tensor-parallel-size 1 \
+  --max-model-len 262144 --max-num-seqs 16 --max-num-batched-tokens 8192 \
+  --gpu-memory-utilization 0.97 --dtype bfloat16 --kv-cache-dtype bfloat16 \
+  --kernel-config '{"nvfp4_scale_compression":true}' \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":3}'
+```
+
+This option defaults off and requires SM120, TP1 execution and
+FlashInfer CUTLASS (selected automatically for the opt-in). EP/EPLB,
+overlapping microbatches, sleep, LoRA and CPU expert-weight offload are
+unsupported. PLE host offload is supported. Weight reload, mutation, checksums
+and state export fail explicitly while scales alias mutable shared buffers.
+
+Compression adds reconstruction work. Measure GPU KV capacity, decode,
+uncached prefill and energy on the intended workload before enabling it.
+Decode and short-prefill batches select active experts with a GPU histogram;
+large prefills reconstruct all experts without route preparation.
+The independent `--use-replayssm` option enables Qwen GDN/PLE RecoverSSM with
+MTP; it can be evaluated separately or together with resident compression.
+Rebuild the native extension to use fused CUDA RecoverSSM verification for
+pure speculative-decode batches: recurrence, gated RMSNorm and the output gate
+run together. A native library without the replay operator falls back to
+Triton. `VLLM_GDN_DECODE_KERNEL=triton` explicitly selects Triton verification.
+Evaluate output quality as well as speed when changing this kernel path.
+Compatible GDN KV groups commit together after sampling; groups with
+incompatible state layouts retain individual commits.
+
+Async scheduling is supported: forwards stay ordered on one stream, so the
+shared scale buffers are never reused while a layer still reads them.
+
+Two lossless capacity/latency options are independent of the kernel config:
+
+- `VLLM_QWEN4_EXP_EMBED_TOKENS_HOST=1` keeps the target's input embedding
+  table (1.18 GiB) in pinned host memory and reads its rows through UVA. The
+  MTP drafter shares it. Lookups are exact; the freed memory goes to the KV
+  cache.
+- `"draft_lm_head_token_ranges": [[0, 98304], [248000, 248320]]` in
+  `--speculative-config` restricts the MTP drafter's logits to those token-id
+  ranges (row slices of the shared head, no copy). Qwen's BPE ids are roughly
+  frequency ordered, so this drops about 60% of each draft step's head
+  bandwidth at an unchanged acceptance length; target verification is
+  unchanged.
+
+`VLLM_QWEN4_EXP_FP8_DENSE=<regex>` (optionally with
+`VLLM_QWEN4_EXP_FP8_DENSE_KERNEL=CutlassFp8BlockScaledMMKernel`) requantizes
+matching BF16 target projections, e.g. `linear_attn\.(in_proj_qkvz|out_proj)$`,
+to 128x128-block FP8 with dynamic 1x128 activation scales. This is lossy:
+Qwen's own FP8 checkpoint keeps these layers in BF16. Qualify output quality
+before enabling it.
+
+The following kernel options also default off:
+
+- `qwen4_exp_sm120_bf16_gemm` selects measured small-row BF16 projection
+  plans in the target and MTP models. Other shapes and row counts retain
+  standard dispatch.
+- `qwen4_exp_sm120_moe_tactics` selects offline FlashInfer CUTLASS MoE
+  tactics for the measured E512/top10/H2560/I640 shapes. It requires resident
+  scale compression and FlashInfer 0.7.2; startup checks the native tactic
+  table. These plans use deterministic FP32 expert reduction instead of
+  atomic BF16 finalization. Other row counts use default tactics with the
+  same deterministic finalization. Older plans used atomic finalization and
+  can change logits and response length between identical requests.
+- `qwen4_exp_sm120_qsa_prefill` selects a one-split, 32-key QSA tile for BF16
+  prefills with two local KV heads and at least 2048 rows.
+- `qwen4_exp_sm120_hc_up_mix` fuses the HC up projection with sigmoid and
+  four-stream mixing at 6912, 8191 and 8192 rows. It preserves BF16 gate
+  rounding and requires HC4/H2560/rank320 without LoRA. Other configurations
+  retain the existing HC path.
+
+To evaluate these options with the serving configuration above, use
+`--use-replayssm` and replace its kernel configuration with:
+
+```json
+{
+  "nvfp4_scale_compression": true,
+  "qwen4_exp_sm120_bf16_gemm": true,
+  "qwen4_exp_sm120_moe_tactics": true,
+  "qwen4_exp_sm120_qsa_prefill": true,
+  "qwen4_exp_sm120_hc_up_mix": true
+}
+```
+
+These plans were measured on an RTX PRO 6000 at a fixed 450 W power limit.
+They preserve the weight format and BF16 KV cache, but different GEMM and
+attention reductions can change logits and generated continuations. Evaluate
+quality, throughput, prefill and GPU-board energy on the intended workload
+before enabling them.
