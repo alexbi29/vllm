@@ -25,6 +25,7 @@ from vllm.model_executor.layers.mamba.ops.recoverssm import (
     prepare_commit_plan_kernel,
 )
 from vllm.model_executor.layers.mamba.recoverssm_utils import (
+    recoverssm_metadata_tensor,
     recoverssm_ptr_table,
     recoverssm_require,
 )
@@ -511,7 +512,7 @@ class GDNRecoverSSMCommitContext:
         _require(hist > 0, "conv state is shorter than its window")
         dev = ref.device
         addr = lambda ts: recoverssm_ptr_table(ts, dev)
-        bstr = lambda ts: torch.tensor(
+        bstr = lambda ts: recoverssm_metadata_tensor(
             [t.stride(0) for t in ts], dtype=torch.int64, device=dev
         )
         z = lambda: torch.empty(max_num_reqs, dtype=torch.int32, device=dev)
@@ -519,10 +520,10 @@ class GDNRecoverSSMCommitContext:
             tuple(conv_states),
             addr(conv_states),
             bstr(conv_states),
-            torch.tensor(
+            recoverssm_metadata_tensor(
                 [s.stride(1) for s in conv_states], dtype=torch.int64, device=dev
             ),
-            torch.tensor(
+            recoverssm_metadata_tensor(
                 [s.stride(2) for s in conv_states], dtype=torch.int64, device=dev
             ),
             hist,
@@ -809,7 +810,7 @@ class GDNRecoverSSMGroupedCommit:
             conv_dim_first=True,
         )
         dev = contexts[0].checkpoints[0].device
-        self.layer_groups = torch.tensor(
+        self.layer_groups = recoverssm_metadata_tensor(
             [g for g, c in enumerate(contexts) for _ in c.checkpoints],
             dtype=torch.int32,
             device=dev,

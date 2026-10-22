@@ -24,6 +24,15 @@ def uses_recoverssm(cache_config, num_speculative_tokens: int) -> bool:
     )
 
 
+def recoverssm_metadata_tensor(values, *, dtype, device) -> torch.Tensor:
+    """Copy small host metadata without blocking CUDA's execution stream."""
+    device = torch.device(device)
+    if device.type == "cuda":
+        host = torch.tensor(values, dtype=dtype, pin_memory=True)
+        return host.to(device, non_blocking=True)
+    return torch.tensor(values, dtype=dtype, device=device)
+
+
 def recoverssm_ptr_table(tensors, device) -> torch.Tensor:
     """int64 table of the tensors' data pointers, keeping each uint64 bit pattern.
 
@@ -31,7 +40,12 @@ def recoverssm_ptr_table(tensors, device) -> torch.Tensor:
     the kernels only cast the value back to a pointer."""
     ptrs = [t.data_ptr() for t in tensors]
     ptrs = [p if p < (1 << 63) else p - (1 << 64) for p in ptrs]
-    return torch.tensor(ptrs, dtype=torch.int64, device=device)
+    return recoverssm_metadata_tensor(ptrs, dtype=torch.int64, device=device)
 
 
-__all__ = ["recoverssm_ptr_table", "recoverssm_require", "uses_recoverssm"]
+__all__ = [
+    "recoverssm_metadata_tensor",
+    "recoverssm_ptr_table",
+    "recoverssm_require",
+    "uses_recoverssm",
+]
