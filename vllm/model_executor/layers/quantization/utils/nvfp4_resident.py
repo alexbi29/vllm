@@ -245,13 +245,12 @@ def validate_nvfp4_scale_compression(config):
         or parallel.enable_expert_parallel
         or parallel.enable_eplb
         or parallel.use_ubatching
-        or config.scheduler_config.async_scheduling
         or model.enable_sleep_mode
         or config.lora_config is not None
         or config.offload_config.uva.cpu_offload_gb > 0
         or config.offload_config.prefetch.offload_group_size > 0
     ):
         raise ValueError(
-            "NVFP4 scale compression requires synchronous TP1 without "
+            "NVFP4 scale compression requires TP1 without "
             "EP/EPLB, ubatching, sleep, LoRA or CPU weight offload"
         )
