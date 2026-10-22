@@ -9,6 +9,7 @@ from typing import Any, cast
 import pytest
 import torch
 
+from tests.utils import create_new_process_for_each_test
 from vllm.model_executor.layers.mamba.gdn.recoverssm_gdn import (
     GDNRecoverSSMCommitContext,
     gdn_recoverssm_verify,
@@ -262,6 +263,23 @@ def test_spec_rows_mixed_batch():
     )
     with pytest.raises(ValueError, match="spec rows classified"):
         recoverssm_request_indices(rows, 2, torch.device("cuda"))
+
+
+@create_new_process_for_each_test()
+def test_mixed_request_indices_do_not_stage_through_pageable_memory(monkeypatch):
+    """Noncontiguous spec rows need a pinned H2D copy during mixed batches."""
+    import vllm.utils.gpu_sync_debug as gsd
+
+    torch.empty(1, device="cuda")
+    monkeypatch.setattr(gsd, "_SYNC_CHECK_MODE", "error")
+    gsd.enable_gpu_sync_check()
+    rows = torch.tensor([0, 2, 3])
+    indices = gsd.with_gpu_sync_check(recoverssm_request_indices)(
+        rows, 3, torch.device("cuda")
+    )
+    assert indices is not None
+    assert indices.dtype == torch.int32
+    assert indices.tolist() == rows.tolist()
 
 
 def test_commit_maps_noncontiguous_requests_in_align_mode():
