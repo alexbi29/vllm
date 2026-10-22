@@ -165,14 +165,14 @@ GEMMs. The FP4 weights, scale values and MTP expert weights are unchanged.
 ```bash
 vllm serve nvidia/Qwen3.8-Flash-Next-NVFP4 \
   --engram-config '{"cpu_offload":true}' \
-  --tensor-parallel-size 1 --no-async-scheduling \
+  --tensor-parallel-size 1 \
   --max-model-len 262144 --max-num-seqs 16 --max-num-batched-tokens 8192 \
   --gpu-memory-utilization 0.97 --dtype bfloat16 --kv-cache-dtype bfloat16 \
   --kernel-config '{"nvfp4_scale_compression":true}' \
   --speculative-config '{"method":"mtp","num_speculative_tokens":3}'
 ```
 
-This option defaults off and requires SM120, synchronous TP1 execution and
+This option defaults off and requires SM120, TP1 execution and
 FlashInfer CUTLASS (selected automatically for the opt-in). EP/EPLB,
 overlapping microbatches, sleep, LoRA and CPU expert-weight offload are
 unsupported. PLE host offload is supported. Weight reload, mutation, checksums
@@ -191,6 +191,29 @@ Triton. `VLLM_GDN_DECODE_KERNEL=triton` explicitly selects Triton verification.
 Evaluate output quality as well as speed when changing this kernel path.
 Compatible GDN KV groups commit together after sampling; groups with
 incompatible state layouts retain individual commits.
+
+Async scheduling is supported: forwards stay ordered on one stream, so the
+shared scale buffers are never reused while a layer still reads them.
+
+Two lossless capacity/latency options are independent of the kernel config:
+
+- `VLLM_QWEN4_EXP_EMBED_TOKENS_HOST=1` keeps the target's input embedding
+  table (1.18 GiB) in pinned host memory and reads its rows through UVA. The
+  MTP drafter shares it. Lookups are exact; the freed memory goes to the KV
+  cache.
+- `"draft_lm_head_token_ranges": [[0, 98304], [248000, 248320]]` in
+  `--speculative-config` restricts the MTP drafter's logits to those token-id
+  ranges (row slices of the shared head, no copy). Qwen's BPE ids are roughly
+  frequency ordered, so this drops about 60% of each draft step's head
+  bandwidth at an unchanged acceptance length; target verification is
+  unchanged.
+
+`VLLM_QWEN4_EXP_FP8_DENSE=<regex>` (optionally with
+`VLLM_QWEN4_EXP_FP8_DENSE_KERNEL=CutlassFp8BlockScaledMMKernel`) requantizes
+matching BF16 target projections, e.g. `linear_attn\.(in_proj_qkvz|out_proj)$`,
+to 128x128-block FP8 with dynamic 1x128 activation scales. This is lossy:
+Qwen's own FP8 checkpoint keeps these layers in BF16. Qualify output quality
+before enabling it.
 
 The following kernel options also default off:
 
