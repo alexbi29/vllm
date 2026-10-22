@@ -105,6 +105,7 @@ _QWEN3_OMNI_DSPARK_ARCHITECTURE = "Qwen3OmniDSparkModel"
 _METHOD_SPECIFIC_OPTIONS = (
     "dspark_draft_topk",
     "draft_lm_head_quantization",
+    "draft_lm_head_token_ranges",
     "index_share_for_mtp_iteration",
     "xpress_topc",
     "speculator_options",
@@ -441,6 +442,20 @@ _DRAFT_VLLM_CONFIG_OVERRIDES = (
 )
 
 
+def normalize_token_ranges(ranges) -> list[tuple[int, int]]:
+    """Validate half-open ``[start, end)`` token-id ranges."""
+    out = [tuple(r) for r in ranges]
+    if not out or any(
+        len(r) != 2 or not all(isinstance(v, int) for v in r) or not 0 <= r[0] < r[1]
+        for r in out
+    ):
+        raise ValueError(
+            "draft_lm_head_token_ranges must be non-empty [start, end) pairs "
+            f"with 0 <= start < end, got {list(ranges)}."
+        )
+    return out  # type: ignore[return-value]
+
+
 @config
 class SpeculativeConfig:
     """Configuration for speculative decoding."""
@@ -537,6 +552,15 @@ class SpeculativeConfig:
     activation scales on the platform's FP8 linear kernel; "nvfp4" is
     weight-only on the platform's W4A16 kernel. The target verifies with its
     own head, so only the acceptance length can change. Model Runner V2 only."""
+    draft_lm_head_token_ranges: list[tuple[int, int]] | None = None
+    """Restrict the drafter's copy of a shared target lm_head to these
+    half-open token-id ranges, e.g. ``[[0, 98304], [248000, 248320]]``. Draft
+    logits outside them are -inf, so such tokens are never proposed; the
+    target verifies with its full head, so only the acceptance length can
+    change. The ranges are row slices of the target weight (no copy). Useful
+    for large vocabularies whose BPE ids are ordered by frequency. EAGLE/MTP
+    on Model Runner V2 with TP1 only; exclusive with
+    draft_lm_head_quantization."""
     use_local_argmax_reduction: bool = False
     """Use vocab-parallel local argmax instead of all-gathering full logits
     for draft token generation. Reduces communication from O(vocab_size) to

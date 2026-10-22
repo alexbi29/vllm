@@ -10,6 +10,7 @@ from vllm.distributed.parallel_state import get_pp_group
 from vllm.lora.layers.base import BaseLayerWithLoRA
 from vllm.model_executor.layers.quantization.online.lm_head import (
     quantized_lm_head_copy,
+    subset_lm_head_copy,
 )
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.model_loader.utils import get_draft_load_config
@@ -47,6 +48,7 @@ def share_target_lm_head(
     target_lm_head: nn.Module | None,
     quantization: Literal["fp8", "nvfp4"] | None,
     can_share: bool = True,
+    token_ranges: list[tuple[int, int]] | None = None,
 ) -> nn.Module | None:
     """Install the target lm_head, or its quantized copy, on a drafter that
     shares it. Returns the installed head, or None if the drafter keeps its own.
@@ -57,7 +59,7 @@ def share_target_lm_head(
         and target_lm_head is not None
         and _should_share(draft_model, "has_own_lm_head", draft_lm_head, target_lm_head)
     ):
-        if quantization is not None:
+        if quantization is not None or token_ranges is not None:
             raise ValueError(
                 "draft_lm_head_quantization needs a drafter that shares the "
                 "target lm_head."
@@ -66,6 +68,8 @@ def share_target_lm_head(
     head = target_lm_head
     if quantization is not None:
         head = quantized_lm_head_copy(target_lm_head, quantization)
+    if token_ranges is not None:
+        head = subset_lm_head_copy(target_lm_head, token_ranges)
     if draft_lm_head is not None:
         del draft_model.lm_head
     draft_model.lm_head = head
@@ -146,6 +150,7 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
         eagle_model,
         get_target_lm_head(target_model, target_language_model),
         speculative_config.draft_lm_head_quantization,
+        token_ranges=speculative_config.draft_lm_head_token_ranges,
     )
     if draft_head is not None:
         # MTP layers route logits through layer.shared_head.head, not
