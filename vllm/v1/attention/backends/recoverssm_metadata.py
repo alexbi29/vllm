@@ -61,4 +61,7 @@ def recoverssm_request_indices(
         )
     if num_spec_decodes == 0 or int(rows[-1]) == num_spec_decodes - 1:
         return None
-    return rows.to(torch.int32).to(device, non_blocking=True)
+    indices = rows.to(torch.int32)
+    if device.type == "cuda":
+        indices = indices.pin_memory()
+    return indices.to(device, non_blocking=True)
