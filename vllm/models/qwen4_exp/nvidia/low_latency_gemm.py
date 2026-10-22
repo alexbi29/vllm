@@ -448,6 +448,8 @@ def _runtime_ok(
 
 
 class _Qwen4ExpLowLatencyApply:
+    use_sm120_verify: bool = False
+
     def apply(
         self,
         layer: nn.Module,
@@ -455,7 +457,9 @@ class _Qwen4ExpLowLatencyApply:
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if bias is None and not envs.VLLM_BATCH_INVARIANT:
-            return torch.ops.vllm.qwen4_exp_low_latency_gemm(x, layer.weight)
+            return torch.ops.vllm.qwen4_exp_low_latency_gemm(
+                x, layer.weight, self.use_sm120_verify
+            )
         return super().apply(layer, x, bias)  # type: ignore[misc]
 
 
@@ -469,8 +473,14 @@ class Qwen4ExpLowLatencyEmbeddingMethod(
     pass
 
 
-def _qwen4_exp_low_latency_gemm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    if current_platform.is_device_capability(120) and not envs.VLLM_BATCH_INVARIANT:
+def _qwen4_exp_low_latency_gemm(
+    x: torch.Tensor, weight: torch.Tensor, use_sm120_verify: bool = False
+) -> torch.Tensor:
+    if (
+        use_sm120_verify
+        and current_platform.is_device_capability(120)
+        and not envs.VLLM_BATCH_INVARIANT
+    ):
         from .ops.sm120_gemm import sm120_projection_gemm
 
         out = sm120_projection_gemm(x, weight)
@@ -491,7 +501,7 @@ def _qwen4_exp_low_latency_gemm(x: torch.Tensor, weight: torch.Tensor) -> torch.
 
 
 def _qwen4_exp_low_latency_gemm_fake(
-    x: torch.Tensor, weight: torch.Tensor
+    x: torch.Tensor, weight: torch.Tensor, use_sm120_verify: bool = False
 ) -> torch.Tensor:
     return x.new_empty((*x.shape[:-1], weight.shape[0]))
 
@@ -508,10 +518,12 @@ def enable_qwen4_exp_low_latency_gemm(
     dtype: torch.dtype,
 ) -> None:
     capability = current_platform.get_device_capability()
+    use_sm120_verify = False
     if capability == (12, 0):
         config = get_current_vllm_config_or_none()
         if config is None or not config.kernel_config.qwen4_exp_sm120_bf16_gemm:
             return
+        use_sm120_verify = config.kernel_config.qwen4_exp_sm120_verify_gemm
     plans = QWEN4_EXP_GEMM_PLANS_BY_CAPABILITY.get(capability, {})
     if dtype != torch.bfloat16 or not plans:
         return
@@ -541,6 +553,7 @@ def enable_qwen4_exp_low_latency_gemm(
             child.quant_method = Qwen4ExpLowLatencyLinearMethod()
         else:
             child.quant_method = Qwen4ExpLowLatencyEmbeddingMethod()
+        child.quant_method.use_sm120_verify = use_sm120_verify
         warmup_configs.update(plan.values())
         installed += 1
 

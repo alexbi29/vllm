@@ -865,11 +865,12 @@ class GDNRecoverSSMGroupedCommit:
         )
         ref_bt = None if block_tables is None else block_tables[0]
         if block_tables is not None:
+            reference = block_tables[0]
             _require(
                 all(
-                    t.shape == ref_bt.shape
-                    and t.stride() == ref_bt.stride()
-                    and t.dtype == ref_bt.dtype
+                    t.shape == reference.shape
+                    and t.stride() == reference.stride()
+                    and t.dtype == reference.dtype
                     for t in block_tables
                 ),
                 "groups need block tables of one shape, stride and dtype",
