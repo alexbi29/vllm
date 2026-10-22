@@ -8,6 +8,7 @@ from vllm.distributed.parallel_state import get_pp_group
 from vllm.lora.layers.base import BaseLayerWithLoRA
 from vllm.model_executor.layers.quantization.online.lm_head import (
     quantized_lm_head_copy,
+    subset_lm_head_copy,
 )
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.model_loader.utils import get_draft_load_config
@@ -114,6 +115,10 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
             draft_head = quantized_lm_head_copy(
                 target_lm_head, speculative_config.draft_lm_head_quantization
             )
+        if speculative_config.draft_lm_head_token_ranges is not None:
+            draft_head = subset_lm_head_copy(
+                target_lm_head, speculative_config.draft_lm_head_token_ranges
+            )
         if draft_lm_head is not None:
             del eagle_model.lm_head
         eagle_model.lm_head = draft_head
@@ -128,9 +133,13 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
                 if sh is not None and hasattr(sh, "head"):
                     del sh.head
                     sh.head = draft_head
-    elif speculative_config.draft_lm_head_quantization is not None:
+    elif (
+        speculative_config.draft_lm_head_quantization is not None
+        or speculative_config.draft_lm_head_token_ranges is not None
+    ):
         raise ValueError(
-            "draft_lm_head_quantization needs a drafter that shares the target lm_head."
+            "draft_lm_head_quantization/draft_lm_head_token_ranges need a drafter "
+            "that shares the target lm_head."
         )
 
     # MTP shares topk_indices_buffer with the target model. We update
