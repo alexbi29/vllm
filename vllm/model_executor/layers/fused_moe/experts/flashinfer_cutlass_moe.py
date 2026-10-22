@@ -376,6 +376,8 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
             and self._nvfp4_resident is not None
             and self._nvfp4_resident.moe_tactics is not None
         ):
+            # The tuned GEMM2 tiles must retain deterministic FP32 reduction.
+            finalize_kwargs["use_fused_finalize"] = False
             profile = self._nvfp4_resident.moe_tactics.get(hidden_states.shape[0])
             if profile is not None:
                 finalize_kwargs["profile_ids"] = list(profile)

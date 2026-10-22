@@ -56,12 +56,12 @@ MNK_FACTORS = [
 @pytest.mark.skipif(
     not current_platform.is_device_capability(120), reason="SM120 tactic plans"
 )
-@pytest.mark.parametrize("m", [4, 64, 6912, 8000, 8191, 8192])
+@pytest.mark.parametrize("m", [4, 8, 16, 64, 2048, 6912, 8000, 8191, 8192])
 @torch.inference_mode()
 def test_qwen4_exp_resident_tactics_graph_replays_new_routes(
     m, monkeypatch, workspace_init
 ):
-    """Compressed scales and fixed tactics must follow changing graph inputs."""
+    """Tactics must track new routes and exactly repeat unchanged graph inputs."""
     from types import SimpleNamespace
 
     if pytest.importorskip("flashinfer").__version__ != "0.7.2":
@@ -166,6 +166,10 @@ def test_qwen4_exp_resident_tactics_graph_replays_new_routes(
                 scratch.fill_(0xA5)
             graph.replay()
             torch.testing.assert_close(actual, reference, atol=0.02, rtol=0.02)
+            repeated = actual.clone()
+            for _ in range(3):
+                graph.replay()
+                torch.testing.assert_close(actual, repeated, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize(
