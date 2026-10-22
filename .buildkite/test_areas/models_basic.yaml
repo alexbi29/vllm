@@ -360,7 +360,6 @@ steps:
     - >-
       pytest -v -s
       models/qwen4_exp/test_hc_ops.py
-      models/qwen4_exp/test_sm120_gemm.py
       models/qwen4_exp/test_qsa_prepare.py
       models/qwen4_exp/test_qsa_reference.py
     - pytest -v -s models/qwen4_exp/test_ple.py

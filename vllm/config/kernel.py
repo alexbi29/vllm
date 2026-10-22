@@ -309,9 +309,6 @@ class KernelConfig:
     qwen4_exp_sm120_bf16_gemm: bool = False
     """Use measured BF16 small-row projection plans for Qwen4Exp on SM120."""
 
-    qwen4_exp_sm120_verify_gemm: bool = False
-    """Evaluate additional BF16 verification plans with the BF16 GEMM option."""
-
     qwen4_exp_sm120_moe_tactics: bool = False
     """Use offline CUTLASS tactics with resident Qwen4Exp NVFP4 scales."""
 

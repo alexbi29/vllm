@@ -197,10 +197,6 @@ The following kernel options also default off:
 - `qwen4_exp_sm120_bf16_gemm` selects measured small-row BF16 projection
   plans in the target and MTP models. Other shapes and row counts retain
   standard dispatch.
-- `qwen4_exp_sm120_verify_gemm` separately evaluates additional tensor-core
-  and split-K plans at selected verification widths. It needs the BF16 GEMM
-  option. Operator gains did not consistently improve full-model throughput;
-  keep it disabled unless it passes the intended workload's model gates.
 - `qwen4_exp_sm120_moe_tactics` selects offline FlashInfer CUTLASS MoE
   tactics for the measured E512/top10/H2560/I640 shapes. It requires resident
   scale compression and FlashInfer 0.7.2; startup checks the native tactic
