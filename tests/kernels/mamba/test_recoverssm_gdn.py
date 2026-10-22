@@ -338,11 +338,21 @@ ALIGN_CASES = [
 ]
 
 
+def _align_source(bt, nc, bs, src_at_window_end):
+    """The window's source block. MRV2 pre-copies the running state into the block
+    holding the window's last token, which can also be the final block."""
+    col = (nc + T - 1) // bs if src_at_window_end else nc // bs
+    return bt[0, col].reshape(1).contiguous()
+
+
+@pytest.mark.parametrize("src_at_window_end", [False, True])
 @pytest.mark.parametrize("nc,accepted,bs", ALIGN_CASES)
-def test_align_boundary_and_final_state_match_native(nc, accepted, bs):
+def test_align_boundary_and_final_state_match_native(
+    nc, accepted, bs, src_at_window_end
+):
     inp = _make([T], nb=12)
     bt = torch.arange(2, 8, dtype=torch.int32, device="cuda").reshape(1, 6)
-    src = bt[0, nc // bs].reshape(1).contiguous()
+    src = _align_source(bt, nc, bs, src_at_window_end)
     inp["state_indices"] = src
     _verify(inp)
     _, states = _native(inp)
@@ -358,10 +368,9 @@ def test_align_boundary_and_final_state_match_native(nc, accepted, bs):
     )
     next_boundary = (nc // bs + 1) * bs
     final_blk = int(bt[0, max(nc + accepted - 1, 0) // bs])
-    if (
-        nc + accepted >= next_boundary
-    ):  # crosses: the boundary state goes into the source block
-        assert torch.equal(ckpt[int(src)], states[next_boundary - nc - 1])
+    if nc + accepted >= next_boundary:  # crosses: the boundary block gets its state
+        boundary_blk = int(bt[0, nc // bs])
+        assert torch.equal(ckpt[boundary_blk], states[next_boundary - nc - 1])
     assert torch.equal(ckpt[final_blk], states[accepted - 1])
 
 
@@ -582,11 +591,12 @@ def test_commit_bf16_state_rounds_once(accepted, seed):
         assert err_rssm <= err_native * 1.05 + 1e-7, (err_rssm, err_native)
 
 
+@pytest.mark.parametrize("src_at_window_end", [False, True])
 @pytest.mark.parametrize("nc,accepted,bs", ALIGN_CASES)
-def test_align_boundary_bf16_state(nc, accepted, bs):
+def test_align_boundary_bf16_state(nc, accepted, bs, src_at_window_end):
     inp, ref_inp = _bf16_case([T])
     bt = torch.arange(2, 8, dtype=torch.int32, device="cuda").reshape(1, 6)
-    src = bt[0, nc // bs].reshape(1).contiguous()
+    src = _align_source(bt, nc, bs, src_at_window_end)
     inp["state_indices"] = ref_inp["state_indices"] = src
     _verify(inp)
     _, ref_states = _native(ref_inp)
@@ -603,7 +613,7 @@ def test_align_boundary_bf16_state(nc, accepted, bs):
     final_blk = int(bt[0, max(nc + accepted - 1, 0) // bs])
     if nc + accepted >= next_boundary:
         torch.testing.assert_close(
-            ckpt[int(src)].float(),
+            ckpt[int(bt[0, nc // bs])].float(),
             ref_states[next_boundary - nc - 1].float().bfloat16().float(),
             rtol=BF16_ULP,
             atol=1e-5,
