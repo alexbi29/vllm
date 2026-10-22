@@ -117,6 +117,7 @@ class RecoverSSMState:
                 logger.info("GDN RecoverSSM commit stays per group: %s", e)
                 grouped = None
             else:
+                assert grouped is not None
                 logger.info(
                     "GDN RecoverSSM grouped commit: %d KV cache groups, %d layers",
                     grouped.num_groups,
