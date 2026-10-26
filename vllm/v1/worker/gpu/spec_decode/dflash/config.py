@@ -2,7 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from typing import TYPE_CHECKING
 
-from vllm.v1.worker.gpu.spec_decode.eagle.config import wrap_eagle_hf_config
+from vllm.v1.worker.gpu.spec_decode.eagle.config import (
+    check_draft_lm_head_quantization,
+    wrap_eagle_hf_config,
+)
 from vllm.v1.worker.gpu.spec_decode.speculator_config import (
     DraftModelSpeculatorConfig,
 )
@@ -13,6 +16,7 @@ if TYPE_CHECKING:
 
 class DFlashSpeculatorConfig(DraftModelSpeculatorConfig):
     base_method = "dflash"
+    supported_options = frozenset({"draft_lm_head_quantization"})
     speculator_class = (
         "vllm.v1.worker.gpu.spec_decode.dflash.speculator.DFlashSpeculator"
     )
@@ -28,6 +32,10 @@ class DFlashSpeculatorConfig(DraftModelSpeculatorConfig):
         assert cls.base_method is not None
         wrap_eagle_hf_config(spec, cls.base_method)
         spec.parallel_drafting = True
+
+    @classmethod
+    def apply_options(cls, spec: "SpeculativeConfig") -> None:
+        check_draft_lm_head_quantization(spec)
 
     @property
     def uses_aux_hidden_states(self) -> bool:
