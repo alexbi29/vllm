@@ -6,12 +6,15 @@ from collections.abc import Sequence
 
 import torch
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
 from vllm.model_executor.layers.quantization.utils import replace_parameter
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
     QuantKey,
+    kFp8DynamicTokenSym,
+    kFp8StaticChannelSym,
     kFp8StaticTensorSym,
 )
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
@@ -20,6 +23,7 @@ from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     cutlass_fp8_supported,
 )
 from vllm.platforms import current_platform
+from vllm.utils.torch_utils import direct_register_custom_op
 
 from .BlockScaledMMLinearKernel import Fp8BlockScaledMMLinearKernel
 from .ScaledMMLinearKernel import (
@@ -154,12 +158,68 @@ class CutlassInt8ScaledMMLinearKernel(Int8ScaledMMLinearKernel):
         )
 
 
+def _sm120_fp8_cublaslt_m_range() -> tuple[int, int] | None:
+    """Parse VLLM_SM120_FP8_CUBLASLT_M_RANGE ("LO:HI") on SM120 CUDA only."""
+    value = envs.VLLM_SM120_FP8_CUBLASLT_M_RANGE
+    if not value or not current_platform.is_device_capability_family(120):
+        return None
+    lo, hi = (int(part) for part in value.split(":"))
+    if not 0 <= lo < hi:
+        raise ValueError(
+            f"VLLM_SM120_FP8_CUBLASLT_M_RANGE must be LO:HI, got {value!r}"
+        )
+    return lo, hi
+
+
+def _banded_fp8_scaled_mm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+    lo: int,
+    hi: int,
+) -> torch.Tensor:
+    # Decided per call, so each CUDA graph size picks its own kernel; inside
+    # torch.compile a Python branch on the token count would be traced once.
+    if lo < a.shape[0] <= hi:
+        return torch._scaled_mm(
+            a, b, scale_a=scale_a, scale_b=scale_b.view(1, -1), out_dtype=torch.bfloat16
+        )
+    return ops.cutlass_scaled_mm(a, b, scale_a, scale_b, torch.bfloat16)
+
+
+def _banded_fp8_scaled_mm_fake(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+    lo: int,
+    hi: int,
+) -> torch.Tensor:
+    return a.new_empty((a.shape[0], b.shape[1]), dtype=torch.bfloat16)
+
+
+direct_register_custom_op(
+    op_name="sm120_banded_fp8_scaled_mm",
+    op_func=_banded_fp8_scaled_mm,
+    fake_impl=_banded_fp8_scaled_mm_fake,
+)
+
+
 class CutlassFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
     def __init__(
         self, c: FP8ScaledMMLinearLayerConfig, layer_param_names: Sequence[str]
     ) -> None:
         self.logical_output_size: int | None = None
         super().__init__(c, layer_param_names)
+        m_range = _sm120_fp8_cublaslt_m_range()
+        # cuBLASLt rowwise needs per-token activation and per-channel weight scales.
+        eligible = (
+            c.activation_quant_key == kFp8DynamicTokenSym
+            and c.weight_quant_key == kFp8StaticChannelSym
+            and c.out_dtype == torch.bfloat16
+        )
+        self.cublaslt_m_range = m_range if eligible else None
 
     @classmethod
     def is_supported(
@@ -254,9 +314,14 @@ class CutlassFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
         if pad_n > 0 and bias is not None:
             bias = self._pad_to_alignment(bias, dim=0, alignment=16)
 
-        output = ops.cutlass_scaled_mm(
-            A, B, out_dtype=out_dtype, scale_a=As, scale_b=Bs, bias=bias
-        )
+        if self.cublaslt_m_range is not None and bias is None and pad_n == 0:
+            output = torch.ops.vllm.sm120_banded_fp8_scaled_mm(
+                A.view(-1, A.shape[-1]), B, As, Bs, *self.cublaslt_m_range
+            )
+        else:
+            output = ops.cutlass_scaled_mm(
+                A, B, out_dtype=out_dtype, scale_a=As, scale_b=Bs, bias=bias
+            )
 
         if pad_n > 0:
             output = output[..., :output_size].contiguous()

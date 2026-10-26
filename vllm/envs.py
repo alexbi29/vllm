@@ -184,6 +184,7 @@ if TYPE_CHECKING:
     VLLM_QWEN4_EXP_EMBED_TOKENS_HOST: bool = False
     VLLM_QWEN4_EXP_FP8_DENSE: str = ""
     VLLM_QWEN4_EXP_FP8_DENSE_KERNEL: str = ""
+    VLLM_SM120_FP8_CUBLASLT_M_RANGE: str = ""
     VLLM_DP_MASTER_IP: str = ""
     VLLM_DP_MASTER_PORT: int = 0
     VLLM_RANDOMIZE_DP_DUMMY_INPUTS: bool = False
@@ -787,6 +788,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Optional FP8 block-scaled kernel class name for those projections.
     "VLLM_QWEN4_EXP_FP8_DENSE_KERNEL": lambda: os.environ.get(
         "VLLM_QWEN4_EXP_FP8_DENSE_KERNEL", ""
+    ),
+    # SM120 per-token/per-channel FP8 GEMMs: "LO:HI" routes LO < M <= HI to
+    # cuBLASLt (torch._scaled_mm) instead of CUTLASS, whose 64-row tile is slow
+    # there (e.g. speculative-decoding verify batches). Empty disables it.
+    "VLLM_SM120_FP8_CUBLASLT_M_RANGE": lambda: os.environ.get(
+        "VLLM_SM120_FP8_CUBLASLT_M_RANGE", ""
     ),
     # Qwen4Exp: keep the input embedding table in pinned host memory (UVA).
     "VLLM_QWEN4_EXP_EMBED_TOKENS_HOST": lambda: (
