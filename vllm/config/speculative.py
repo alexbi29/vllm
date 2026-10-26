@@ -475,8 +475,8 @@ class SpeculativeConfig:
     acceptance-rate impact of reusing that block. It does not disable the
     speculative drafter itself."""
     draft_lm_head_quantization: Literal["fp8", "nvfp4"] | None = None
-    """Quantize the drafter's copy of a target lm_head it shares (EAGLE and
-    MTP). "fp8" uses per-row weight and per-token activation scales on the
+    """Quantize the drafter's copy of a target lm_head it shares (EAGLE, MTP
+    and DFlash). "fp8" uses per-row weight and per-token activation scales on the
     platform's FP8 linear kernel; "nvfp4" is weight-only on the platform's
     W4A16 kernel. The target verifies with its own head, so only the
     acceptance length can change. Model Runner V2 only."""
@@ -1909,7 +1909,7 @@ class SpeculativeConfig:
         if self.draft_lm_head_quantization is not None:
             # Gemma-4 MTP has no target lm_head to share; its speculator
             # quantizes the assistant's own draft-dim head instead.
-            if self.method not in ("eagle", "eagle3", "mtp"):
+            if self.method not in ("eagle", "eagle3", "mtp", "dflash"):
                 raise ValueError(
                     "draft_lm_head_quantization is not supported for method "
                     f"{self.method!r}."
