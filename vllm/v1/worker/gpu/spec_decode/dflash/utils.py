@@ -3,6 +3,9 @@
 import torch.nn as nn
 
 from vllm.config import VllmConfig, replace
+from vllm.model_executor.layers.quantization.online.lm_head import (
+    quantized_lm_head_copy,
+)
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.model_loader.utils import get_draft_load_config
 from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
@@ -68,8 +71,18 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
             dflash_model, "has_own_lm_head", draft_lm_head, target_lm_head
         )
     ):
+        draft_head = target_lm_head
+        if speculative_config.draft_lm_head_quantization is not None:
+            draft_head = quantized_lm_head_copy(
+                target_lm_head, speculative_config.draft_lm_head_quantization
+            )
         if draft_lm_head is not None:
             del dflash_model.lm_head
-        dflash_model.lm_head = target_lm_head
+        dflash_model.lm_head = draft_head
+    elif speculative_config.draft_lm_head_quantization is not None:
+        raise ValueError(
+            "draft_lm_head_quantization needs a DFlash drafter that shares the "
+            "target lm_head."
+        )
 
     return dflash_model
