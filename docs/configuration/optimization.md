@@ -2,6 +2,10 @@
 
 This guide covers optimization strategies and performance tuning for vLLM V1.
 
+For a measured dense FP8 workload on Blackwell SM120, see
+[Llama optimization on SM120](llama_optimization.md), including repeated
+TPS/prefill/board-energy results and the limits of the quality comparison.
+
 !!! tip
     Running out of memory? Consult [this guide](./conserving_memory.md) on how to conserve memory.
 
