@@ -7374,5 +7374,36 @@
     "source_head": "28c118b2ca0671df7fe8df1bcedc56255f3ef925",
     "serving_changed": false,
     "future_serving_feature": "opt-in/default-off"
+  },
+  "subsequent_user_authorized_adoption": {
+    "accepted": true,
+    "context_argument": "auto",
+    "native_target_and_draft_limit": 524288,
+    "resolved_context": 263488,
+    "kv_tokens": 263552,
+    "draft_tokens": 7,
+    "batch_tokens": 4096,
+    "gpu_memory_utilization": 0.97,
+    "power_w": 450,
+    "near_max_input_tokens": 263308,
+    "serving_passed": 15,
+    "serving_expected": 15,
+    "tools_passed": 10,
+    "tools_expected": 10,
+    "reasoning_modes_and_strict_json": true,
+    "over_limit_status": 400,
+    "native_original_hashes_matched": 17,
+    "config_sha256": "d1ac8be2800fee63a3a31587fe18be18a0b46a5bcadc0afe65e4d27198dc9b75",
+    "source_head": "28c118b2ca0671df7fe8df1bcedc56255f3ef925",
+    "quality_or_performance_rerun": false,
+    "old_screen_and_statistical_decisions_preserved": true,
+    "context_concurrency": "Approximately one maximum-length request;16 shorter sequences configured.",
+    "cold_auto_observation": {
+      "resolved_context": 255616,
+      "kv_tokens": 255679,
+      "serving_suite_run": false,
+      "metadata_audit_error": "Proxy model list omitted context field; original recipe restored before serving. Corrected audit reads engine model metadata."
+    },
+    "current_state": "Adopted batch4096 and auto context by explicit user request; source, precision and backend unchanged. No global vLLM default changed."
   }
 }
