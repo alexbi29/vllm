@@ -212,6 +212,19 @@ def analyze_draft_batch():
         f"{followup['cached_candidate_kv_tokens']} tokens; "
         "independent capacity observation, no quality qualification"
     )
+    adoption = data["subsequent_user_authorized_adoption"]
+    assert adoption["accepted"]
+    assert adoption["batch_tokens"] == 4096 and adoption["draft_tokens"] == 7
+    assert adoption["context_argument"] == "auto"
+    assert adoption["resolved_context"] <= adoption["native_target_and_draft_limit"]
+    assert adoption["near_max_input_tokens"] + 128 <= adoption["resolved_context"]
+    assert adoption["serving_passed"] == adoption["serving_expected"] == 15
+    assert adoption["tools_passed"] == adoption["tools_expected"] == 10
+    assert adoption["over_limit_status"] == 400
+    assert adoption["native_original_hashes_matched"] == 17
+    assert not adoption["quality_or_performance_rerun"]
+    assert adoption["old_screen_and_statistical_decisions_preserved"]
+    print(f"  accepted batch4096/auto: context {adoption['resolved_context']} tokens")
 
 
 def main():

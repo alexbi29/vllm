@@ -341,3 +341,37 @@ Any future integration remains opt-in/default-off. All numeric rows, prefill
 windows, caps, startup observations and decisions are in
 `draft_batch_results.json`. One boot per candidate versus a saved control gives
 descriptive comparisons, not a passed statistical performance margin.
+
+## Subsequent explicit adoption and maximum context
+
+The user subsequently adopted batch4096 and requested the largest context
+that fits available VRAM. Only the selected serving stanza's batch/context
+arguments change; source, environment, native assets, precision, FlashInfer,
+seven draft tokens, .97 and 450 W remain the same.
+
+Both target and draft declare a native 524,288-token positional limit. The
+existing `--max-model-len auto` fits context to the KV memory budget without
+changing RoPE scaling. A normal-cache load resolves **263,488 total input/output
+tokens**, with **263,552 logical KV tokens**. This supports approximately one
+maximum-length request; 16 shorter sequences remain configured. The earlier
+2× capacity comparison refers to the former 131,072-token context.
+
+All **15/15 serving cases** pass, including exact recall at **263,308 input
+tokens**, cancellation recovery, reasoning modes and strict JSON. All **10/10
+tool cases** pass. A request exceeding the resolved limit returns HTTP 400.
+The complete current-boot log has no OOM/fatal error, all 17 original native
+hashes match, and the final public answer is 187. The accepted recipe remains
+running; backups and a standalone rollback are saved operationally.
+
+The initial cold auto-fit boot resolves 255,616 tokens. Its audit mistakenly
+reads proxy-generated model metadata, then restores the original recipe before
+the serving suite. The corrected audit reads the existing engine metadata
+route, reuses compiled artifacts and verifies the accepted limit. This attempt
+remains separate from successful acceptance.
+
+No new hard8 or throughput campaign was run for adoption. Explicit user
+authorization is recorded separately from the earlier failed/inconclusive
+screens; no statistical decision is relabeled. Auto-fit can select a different
+limit on another boot, so the effective engine metadata and current boot are
+the evidence for its actual context. This deployment selects existing opt-in
+settings; the PR introduces no global serving default or allocation feature.

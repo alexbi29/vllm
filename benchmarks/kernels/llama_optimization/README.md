@@ -88,3 +88,7 @@ screen. A separately declared single cached reload reserves 263,552 KV tokens,
 above the 262,144-token target. Both observations remain separate. No candidate
 hard8 run or promotion followed, and the original 7-token/8192 recipe is restored.
 These are descriptive one-boot measurements, not statistical equivalence claims.
+The subsequent explicit adoption uses batch4096 and auto-fit context, resolving
+to 263,488 total input/output tokens. All 15 serving and 10 tool cases pass,
+including near-maximum recall; no new hard8 or throughput suite was run.
+That operational acceptance leaves the earlier statistical decisions intact.
