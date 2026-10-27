@@ -108,6 +108,112 @@ def analyze_compression():
     print("  18 eager/graph raw-bit comparisons pass; 0 reusable VRAM saved")
 
 
+def analyze_draft_batch():
+    data = json.loads(Path(__file__).with_name("draft_batch_results.json").read_text())
+    assert data["schema_version"] == 1 and data["build"]["power_w"] == 450
+    assert set(data["candidates"]) == {"draft3", "draft5", "batch4096"}
+    canceled = data["candidates"]["draft5"]
+    assert canceled["canceled_by_user"] and not canceled["measured"]
+    assert data["user_cancellation"]["activation_exit_code"] == 125
+    assert not data["user_cancellation"]["changed_config"]
+    protocol = data["frozen_screen"]
+    print("DFlash draft length and prefill batch size (saved descriptive screens)")
+    for name in ("draft3", "batch4096"):
+        arm = data["candidates"][name]
+        screen = arm["screen"]
+        for cell, candidate in arm["decode"].items():
+            control = data["control"]["decode"][cell]
+            a, b = candidate["summary"], control["summary"]
+            expected = 32 if cell == "realistic-c16-on" else 16
+            for record in (candidate, control):
+                summary = record["summary"]
+                assert len(record["rows"]) == summary["requests"] == expected
+                assert (
+                    sum(r["completion_tokens"] for r in record["rows"])
+                    == (summary["output_tokens"])
+                )
+                assert summary["output_tps"] == (
+                    summary["output_tokens"] / summary["elapsed_s"]
+                )
+                assert summary["joules_per_output_token"] == (
+                    summary["gross_board_joules"] / summary["output_tokens"]
+                )
+            keys = ("index", "repeat", "thinking", "prompt_tokens")
+            assert [tuple(r[k] for k in keys) for r in candidate["rows"]] == [
+                tuple(r[k] for k in keys) for r in control["rows"]
+            ]
+            saved = screen["decode"][cell]
+            assert math.isclose(
+                saved["rate_change_percent"],
+                100 * (a["output_tps"] / b["output_tps"] - 1),
+                abs_tol=1e-10,
+            )
+            assert math.isclose(
+                saved["energy_change_percent"],
+                100 * (a["joules_per_output_token"] / b["joules_per_output_token"] - 1),
+                abs_tol=1e-10,
+            )
+        for size, candidate in arm["prefill"].items():
+            control = data["control"]["prefill"][size]
+            assert candidate["actual_input_tokens"] == control["actual_input_tokens"]
+            for record in (candidate, control):
+                assert len(record["windows"]) == 3
+                count = 8 if size == "8192" else 2
+                for window in record["windows"]:
+                    assert math.isclose(
+                        window["input_tps"],
+                        record["actual_input_tokens"] * count / window["elapsed_s"],
+                    )
+            rate = statistics.median(w["input_tps"] for w in candidate["windows"])
+            base = statistics.median(w["input_tps"] for w in control["windows"])
+            assert math.isclose(
+                screen["prefill"][size]["rate_change_percent"],
+                100 * (rate / base - 1),
+                abs_tol=1e-10,
+            )
+        capacity = arm["boot"]["kv_tokens"]
+        limit = (
+            protocol["batch4096_advance_min_kv_tokens"]
+            if name == "batch4096"
+            else protocol["capacity_reference_tokens"] * 0.99
+        )
+        assert screen["capacity_screen_pass"] == (capacity >= limit)
+        assert not screen["qualify"]
+        assert arm["serving"]["passed"] == arm["serving"]["expected"] == 15
+        assert arm["tools"]["passed"] == arm["tools"]["expected"] == 10
+        assert arm["reasoning_modes_and_strict_json"]
+        assert all(not q["run"] for q in arm["quality"].values())
+        changes = {k: v["rate_change_percent"] for k, v in screen["decode"].items()}
+        print(f"  {name}: decode changes {changes}; initial screen held")
+    for control in data["control"]["quality"].values():
+        assert len(control["questions"]) == 8
+        means = []
+        for question in control["questions"].values():
+            attempts = question["attempts"]
+            summary = question["summary"]
+            assert len(attempts) == 15
+            assert sum(bool(a["correct"]) for a in attempts) == summary["raw"]
+            assert sum(a["usable"] for a in attempts) == summary["usable"]
+            assert sum(a["finish"] == "length" for a in attempts) == summary["caps"]
+            means.append(statistics.mean(a["tokens"] for a in attempts))
+            assert means[-1] == summary["all_tok_q"]
+        assert math.isclose(statistics.mean(means), control["metrics"]["all_tok_q"])
+    followup = data["capacity_followup"]
+    assert followup["candidate_cached_reloads"] == 1
+    assert followup["new_performance_or_quality_runs"] == 0
+    assert followup["capacity_target_pass"] == (
+        followup["cached_candidate_kv_tokens"] >= 262144
+    )
+    assert data["final_state"]["restored"]
+    assert data["final_state"]["native_hashes_matched"] == 17
+    assert not data["final_state"]["serving_changed"]
+    print(
+        "  cached batch4096 capacity: "
+        f"{followup['cached_candidate_kv_tokens']} tokens; "
+        "independent capacity observation, no quality qualification"
+    )
+
+
 def main():
     data = json.loads(Path(__file__).with_name("results.json").read_text())
     cells = data["attention"]["retained_screen"]["cells"]
@@ -196,6 +302,7 @@ def main():
         print(f"  {method}: projected C1/C2/C16 {gains}")
     print("72 GEMM cases pass numerics; no alternative clears the +3% C1 gate")
     analyze_compression()
+    analyze_draft_batch()
 
 
 if __name__ == "__main__":

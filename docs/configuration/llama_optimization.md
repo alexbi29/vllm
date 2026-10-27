@@ -271,3 +271,73 @@ unchanged. No model quality/TPS/prefill campaign was entered after the operator
 and capacity gates failed. No new production energy or KV-capacity gain is
 claimed. CPU entropy-code compression of a file is a different mechanism from
 the hardware patterns recognized by transparent compute-data compression.
+
+## Draft length and prefill batching
+
+This later screen uses the same source `28c118b2ca`, native assets and 450 W as
+the compression probe, with the current DFlash2 recipe. Target FP8 weights,
+BF16 target head/KV, FlashInfer/page64, probabilistic draft sampling, FP8 draft
+head, 16 slots and 131072 context stay fixed. The FP8 GEMM dispatch remains
+cuBLASLt for `64 < M <= 256` and native CUTLASS outside that band.
+
+The saved current control uses seven draft tokens, 8192 maximum batched tokens
+and a .97 memory budget. This differs from the historical no-speculation recipe
+above; the two baselines are not pooled. Each candidate reuses the same complete
+16-prompt realistic bank, seeds, sampling and 1024-token cap. C1/C4 have one pass,
+C16 has two. Natural stops are respected and output lengths/caps are retained.
+
+| Configuration | C1 on tok/s | C4 on | C16 on | C1 off |
+| --- | ---: | ---: | ---: | ---: |
+| Saved 7-token / 8192-batch control | 67.2 | 237.2 | 626.9 | 72.9 |
+| 3-token / 8192-batch | 64.8 (−3.7%) | 224.8 (−5.2%) | 680.1 (+8.5%) | 69.8 (−4.3%) |
+| 7-token / 4096-batch | 67.3 (+0.1%) | 235.3 (−0.8%) | 615.8 (−1.8%) | 72.9 (−0.1%) |
+
+Three tokens reduces mean accepted length at C1 from about 1.72 to 1.65.
+Board J/output rises 3.8%/5.4% at C1/C4 and falls 7.7% at C16. It fails the
+frozen general-regression screen. The user canceled the five-token test after
+seeing the C1/C4 slowdown; no five-token performance or quality data was
+collected. The cancellation exits125 without changing the configuration.
+
+For batch4096, board J/output changes −0.1%/+0.8%/+1.8% at C1/C4/C16.
+Exact saved 8,069/64,375-token inputs use two excluded warmups and three complete
+windows per size, with the original request counts and isolated cache salts.
+
+| Prefill configuration | 8K input tok/s | 64K input tok/s | Board J/input change, 8K / 64K |
+| --- | ---: | ---: | ---: |
+| Saved control | 5,700 | 3,002 | reference |
+| 3-token / 8192-batch | 5,664 (−0.6%) | 3,019 (+0.6%) | +0.8% / −0.7% |
+| 7-token / 4096-batch | 5,865 (+2.9%) | 3,046 (+1.5%) | −2.7% / −1.4% |
+
+Capacity requires distinguishing cold compilation from a normal cached load:
+
+| Startup observation | BF16 KV tokens |
+| --- | ---: |
+| Original 7-token / 8192, cached | 259,520 |
+| 3-token / 8192, first compilation, unmeasured setup | 255,616 |
+| 3-token / 8192, cached measured boot | 260,736 |
+| 7-token / 4096, first compilation, measured boot | 255,680 |
+| 7-token / 4096, single cached capacity-only reload | 263,552 |
+| Original 7-token / 8192, final restored boot | 259,520 |
+
+The cached batch4096 observation clears the 262,144-token target: 2.011 times
+the context limit, 4,032 tokens (+1.6%) above the preceding cached control.
+The independent follow-up was declared before that reload; no throughput or
+quality suite was repeated. Its positive capacity result does not overwrite
+the initial screen's cold-capacity failure or qualify a deployment.
+
+Both measured arms pass all 15 serving probes, including near-maximum-context
+recall, 10 tool cases, reasoning modes and strict JSON. No OOM/fatal error was
+found in their complete retained logs. No candidate hard8 run followed the
+failed initial advancement screens; saved control per-question costs and usable
+rates remain in the data, with no new quality-equivalence claim.
+
+The initial unmeasured attempt rejected legitimately unused longer-query
+FlashInfer libraries. A final audit also rejected an additional generated
+Triton helper after restoration; independent verification confirms all 17
+original native-library hashes and records that helper separately. Both audit
+failures and successful public restoration receipts remain in the evidence.
+The original 7-token/8192 recipe is restored, with no serving/default change.
+Any future integration remains opt-in/default-off. All numeric rows, prefill
+windows, caps, startup observations and decisions are in
+`draft_batch_results.json`. One boot per candidate versus a saved control gives
+descriptive comparisons, not a passed statistical performance margin.
