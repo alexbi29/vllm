@@ -19,6 +19,9 @@ describes the serving recipe, workload, performance, quality and uncertainty.
 - `compressible_memory_results.json`: actual VMM compression grants, two
   complete 18-cell FP8 timing screens, raw-bit correctness on matching fixtures,
   and 12 allocator-capacity measurements. The capacity setup failure is separate.
+- `draft_batch_results.json`: complete 3-token and 4096-batch decode/prefill
+  observations versus saved 7-token/8192-batch controls; user-canceled 5-token
+  arm, cold versus cached capacity, saved control quality and held decisions.
 
 The source build that produced these results is recorded in `build`.
 These are saved measurements, not results from building this PR branch.
@@ -71,3 +74,17 @@ steady GEMM or output-token energy. No physical DRAM counters were collected.
 All real-data speed gates failed, despite a 3.13× zero-data positive control.
 The separate CUDA/NVML capacity measurements found 0 reusable VRAM saving.
 This is a held experiment: no serving feature, default or precision changed.
+
+## Draft length and prefill batching
+
+The later configuration screen retains the original FP8 weights, BF16 KV,
+FlashInfer/page64, probabilistic DFlash2, FP8 draft head and 450 W. Only draft
+length or maximum batched prefill tokens changes. The 3-token arm trades slower
+C1/C4 for faster C16; the user canceled 5 tokens before measurement. Batch4096
+has small decode changes and slightly higher prefill rates.
+
+The first batch4096 boot compiles fresh graphs and fails the initial capacity
+screen. A separately declared single cached reload reserves 263,552 KV tokens,
+above the 262,144-token target. Both observations remain separate. No candidate
+hard8 run or promotion followed, and the original 7-token/8192 recipe is restored.
+These are descriptive one-boot measurements, not statistical equivalence claims.
