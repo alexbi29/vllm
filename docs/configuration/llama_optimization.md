@@ -4,6 +4,8 @@ For the dense FP8 Llama workload measured here, FlashInfer with 64-token pages
 improved 64K prefill by **9.49%** and lowered GPU-board J/input token by **8.32%**.
 Decode changes were small. Screened output-head and alternative FP8 GEMM
 operators did not clear their advancement gates, so no new kernel was retained.
+An additional transparent CUDA memory-compression screen also stayed out:
+actual FP8 GEMMs gained no material speed and returned no reusable VRAM for KV.
 
 This is a record of one workload, not a default for every Llama checkpoint.
 The [saved results](../../benchmarks/kernels/llama_optimization/README.md)
@@ -203,3 +205,69 @@ unique (M,N) pairs. Precision, counts, timing windows and margins are unchanged.
 Only corrected observations are used above. Both decode candidates failed
 their preceding performance gate, so no additional full-model quality campaign
 was entered and the accepted FlashInfer recipe remained in service.
+
+## Transparent CUDA weight-memory compression
+
+This independent operator screen uses the same FP8 bytes, per-channel scales,
+dynamic per-token input quantization and BF16 outputs in both arms. It changes
+only the VMM allocation hint, `CU_MEM_ALLOCATION_COMP_NONE` versus
+`CU_MEM_ALLOCATION_COMP_GENERIC`. Every candidate allocation was checked with
+`cuMemGetAllocationPropertiesFromHandle`; a device support attribute alone did
+not count as enabled compression. Serving integration would be opt-in and
+default-off; no serving allocator or default was changed.
+
+The measured source is `28c118b2ca0671df7fe8df1bcedc56255f3ef925`, with its
+existing native build and Torch 2.14, on the same SM120 card at 450 W. This is
+separate from the older serving measurements above. The existing GEMM dispatch
+uses CUTLASS at M=1/8/32 and cuBLASLt at M=128 (`64 < M <= 256`).
+
+Four serialized layer-0 matrices use the QKV/O/gate-up/down shapes listed above.
+There are six counterbalanced windows of 20 samples per arm/cell. CUDA graph
+external timing-event nodes surround only the GEMM; a high-entropy buffer of
+twice the 128 MiB L2 is written outside the timed nodes before each replay.
+CUPTI Python support and Nsight Compute were unavailable, so physical DRAM
+bytes and compression ratios were not measured. Reported logical GB/s is not
+a physical DRAM counter.
+
+Final timed run; medians in microseconds:
+
+| Operand/cell | Ordinary | Compressible | Rate change |
+| --- | ---: | ---: | ---: |
+| Actual FP8, sum of four GEMMs at M=1 | 419.840 | 420.184 | −0.08% |
+| Actual FP8, sum at M=8 | 422.240 | 425.040 | −0.66% |
+| Actual FP8, sum at M=32 | 429.696 | 429.864 | −0.04% |
+| Actual FP8, sum at M=128 | 465.256 | 466.376 | −0.24% |
+| Zero weights, down/M=8 | 108.872 | 34.816 | 3.13× speedup |
+| High-entropy weights, down/M=8 | 109.056 | 108.544 | +0.47% |
+
+The six M=8 window medians have these minimum/maximum ranges (microseconds):
+
+| Actual FP8 matrix | Ordinary range | Compressible range |
+| --- | ---: | ---: |
+| QKV | 51.200–52.000 | 51.200–51.200 |
+| O | 40.960–42.784 | 40.960–42.800 |
+| Gate/up | 221.184–221.920 | 221.184–223.024 |
+| Down | 108.544–108.544 | 108.544–110.592 |
+
+The zero control demonstrates a working compression path. It does not establish
+a benefit for real FP8 operands. The initial timed run also failed the gate:
+its M=8 aggregate rate changed −0.32%. Both complete 18-cell runs and every
+sample remain in `compressible_memory_results.json`. The aggregate sums describe
+four operator cases, not measured model TPS. Neither run clears the frozen +3%
+M=8 advancement margin. A subsequent correctness-only run compares raw BF16
+storage bits, including signed zero, on the final timed run's matching operand
+hashes. All 18 eager and graph cases pass; timing was not repeated for that check.
+
+A separately declared capacity screen addresses KV headroom. In three paired
+repetitions each, the real FP8 matrix and the all-zero control both consumed
+**152 MiB with either allocation type**, measured independently by CUDA free
+memory and NVML. Every release returned to baseline. **Reusable VRAM saving was
+zero**, so this path did not improve KV capacity. The initial capacity setup
+failed before collecting samples because no CUDA context was current; it is
+retained separately from the corrected 12 measurements.
+
+The benchmark is explicitly invoked, and the production allocation path remains
+unchanged. No model quality/TPS/prefill campaign was entered after the operator
+and capacity gates failed. No new production energy or KV-capacity gain is
+claimed. CPU entropy-code compression of a file is a different mechanism from
+the hardware patterns recognized by transparent compute-data compression.
