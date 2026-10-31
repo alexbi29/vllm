@@ -384,9 +384,9 @@ def test_compact_cache_rejects_incompatible_storage(dtype, mode, head_size):
 def test_gemma4_mtp_reads_target_compact_norm(monkeypatch, runner):
     """A draft's independent dense backend must not misinterpret compact KV."""
     if runner == "v1":
-        from vllm.v1.spec_decode import gemma4 as runner_module
+        from vllm.v1.spec_decode import gemma4 as v1_runner
     else:
-        from vllm.v1.worker.gpu.spec_decode.gemma4 import speculator as runner_module
+        from vllm.v1.worker.gpu.spec_decode.gemma4 import speculator as v2_runner
 
     norm = torch.randn(512, dtype=torch.bfloat16)
     target_impl = SimpleNamespace(
@@ -432,16 +432,16 @@ def test_gemma4_mtp_reads_target_compact_norm(monkeypatch, runner):
     target_name = "model.layers.0.self_attn.attn"
     if runner == "v1":
         monkeypatch.setattr(
-            runner_module,
+            v1_runner,
             "get_layers_from_vllm_config",
             lambda *args: {target_name: target},
         )
-        runner_module.Gemma4Proposer._setup_gemma4_kv_sharing(proposer, {target_name})
+        v1_runner.Gemma4Proposer._setup_gemma4_kv_sharing(proposer, {target_name})
     else:
         proposer.vllm_config.compilation_config = SimpleNamespace(
             static_forward_context={target_name: target}
         )
-        runner_module.Gemma4Speculator._setup_gemma4_kv_sharing(
+        v2_runner.Gemma4Speculator._setup_gemma4_kv_sharing(
             proposer, proposer.model, {target_name}
         )
         torch.testing.assert_close(draft._k_scale, target._k_scale)
