@@ -64,8 +64,8 @@ def test_qwen4_exp_resident_tactics_graph_replays_new_routes(
     """Tactics must track new routes and exactly repeat unchanged graph inputs."""
     from types import SimpleNamespace
 
-    if pytest.importorskip("flashinfer").__version__ != "0.7.2":
-        pytest.skip("The opt-in tactic plans require FlashInfer 0.7.2")
+    if pytest.importorskip("flashinfer").__version__ not in ("0.7.2", "0.7.2.post1"):
+        pytest.skip("The opt-in tactic plans require FlashInfer 0.7.2 or 0.7.2.post1")
 
     from vllm.compilation import backends
     from vllm.model_executor.layers.quantization.utils import nvfp4_resident

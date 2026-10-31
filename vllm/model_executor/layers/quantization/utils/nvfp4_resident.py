@@ -39,8 +39,11 @@ def _validated_sm120_moe_tactics(device_index: int) -> dict[int, tuple[int, int]
     from flashinfer.fused_moe.core import ActivationType, get_cutlass_fused_moe_module
     from flashinfer.utils import device_support_pdl
 
-    if flashinfer.__version__ != "0.7.2":
-        raise RuntimeError("Qwen4Exp SM120 MoE tactics require FlashInfer 0.7.2")
+    # post1 retains the CUTLASS builders and native tactic definitions.
+    if flashinfer.__version__ not in ("0.7.2", "0.7.2.post1"):
+        raise RuntimeError(
+            "Qwen4Exp SM120 MoE tactics require FlashInfer 0.7.2 or 0.7.2.post1"
+        )
     device = torch.device("cuda", device_index)
     with torch.accelerator.device_index(device_index):
         runner = (
