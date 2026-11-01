@@ -35,6 +35,71 @@ from vllm.v1.worker.gpu.spec_decode.target_dependent_ar.speculator import (
 from vllm.v1.worker.utils import AttentionGroup
 
 
+@pytest.mark.parametrize("hidden_size", [33, 256, 2816])
+@pytest.mark.parametrize("num_reqs", [1, 3, 7])
+def test_q_only_inputs_select_last_accepted_row(hidden_size, num_reqs):
+    """Drop rejected/prompt rows, retaining sampling keys and graph padding."""
+    from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+
+    device = torch.device("cuda")
+    max_reqs = 8
+    tokens = num_reqs * 3
+    target_buffers = InputBuffers(max_reqs, tokens, device)
+    batch = InputBatch.make_dummy(num_reqs, tokens, target_buffers)
+    batch.positions.copy_(torch.arange(tokens, device=device) + 100)
+    batch.seq_lens.copy_(torch.arange(num_reqs, device=device) + 103)
+    batch.idx_mapping.copy_(torch.arange(num_reqs, device=device).roll(1))
+    rejected = torch.arange(num_reqs, device=device, dtype=torch.int32) % 3
+    sampled = torch.arange(num_reqs, device=device, dtype=torch.int32) % 2
+    last = torch.arange(max_reqs, device=device, dtype=torch.int64) + 1000
+    backup = last + 1000
+    accepted_rows = batch.query_start_loc[1:] - rejected - 1
+    source = torch.randn(tokens, hidden_size + 7, device=device, dtype=torch.bfloat16)[
+        :, :hidden_size
+    ]
+    destination = torch.full(
+        (max_reqs, hidden_size + 3), -99, device=device, dtype=source.dtype
+    )[:, :hidden_size]
+    draft_buffers = InputBuffers(max_reqs, max_reqs, device)
+    draft_buffers.seq_lens.fill_(999)
+    draft_buffers.query_start_loc.fill_(999)
+    current_step = torch.tensor(99, device=device, dtype=torch.int64)
+    sample_positions = torch.full((max_reqs,), -1, device=device, dtype=torch.int64)
+
+    spec_module.prepare_q_only_decode_inputs(
+        destination,
+        current_step,
+        draft_buffers,
+        sample_positions,
+        source,
+        batch,
+        sampled,
+        rejected,
+        last,
+        backup,
+        max_reqs,
+    )
+
+    expected_ids = torch.where(
+        sampled > 0, last[batch.idx_mapping], backup[batch.idx_mapping]
+    ).to(torch.int32)
+    assert torch.equal(draft_buffers.input_ids[:num_reqs], expected_ids)
+    assert torch.equal(destination[:num_reqs], source[accepted_rows])
+    assert torch.equal(
+        draft_buffers.positions[:num_reqs], batch.positions[accepted_rows]
+    )
+    assert torch.equal(sample_positions[:num_reqs], batch.positions[accepted_rows] + 1)
+    assert torch.equal(draft_buffers.seq_lens[:num_reqs], batch.seq_lens - rejected)
+    assert torch.count_nonzero(draft_buffers.seq_lens[num_reqs:]) == 0
+    assert torch.equal(
+        draft_buffers.query_start_loc,
+        torch.arange(max_reqs + 1, device=device, dtype=torch.int32).clamp_max(
+            num_reqs
+        ),
+    )
+    assert current_step.item() == 0
+
+
 class _TestSpeculator(TargetDependentARSpeculator):
     # Set by each test to the draft model `load_draft_model` should hand back.
     test_draft_model: torch.nn.Module
@@ -513,6 +578,67 @@ def test_multi_step_decode_replays_captured_graph_as_expected(
 
     assert decode.call_count == expected_eager_calls
     assert run_fullgraph.call_count == expected_graph_replays
+
+
+class _QOnlyTestSpeculator(_TestSpeculator):
+    @property
+    def use_q_only_drafting(self) -> bool:
+        return True
+
+
+@pytest.mark.parametrize(
+    ("method_name", "cg_mode", "expected_eager_calls", "expected_graph_replays"),
+    [
+        ("_multi_step_decode", CUDAGraphMode.NONE, 4, 0),
+        ("_multi_step_decode", CUDAGraphMode.FULL, 0, 4),
+        ("_run_fused_multi_step_decode", CUDAGraphMode.NONE, 4, 0),
+        ("_run_fused_multi_step_decode", CUDAGraphMode.FULL, 0, 1),
+    ],
+)
+def test_q_only_multi_step_decode_starts_at_draft_step_zero(
+    monkeypatch, method_name, cg_mode, expected_eager_calls, expected_graph_replays
+):
+    """Q-only drafting has no draft prefill, so step 0 also runs as a decode."""
+    speculator = object.__new__(_QOnlyTestSpeculator)
+    speculator.num_speculative_steps = 4
+    speculator.current_draft_step = torch.tensor(7)
+    speculator.input_buffers = SimpleNamespace(
+        positions=torch.arange(2), query_start_loc=torch.arange(3)
+    )
+    speculator.idx_mapping = torch.arange(2)
+    speculator.attn_groups = []
+    speculator.block_tables = SimpleNamespace(input_block_tables=[])
+    steps = []
+    decode = Mock(side_effect=lambda *a, **k: steps.append(int(speculator.current_draft_step)))
+    monkeypatch.setattr(speculator, "_decode", decode)
+    run_fullgraph = Mock(
+        side_effect=lambda _: steps.append(int(speculator.current_draft_step))
+    )
+    speculator.decode_cudagraph_manager = SimpleNamespace(run_fullgraph=run_fullgraph)
+
+    getattr(speculator, method_name)(
+        num_reqs=2,
+        skip_attn=True,
+        batch_desc=BatchExecutionDescriptor(cg_mode=cg_mode, num_tokens=2, num_reqs=2),
+        seq_lens_cpu_upper_bound=None,
+        num_tokens_across_dp=None,
+        num_speculative_steps=4,
+    )
+
+    assert speculator._first_decode_step == 0
+    assert decode.call_count == expected_eager_calls
+    assert run_fullgraph.call_count == expected_graph_replays
+    if method_name == "_multi_step_decode" or cg_mode == CUDAGraphMode.NONE:
+        assert steps == [0, 1, 2, 3]
+
+
+def test_q_only_skips_ordinary_decode_input_preparation(monkeypatch):
+    """Q-only inputs come from prepare_q_only_decode_inputs in propose()."""
+    speculator = object.__new__(_QOnlyTestSpeculator)
+    launched = Mock()
+    monkeypatch.setattr(spec_module, "_prepare_decode_inputs_kernel", launched)
+    speculator._prepare_decode_inputs(None, None, 2, False, None)
+    launched.__getitem__.assert_not_called()
 
 
 def test_fused_full_graph_maps_split_group_block_tables():

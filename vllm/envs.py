@@ -95,6 +95,7 @@ if TYPE_CHECKING:
     VLLM_FLOAT32_MATMUL_PRECISION: Literal["highest", "high", "medium"] = "highest"
     VLLM_BATCH_INVARIANT: bool = False
     VLLM_GEMMA4_DENSE_CUDNN: bool = False
+    VLLM_GEMMA4_Q_ONLY_DRAFTING: bool = False
     VLLM_TRITON_USE_TD: bool | None = None
     VLLM_GPU_SYNC_CHECK: Literal["warn", "error"] | None = None
     MAX_JOBS: str | None = None
@@ -679,6 +680,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Opt-in SM120 BF16 Gemma4 shared-MLP projections with audited cuDNN plans.
     "VLLM_GEMMA4_DENSE_CUDNN": lambda: bool(
         int(os.getenv("VLLM_GEMMA4_DENSE_CUDNN", "0"))
+    ),
+    "VLLM_GEMMA4_Q_ONLY_DRAFTING": lambda: bool(
+        int(os.getenv("VLLM_GEMMA4_Q_ONLY_DRAFTING", "0"))
     ),
     "VLLM_REPLICATE_EMBED": lambda: (
         os.getenv("VLLM_REPLICATE_EMBED", "0").strip().lower() in ("1", "true")
