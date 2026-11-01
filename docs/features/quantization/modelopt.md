@@ -49,6 +49,14 @@ module prefix and decoder layer indices before constructing quantized layers.
     use `--linear-backend flashinfer_trtllm` to select FlashInfer's TensorRT-LLM
     GEMM backend.
 
+### GDN prefill gate precision
+
+FlashInfer GDN prefill uses CUDA libdevice exponentiation for the final gate
+inside fused preparation. This automatic behavior preserves the previous
+Torch-compatible gate rounding without a separate Torch launch. It also applies
+to ModelOpt NVFP4 models such as Qwen3.8-Flash-Next and is not limited to SM120.
+Prefill backends that consume log gates keep their existing preparation.
+
 ## Benchmarking with dummy weights
 
 For performance experiments with random weights, use `--load-format dummy`.
@@ -219,12 +227,9 @@ Post-load FP8 placement releases the original BF16 backing allocation while
 preserving the parameter object and its weight loader. This allows the smaller
 FP8 weights to return memory to the KV-cache budget.
 
-On SM120, Qwen4Exp's FlashInfer GDN prefill uses CUDA libdevice FP32 gate
-exponentiation inside the fused preparation kernel to preserve the earlier
-Torch/CUDA exp arithmetic. The fast Triton exp approximation changes rounding
-and can change greedy tool-call generation. This path adds no separate Torch
-launch, preserves the compiler's flush-to-zero defaults and keeps FlashInfer's
-in-place output for both ordinary and speculative prefill.
+The [GDN prefill gate precision](#gdn-prefill-gate-precision) correction also
+applies to Qwen4Exp. It preserves the compiler's flush-to-zero defaults and
+FlashInfer's in-place output for ordinary and speculative prefill.
 
 The following kernel options also default off:
 

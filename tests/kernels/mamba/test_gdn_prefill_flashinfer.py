@@ -222,10 +222,10 @@ def test_flashinfer_checkpoints_export_the_state_at_each_offset(use_cp, ssm_dtyp
 
 @pytest.mark.parametrize("num_tokens", [1, 326, 336])
 @torch.inference_mode()
-def test_fused_precise_gate_matches_torch_without_changing_preparation(
+def test_fused_gate_matches_torch_without_changing_preparation(
     num_tokens: int,
 ):
-    """The fused precise gate preserves the old exp and preceding Q/K/V/beta."""
+    """Fused gate exponentiation preserves the old exp and Q/K/V/beta."""
     torch.manual_seed(0)
     device = "cuda"
     h, hv, k, v = 16, 48, 128, 128
@@ -244,7 +244,7 @@ def test_fused_precise_gate_matches_torch_without_changing_preparation(
         head_v_dim=v,
     )
     reference = fused_post_conv_prep(**inputs, output_g_exp=False)
-    precise = fused_post_conv_prep(**inputs, output_g_exp=True, precise_g_exp=True)
+    precise = fused_post_conv_prep(**inputs, output_g_exp=True)
     for index in (0, 1, 2, 4):
         torch.testing.assert_close(precise[index], reference[index], rtol=0, atol=0)
     torch.testing.assert_close(precise[3], torch.exp(reference[3]), rtol=0, atol=0)
@@ -263,7 +263,7 @@ def test_fused_precise_gate_matches_torch_without_changing_preparation(
 def test_qwen4_prefill_preserves_gate_rounding_and_continuation(
     num_tokens: int, dist_init: None
 ):
-    """Real prefill preserves the old SM120 Torch gate, output and cached state."""
+    """Real prefill preserves the old Torch gate, output and cached state."""
     torch.manual_seed(0)
     device = torch.device("cuda")
     prefix = "model.layers.0.linear_attn"
@@ -345,9 +345,6 @@ def test_qwen4_prefill_preserves_gate_rounding_and_continuation(
                 query_start_loc=metadata.non_spec_query_start_loc,
                 metadata=metadata,
             ).T
-            # The old numerical reference uses Torch exp on SM120. Other
-            # architectures retain the upstream fused-exp route.
-            torch_exp = current_platform.is_device_capability(120)
             q, k, v, g, beta = fused_post_conv_prep(
                 conv_output,
                 a,
@@ -358,10 +355,9 @@ def test_qwen4_prefill_preserves_gate_rounding_and_continuation(
                 layer.head_k_dim,
                 layer.head_v_dim,
                 apply_l2norm=True,
-                output_g_exp=not torch_exp,
+                output_g_exp=False,
             )
-            if torch_exp:
-                g = torch.exp(g)
+            g = torch.exp(g)
             state_indices = metadata.prefill_state_indices
             assert state_indices is not None
             initial_state = ref_state[state_indices].clone()

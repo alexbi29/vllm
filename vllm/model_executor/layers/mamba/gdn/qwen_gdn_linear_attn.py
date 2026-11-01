@@ -748,14 +748,6 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         self.chunk_gated_delta_rule = ChunkGatedDeltaRule()
         self.gdn_prefill_backend = self.chunk_gated_delta_rule.gdn_prefill_backend
-        # The fast exp approximation changes Qwen4Exp's tool-call generation on
-        # SM120. Keep the preparation fused, using the libdevice exp path.
-        self._use_precise_prefill_gate_exp = (
-            getattr(config, "model_type", None) == "qwen4_exp_text"
-            and current_platform.is_cuda()
-            and current_platform.is_device_capability(120)
-            and self.gdn_prefill_backend == "flashinfer"
-        )
         self._prefill_kernels_warmed_up = False
         self.vllm_config = vllm_config
         # FlashInfer's prefill emits mid-prefill states, so an align-mode
@@ -1918,7 +1910,6 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 head_v_dim=self.head_v_dim,
                 apply_l2norm=True,
                 output_g_exp=self.gdn_prefill_backend == "flashinfer",
-                precise_g_exp=getattr(self, "_use_precise_prefill_gate_exp", False),
             )
             query_non_spec = query_non_spec.unsqueeze(0)
             key_non_spec = key_non_spec.unsqueeze(0)
