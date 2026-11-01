@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from typing import Any
+
 import pytest
 import torch
 
@@ -216,6 +218,36 @@ def test_flashinfer_checkpoints_export_the_state_at_each_offset(use_cp, ssm_dtyp
     untouched = [i for i in range(num_blocks) if i not in written]
     assert not ssm_state[untouched].any()
     assert not conv_state[untouched].any()
+
+
+@pytest.mark.parametrize("num_tokens", [1, 326, 336])
+@torch.inference_mode()
+def test_fused_precise_gate_matches_torch_without_changing_preparation(
+    num_tokens: int,
+):
+    """The fused precise gate preserves the old exp and preceding Q/K/V/beta."""
+    torch.manual_seed(0)
+    device = "cuda"
+    h, hv, k, v = 16, 48, 128, 128
+    inputs: dict[str, Any] = dict(
+        conv_output=torch.randn(
+            num_tokens, 2 * h * k + hv * v, device=device, dtype=torch.bfloat16
+        ),
+        a=torch.empty(num_tokens, hv, device=device, dtype=torch.bfloat16).uniform_(
+            -4, 4
+        ),
+        b=torch.randn(num_tokens, hv, device=device, dtype=torch.bfloat16),
+        A_log=torch.linspace(-6, 2, hv, device=device, dtype=torch.float32),
+        dt_bias=torch.empty(hv, device=device, dtype=torch.bfloat16).uniform_(-1, 1),
+        num_k_heads=h,
+        head_k_dim=k,
+        head_v_dim=v,
+    )
+    reference = fused_post_conv_prep(**inputs, output_g_exp=False)
+    precise = fused_post_conv_prep(**inputs, output_g_exp=True, precise_g_exp=True)
+    for index in (0, 1, 2, 4):
+        torch.testing.assert_close(precise[index], reference[index], rtol=0, atol=0)
+    torch.testing.assert_close(precise[3], torch.exp(reference[3]), rtol=0, atol=0)
 
 
 @pytest.mark.skipif(

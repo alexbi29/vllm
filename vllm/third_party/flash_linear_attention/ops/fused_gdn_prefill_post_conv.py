@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import torch
 
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, tldevice, triton
 
 
 @triton.jit
@@ -47,6 +47,7 @@ def _fused_post_conv_kernel(
     APPLY_L2NORM: tl.constexpr,
     L2NORM_EPS: tl.constexpr,
     OUTPUT_G_EXP: tl.constexpr,
+    PRECISE_G_EXP: tl.constexpr,
     SOFTPLUS_THRESHOLD: tl.constexpr,
     BLOCK_T: tl.constexpr,
     BK: tl.constexpr,
@@ -152,7 +153,10 @@ def _fused_post_conv_kernel(
         g_vals = -tl.exp(A_log_val) * sp
 
         if OUTPUT_G_EXP:
-            g_vals = tl.exp(g_vals)
+            if PRECISE_G_EXP:
+                g_vals = tldevice.exp(g_vals)
+            else:
+                g_vals = tl.exp(g_vals)
 
         beta_vals = tl.sigmoid(b_vals)
 
@@ -172,6 +176,7 @@ def fused_post_conv_prep(
     head_v_dim: int,
     apply_l2norm: bool = True,
     output_g_exp: bool = False,
+    precise_g_exp: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused post-conv1d prep: split + l2norm + gating in one kernel.
 
@@ -186,6 +191,7 @@ def fused_post_conv_prep(
         head_v_dim: dimension per V head (V)
         apply_l2norm: whether to L2-normalize q and k
         output_g_exp: if True, output exp(g) instead of g (for FlashInfer)
+        precise_g_exp: use libdevice for the final exp(g) when output_g_exp is True
 
     Returns:
         q: [L, H, K] contiguous, optionally l2-normalized
@@ -249,6 +255,7 @@ def fused_post_conv_prep(
         APPLY_L2NORM=apply_l2norm,
         L2NORM_EPS=1e-6,
         OUTPUT_G_EXP=output_g_exp,
+        PRECISE_G_EXP=precise_g_exp,
         SOFTPLUS_THRESHOLD=20.0,
         BLOCK_T=BLOCK_T,
         BK=BK,
