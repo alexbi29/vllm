@@ -5,17 +5,29 @@ from types import SimpleNamespace
 import pytest
 import torch
 from torch import nn
+from transformers import LlamaConfig
 
+from vllm.config import ModelConfig
+from vllm.distributed import (
+    destroy_distributed_environment,
+    destroy_model_parallel,
+    init_distributed_environment,
+    initialize_model_parallel,
+)
 from vllm.model_executor.layers.linear import ReplicatedLinear, UnquantizedLinearMethod
+from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
+    CUTLASS_BLOCK_FP8_SUPPORTED,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.models.qwen4_exp.nvidia.weight_placement import (
     move_embedding_to_host,
     quantize_dense_fp8,
 )
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+cuda_only = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
 
+@cuda_only
 def test_host_embedding_lookups_are_exact(default_vllm_config, dist_init):
     embed = VocabParallelEmbedding(1000, 256).to("cuda", torch.bfloat16)
     embed.weight.data.normal_()
@@ -53,6 +65,7 @@ class _Model(nn.Module):
         )
 
 
+@cuda_only
 def test_fp8_dense_converts_only_matching_projections(
     default_vllm_config, dist_init, monkeypatch
 ):
@@ -71,6 +84,9 @@ def test_fp8_dense_converts_only_matching_projections(
 
     assert converted == ["a.proj"]
     assert model.a.proj.weight.dtype == torch.float8_e4m3fn
+    assert model.a.proj.weight.untyped_storage().nbytes() == (
+        model.a.proj.weight.numel() * model.a.proj.weight.element_size()
+    )
     assert type(model.b.proj.quant_method) is UnquantizedLinearMethod
     out_a, _ = model.a.proj(x)
     out_b, _ = model.b.proj(x)
@@ -79,6 +95,82 @@ def test_fp8_dense_converts_only_matching_projections(
     assert 0 < rel < 0.06
 
 
+@cuda_only
 def test_fp8_dense_rejects_unknown_kernel(default_vllm_config, dist_init):
     with pytest.raises(ValueError, match="Unknown FP8"):
         quantize_dense_fp8(_Model().to("cuda"), r"proj", "NoSuchKernel")
+
+
+@pytest.mark.skipif(
+    not CUTLASS_BLOCK_FP8_SUPPORTED,
+    reason="requires a CUDA build with block-FP8 kernel selection",
+)
+def test_fp8_dense_releases_bf16_storage_on_cpu(default_vllm_config, tmp_path):
+    """Post-load placement shrinks storage without changing bytes or loaders.
+
+    Kernel selection uses the CUDA build, but conversion and parameter storage
+    are CPU tensors; no CUDA context or matrix multiplication is required.
+    """
+    LlamaConfig(
+        architectures=["LlamaForCausalLM"],
+        hidden_size=128,
+        intermediate_size=256,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        max_position_embeddings=512,
+        vocab_size=256,
+    ).save_pretrained(tmp_path)
+    default_vllm_config.model_config = ModelConfig(
+        model=str(tmp_path), dtype="bfloat16", skip_tokenizer_init=True
+    )
+    cuda_initialized = torch.cuda.is_initialized()
+    init_distributed_environment(
+        world_size=1,
+        rank=0,
+        local_rank=0,
+        distributed_init_method=f"file://{tmp_path / 'dist'}",
+        backend="gloo",
+    )
+    initialize_model_parallel(1, 1, backend="gloo")
+    try:
+        model = nn.Sequential(
+            ReplicatedLinear(
+                128, 256, bias=False, params_dtype=torch.bfloat16, disable_tp=True
+            )
+        )
+        checkpoint = (
+            torch.arange(128 * 256, dtype=torch.float32)
+            .remainder(8)
+            .reshape(256, 128)
+            .div(8)
+            .to(torch.bfloat16)
+        )
+        layer = model[0]
+        layer.weight.weight_loader(layer.weight, checkpoint)
+        parameter = layer.weight
+        loader = parameter.weight_loader
+        bf16_bytes = parameter.untyped_storage().nbytes()
+        # Every block has max=7/8, so its exact E4M3 scale is (7/8)/448=1/512.
+        expected_weight = (checkpoint * 512).to(torch.float8_e4m3fn)
+        expected_scale = torch.full((2, 1), 1 / 512, dtype=torch.float32)
+
+        with torch.compiler.set_stance("force_eager"):
+            converted = quantize_dense_fp8(
+                model, r"^0$", "CutlassFp8BlockScaledMMKernel"
+            )
+
+        assert converted == ["0"]
+        assert layer.weight is parameter
+        assert layer.weight.weight_loader == loader
+        assert layer.weight.device.type == "cpu"
+        assert layer.weight.dtype == torch.float8_e4m3fn
+        assert layer.weight.untyped_storage().nbytes() == bf16_bytes // 2
+        assert torch.equal(
+            layer.weight.view(torch.uint8), expected_weight.view(torch.uint8)
+        )
+        assert torch.equal(layer.weight_scale_inv, expected_scale)
+        assert torch.cuda.is_initialized() == cuda_initialized
+    finally:
+        destroy_model_parallel()
+        destroy_distributed_environment()
