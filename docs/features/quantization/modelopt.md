@@ -223,6 +223,16 @@ to 128x128-block FP8 with dynamic 1x128 activation scales. This is lossy:
 Qwen's own FP8 checkpoint keeps these layers in BF16. Qualify output quality
 before enabling it.
 
+Post-load FP8 placement releases the original BF16 backing allocation while
+preserving the parameter object and its weight loader. This allows the smaller
+FP8 weights to return memory to the KV-cache budget.
+
+On SM120, Qwen4Exp's FlashInfer GDN prefill preserves the Torch FP32 gate
+exponentiation used before fused gate preparation. Fusing this operation into
+Triton changes rounding and can change greedy tool-call generation. This
+compatibility path keeps FlashInfer's in-place output and applies to both
+ordinary and speculative prefill.
+
 The following kernel options also default off:
 
 - `qwen4_exp_sm120_bf16_gemm` selects measured small-row BF16 projection
