@@ -748,9 +748,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         self.chunk_gated_delta_rule = ChunkGatedDeltaRule()
         self.gdn_prefill_backend = self.chunk_gated_delta_rule.gdn_prefill_backend
-        # Fusing exp into Triton changes Qwen4Exp's greedy tool-call generation
-        # on SM120. Preserve the model's Torch-exp rounding on this path.
-        self._use_torch_prefill_gate_exp = (
+        # The fast exp approximation changes Qwen4Exp's tool-call generation on
+        # SM120. Keep the preparation fused, using the libdevice exp path.
+        self._use_precise_prefill_gate_exp = (
             getattr(config, "model_type", None) == "qwen4_exp_text"
             and current_platform.is_cuda()
             and current_platform.is_device_capability(120)
@@ -1901,7 +1901,6 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 a_prefill = a_non_spec
                 b_prefill = b_non_spec
 
-            use_torch_gate_exp = getattr(self, "_use_torch_prefill_gate_exp", False)
             (
                 query_non_spec,
                 key_non_spec,
@@ -1918,11 +1917,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 head_k_dim=self.head_k_dim,
                 head_v_dim=self.head_v_dim,
                 apply_l2norm=True,
-                output_g_exp=self.gdn_prefill_backend == "flashinfer"
-                and not use_torch_gate_exp,
+                output_g_exp=self.gdn_prefill_backend == "flashinfer",
+                precise_g_exp=getattr(self, "_use_precise_prefill_gate_exp", False),
             )
-            if use_torch_gate_exp:
-                g_non_spec = torch.exp(g_non_spec)
             query_non_spec = query_non_spec.unsqueeze(0)
             key_non_spec = key_non_spec.unsqueeze(0)
             value_non_spec = value_non_spec.unsqueeze(0)
