@@ -746,6 +746,7 @@ def test_draft_prefill_matches_shared_target_metadata_shape(
     speculator = object.__new__(_Speculator)
     speculator.__dict__.update(
         vllm_config=target.vllm_config,
+        use_q_only_drafting=False,
         device=torch.device("cpu"),
         num_speculative_steps=3,
         enable_adaptive_verification=adaptive,

@@ -11,6 +11,7 @@ from collections import defaultdict
 
 import torch.nn as nn
 
+import vllm.envs as envs
 from vllm.compilation.backends import set_model_tag
 from vllm.config import VllmConfig, replace
 from vllm.distributed.parallel_state import get_pp_group
@@ -47,6 +48,32 @@ def _copy_target_kv_scales(attn: nn.Module, target_attn: nn.Module) -> None:
 
 
 class Gemma4Speculator(TargetDependentARSpeculator):
+    def load_model(self, target_model: nn.Module) -> None:
+        super().load_model(target_model)
+        if envs.VLLM_GEMMA4_Q_ONLY_DRAFTING:
+            if self.use_q_only_drafting:
+                logger.info(
+                    "Gemma4 Q-only drafting enabled; skip full-row draft prefill"
+                )
+            else:
+                logger.warning(
+                    "Gemma4 Q-only drafting requires TP/PP/DP/PCP=1 and "
+                    "text-only draft inputs; retaining full-row draft prefill"
+                )
+
+    @property
+    def use_q_only_drafting(self) -> bool:
+        parallel = self.vllm_config.parallel_config
+        return (
+            envs.VLLM_GEMMA4_Q_ONLY_DRAFTING
+            and self.pcp_manager is None
+            and not self.supports_mm_inputs
+            and parallel.tensor_parallel_size == 1
+            and parallel.data_parallel_size == 1
+            and parallel.pipeline_parallel_size == 1
+            and parallel.prefill_context_parallel_size == 1
+        )
+
     @property
     def advance_draft_positions(self) -> bool:
         # Gemma4 MTP is Q-only and reads K/V from the target's existing cache.
