@@ -522,6 +522,7 @@ def test_draft_prefill_matches_shared_target_metadata_shape(
     hidden_states = torch.zeros(target_desc.num_tokens, 1)
     speculator = SimpleNamespace(
         vllm_config=target.vllm_config,
+        use_q_only_drafting=False,
         device=torch.device("cpu"),
         num_speculative_steps=3,
         enable_adaptive_verification=adaptive,
