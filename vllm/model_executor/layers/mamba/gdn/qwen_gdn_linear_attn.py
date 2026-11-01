@@ -415,8 +415,7 @@ def fi_chunk_gated_delta_rule(
     g = g.squeeze(0).contiguous()
     beta = beta.squeeze(0).contiguous()
     fi_state = initial_state.to(torch.float32)
-    # Like FlashInfer's own API, g is the already-exponentiated gate;
-    # fused_post_conv_prep emits it directly (output_g_exp=True).
+    # Like FlashInfer's own API, callers supply the already-exponentiated gate.
     fi_g = g.to(torch.float32)
     fi_beta = beta.to(torch.float32)
     # cu_seqlens goes through as is: FlashInfer accepts int32 and int64.
@@ -867,6 +866,14 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         self.chunk_gated_delta_rule = ChunkGatedDeltaRule()
         self.gdn_prefill_backend = self.chunk_gated_delta_rule.gdn_prefill_backend
+        # Fusing exp into Triton changes Qwen4Exp's greedy tool-call generation
+        # on SM120. Preserve the model's Torch-exp rounding on this path.
+        self._use_torch_prefill_gate_exp = (
+            getattr(config, "model_type", None) == "qwen4_exp_text"
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability(120)
+            and self.gdn_prefill_backend == "flashinfer"
+        )
         self._prefill_kernels_warmed_up = False
         self.vllm_config = vllm_config
         # FlashInfer's prefill emits mid-prefill states, so an align-mode
@@ -2012,6 +2019,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 a_prefill = a_non_spec
                 b_prefill = b_non_spec
 
+            use_torch_gate_exp = getattr(self, "_use_torch_prefill_gate_exp", False)
             (
                 query_non_spec,
                 key_non_spec,
@@ -2028,8 +2036,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 head_k_dim=self.head_k_dim,
                 head_v_dim=self.head_v_dim,
                 apply_l2norm=True,
-                output_g_exp=self.gdn_prefill_backend == "flashinfer",
+                output_g_exp=self.gdn_prefill_backend == "flashinfer"
+                and not use_torch_gate_exp,
             )
+            if use_torch_gate_exp:
+                g_non_spec = torch.exp(g_non_spec)
             query_non_spec = query_non_spec.unsqueeze(0)
             key_non_spec = key_non_spec.unsqueeze(0)
             value_non_spec = value_non_spec.unsqueeze(0)
