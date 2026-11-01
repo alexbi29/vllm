@@ -35,6 +35,26 @@ for a Gemma 4 assistant checkpoint, that release is treating the assistant as a
 generic draft model and may fail during initialization for multimodal Gemma 4
 targets. Upgrade to a version with Gemma 4 MTP support instead.
 
+### Experimental query-only drafting
+
+Set `VLLM_GEMMA4_Q_ONLY_DRAFTING=1` before starting a Gemma 4 assistant on
+Model Runner V2 to compute only the last accepted row of each request on the
+first draft step. The assistant reads the target's KV cache and has no separate
+KV to populate. Other prompt and verification rows can therefore be omitted;
+all draft steps use the one-query decode graphs.
+
+This option is off by default. It currently applies to TP/PP/DP/PCP=1 with
+text-only draft inputs. Unsupported configurations log a warning and retain
+full-row draft prefill. Model Runner V1 retains its existing path. Startup logs
+state whether query-only drafting was enabled.
+
+The target still verifies each draft with its existing acceptance policy.
+This option does not relax acceptance, cap experts, change weights or quantize
+KV. Changing the draft's batch shape and attention route can change floating
+point rounding and speculative acceptance, so bit-identical generation and
+quality equivalence are not guaranteed. Measure complete output-token costs
+and usable-answer rates as well as throughput before adopting it.
+
 ## Offline Example
 
 ```python
