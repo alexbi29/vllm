@@ -51,7 +51,6 @@ class _QwenGDNWarmupConfig:
     fused_spec_decode: bool = False
     # The FlashInfer prefill takes exp(g) straight from fused_post_conv_prep.
     post_conv_g_exp: bool = False
-    post_conv_precise_g_exp: bool = False
 
     @property
     def conv_dim(self) -> int:
@@ -145,9 +144,6 @@ def _qwen_gdn_warmup_config(
                 getattr(layer, "enable_fused_gdn_spec_decode", False)
             ),
             post_conv_g_exp=getattr(layer, "gdn_prefill_backend", None) == "flashinfer",
-            post_conv_precise_g_exp=bool(
-                getattr(layer, "_use_precise_prefill_gate_exp", False)
-            ),
         )
 
     if found_layer:
@@ -243,7 +239,6 @@ def _warm_fused_post_conv_kernel(
             config.v,
             apply_l2norm=True,
             output_g_exp=config.post_conv_g_exp,
-            precise_g_exp=config.post_conv_precise_g_exp,
         )
 
 
