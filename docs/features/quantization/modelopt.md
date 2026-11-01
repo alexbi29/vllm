@@ -227,11 +227,12 @@ Post-load FP8 placement releases the original BF16 backing allocation while
 preserving the parameter object and its weight loader. This allows the smaller
 FP8 weights to return memory to the KV-cache budget.
 
-On SM120, Qwen4Exp's FlashInfer GDN prefill preserves the Torch FP32 gate
-exponentiation used before fused gate preparation. Fusing this operation into
-Triton changes rounding and can change greedy tool-call generation. This
-compatibility path keeps FlashInfer's in-place output and applies to both
-ordinary and speculative prefill.
+On SM120, Qwen4Exp's FlashInfer GDN prefill uses CUDA libdevice FP32 gate
+exponentiation inside the fused preparation kernel to preserve the earlier
+Torch/CUDA exp arithmetic. The fast Triton exp approximation changes rounding
+and can change greedy tool-call generation. This path adds no separate Torch
+launch, preserves the compiler's flush-to-zero defaults and keeps FlashInfer's
+in-place output for both ordinary and speculative prefill.
 
 The following kernel options also default off:
 
