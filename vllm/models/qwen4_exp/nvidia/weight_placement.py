@@ -101,8 +101,10 @@ def quantize_dense_fp8(
             module_name=type(method).__name__,
         )
         nbytes += weight.numel() * weight.element_size()
-        method.process_weights_after_loading(module)
+        # Parameter replacement must see the online method so it releases the
+        # BF16 source storage instead of repacking FP8 into that larger allocation.
         module.quant_method = method
+        method.process_weights_after_loading(module)
         converted.append(name)
     torch.accelerator.empty_cache()
     logger.info(
