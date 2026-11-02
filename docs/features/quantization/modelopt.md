@@ -215,6 +215,10 @@ Two lossless capacity/latency options are independent of the kernel config:
   frequency ordered, so this drops about 60% of each draft step's head
   bandwidth at an unchanged acceptance length; target verification is
   unchanged.
+  Adding `"draft_lm_head_quantization": "fp8"` quantizes only those rows,
+  with fitted per-row scales, into one compact FP8 head. On SM120 this raised
+  C1 decode by about 5% at an unchanged acceptance rate, for about 250 MiB
+  less KV cache.
 
 `VLLM_QWEN4_EXP_FP8_DENSE=<regex>` (optionally with
 `VLLM_QWEN4_EXP_FP8_DENSE_KERNEL=CutlassFp8BlockScaledMMKernel`) requantizes
