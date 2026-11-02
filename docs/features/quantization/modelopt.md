@@ -234,8 +234,12 @@ The following kernel options also default off:
   standard dispatch.
 - `qwen4_exp_sm120_moe_tactics` selects offline FlashInfer CUTLASS MoE
   tactics for the measured E512/top10/H2560/I640 shapes. It requires resident
-  scale compression and FlashInfer 0.7.2; startup checks the native tactic
-  table. Other row counts retain default dispatch.
+  scale compression and FlashInfer 0.7.2 or 0.7.2.post1; startup checks the
+  native tactic table. These plans use deterministic FP32 expert reduction
+  instead of atomic BF16 finalization. Other row counts use default tactics
+  with the same deterministic finalization. Older plans used atomic
+  finalization and can change logits and response length between identical
+  requests.
 - `qwen4_exp_sm120_qsa_prefill` selects a one-split, 32-key QSA tile for BF16
   prefills with two local KV heads and at least 2048 rows.
 - `qwen4_exp_sm120_hc_up_mix` fuses the HC up projection with sigmoid and
