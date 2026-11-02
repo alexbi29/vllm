@@ -1212,6 +1212,7 @@ class CompilationConfig:
                         self.pass_config.fuse_qk_norm_rope_kvcache = False
                     self.splitting_ops.append("vllm::unified_kv_cache_update")
                     self.splitting_ops.append("vllm::unified_mla_kv_cache_update")
+                    self.splitting_ops.append("vllm::gemma4_raw_compact_cache_update")
 
             elif len(self.splitting_ops) == 0:
                 if (

@@ -191,3 +191,46 @@ class Gemma4CompactImpl(TritonAttentionImpl):
 
     def fused_rope_kvcache_supported(self):
         return False
+
+
+class Gemma4CompactRawBackend(Gemma4CompactBackend):
+    @staticmethod
+    def get_name():
+        return "GEMMA4_COMPACT_RAW"
+
+    @staticmethod
+    def get_impl_cls():
+        return Gemma4CompactRawImpl
+
+
+class Gemma4CompactRawImpl(Gemma4CompactImpl):
+    """Raw shared projections with FP32 normalization metadata in four slots."""
+
+    def __init__(self, *args, compact_raw_rope, compact_raw_epsilon=1e-6, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.compact_raw_rope = compact_raw_rope
+        self.compact_raw_epsilon = compact_raw_epsilon
+        self.use_raw_storage = False
+        self._format_initialized = False
+
+    def process_weights_after_loading(self, act_dtype: torch.dtype):
+        super().process_weights_after_loading(act_dtype)
+        # Loading/reloading is the synchronization boundary. The forward path
+        # reads a scalar weight without a host-device check on every step.
+        scalar_norm = bool(torch.all(self.compact_k_norm == self.compact_k_norm[0]))
+        if self._format_initialized:
+            if self.use_raw_storage and not scalar_norm:
+                raise ValueError(
+                    "Reloading raw compact KV with vector KNorm weights requires "
+                    "a full model reload"
+                )
+        else:
+            self.use_raw_storage = scalar_norm
+            self._format_initialized = True
+            if not scalar_norm:
+                self.compact_raw_rope = None
+
+    def do_kv_cache_update(self, layer, key, value, kv_cache, slot_mapping):
+        write_compact_cache(
+            key, value, kv_cache, slot_mapping, raw_storage=self.use_raw_storage
+        )

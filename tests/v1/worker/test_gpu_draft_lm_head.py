@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import gc
+import json
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from vllm.config import ModelConfig
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.online.lm_head import (
     quantized_lm_head_copy,
@@ -33,13 +35,29 @@ requires_nvfp4 = pytest.mark.skipif(
 NVFP4 = pytest.param("nvfp4", marks=requires_nvfp4)
 
 
-def _target_head(monkeypatch, seed: int = 0) -> ParallelLMHead:
-    # Online methods read the model dtype from the current config.
-    model_config = SimpleNamespace(dtype=torch.bfloat16)
-    monkeypatch.setattr(
-        "vllm.model_executor.layers.quantization.online.fp8.get_current_vllm_config",
-        lambda: SimpleNamespace(model_config=model_config),
+@pytest.fixture(autouse=True)
+def head_model_config(default_vllm_config, tmp_path):
+    config = {
+        "architectures": ["LlamaForCausalLM"],
+        "model_type": "llama",
+        "hidden_size": HIDDEN,
+        "intermediate_size": HIDDEN * 2,
+        "num_hidden_layers": 1,
+        "num_attention_heads": 8,
+        "num_key_value_heads": 8,
+        "vocab_size": VOCAB,
+        "max_position_embeddings": 1024,
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    default_vllm_config.model_config = ModelConfig(
+        model=str(tmp_path),
+        dtype="bfloat16",
+        max_model_len=1024,
+        skip_tokenizer_init=True,
     )
+
+
+def _target_head(seed: int = 0) -> ParallelLMHead:
     head = ParallelLMHead(VOCAB, HIDDEN, disable_tp=True)
     gen = torch.Generator().manual_seed(seed)
     head.weight.data.copy_(torch.randn(head.weight.shape, generator=gen) * 0.02)
@@ -58,7 +76,7 @@ def _tensors(module: torch.nn.Module) -> dict[str, torch.Tensor]:
 def test_tracks_bf16_head_through_logits_processor(
     default_vllm_config, dist_init, monkeypatch, quantization, max_rel_err, min_top1
 ):
-    head = _target_head(monkeypatch)
+    head = _target_head()
     target_weight = head.weight.detach().clone()
     draft_head = quantized_lm_head_copy(head, quantization)
 
@@ -76,6 +94,49 @@ def test_tracks_bf16_head_through_logits_processor(
     top1 = (out.argmax(-1) == ref.argmax(-1)).float().mean().item()
     assert rel_err < max_rel_err
     assert top1 > min_top1
+    if quantization == "fp8":
+        from vllm.model_executor.layers.quantization.online.fp8 import (
+            _fp8_channel_scale,
+            _fp8_quant_per_channel,
+        )
+
+        scales = _fp8_channel_scale(head.weight.abs().amax(-1, keepdim=True))
+        baseline = _fp8_quant_per_channel(head.weight, scales).float() * scales
+        reference = head.weight[:VOCAB].float().T
+        basis = torch.eye(HIDDEN, device="cuda", dtype=torch.bfloat16)
+        reconstructed = logits_processor(draft_head, basis).float()
+        before = (baseline[:VOCAB].T - reference).square().sum()
+        after = (reconstructed - reference).square().sum()
+        assert after < before * 0.99
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("fp8_dtype", [torch.float8_e4m3fn, torch.float8_e4m3fnuz])
+def test_fitted_head_scales_preserve_or_reduce_each_rows_fp64_error(dtype, fp8_dtype):
+    from vllm.model_executor.layers.quantization.online.lm_head_fp8 import (
+        fit_fp8_head_scales,
+    )
+
+    generator = torch.Generator().manual_seed(29)
+    weight = torch.randn(37, 1024, generator=generator, dtype=dtype)
+    weight[0].zero_()
+    weight[1].fill_(0.125)
+    weight[2] *= 1e-5
+    weight[3] *= 100
+    original = weight.clone()
+    limit = torch.finfo(fp8_dtype).max
+    scale = (weight.float().abs().amax(-1, keepdim=True) / limit).clamp_min(
+        1 / (limit * 512)
+    )
+    quantized = (weight.float() / scale).clamp(-limit, limit).to(fp8_dtype)
+    before = (quantized.double() * scale.double() - weight.double()).square().sum(-1)
+    pointers = quantized.data_ptr(), scale.data_ptr()
+    fitted, fitted_scale = fit_fp8_head_scales(weight, quantized, scale)
+    after = (fitted.double() * fitted_scale.double() - weight.double()).square().sum(-1)
+    assert torch.all(after <= before)
+    assert after.sum() < before.sum()
+    assert (fitted.data_ptr(), fitted_scale.data_ptr()) == pointers
+    assert torch.equal(weight, original)
 
 
 @requires_cuda
@@ -86,12 +147,12 @@ def test_refresh_follows_target_update(
     """After the target's weights change, the copy is re-derived in place: it
     equals a fresh quantization of the new target, keeps its storage, and
     frees the temporary copy without waiting for the cycle collector."""
-    head = _target_head(monkeypatch)
+    head = _target_head()
     drafter = torch.nn.Module()
     drafter.lm_head = quantized_lm_head_copy(head, quantization)
     ptrs = {k: t.data_ptr() for k, t in _tensors(drafter.lm_head).items()}
 
-    new_weight = _target_head(monkeypatch, seed=1).weight.detach()
+    new_weight = _target_head(seed=1).weight.detach()
     head.weight.data.copy_(new_weight)
     gc.disable()
     try:
@@ -129,7 +190,7 @@ def test_draft_weight_update_refreshes_copy(
 ):
     """A draft weight update can write a target weight the drafter shares, such
     as an embedding tied to the lm_head; the copy must follow it."""
-    head = _target_head(monkeypatch)
+    head = _target_head()
     drafter = torch.nn.Module()
     drafter.lm_head = quantized_lm_head_copy(head, "fp8")
     worker = _draft_update_worker(
@@ -140,7 +201,7 @@ def test_draft_weight_update_refreshes_copy(
     )
 
     worker.start_draft_weight_update()
-    head.weight.data.copy_(_target_head(monkeypatch, seed=1).weight)
+    head.weight.data.copy_(_target_head(seed=1).weight)
     worker.finish_weight_update()
 
     expected = _tensors(quantized_lm_head_copy(head, "fp8"))
@@ -155,7 +216,7 @@ def test_draft_weight_update_loads_lm_head(
 ):
     """A draft update carrying lm_head.weight loads the shared target head, as
     without quantization, and the copy is re-derived from it in place."""
-    head = _target_head(monkeypatch)
+    head = _target_head()
     record_metadata_for_reloading(head)
     drafter = torch.nn.Module()
     draft_head = quantized_lm_head_copy(head, quantization)
@@ -196,7 +257,7 @@ def test_layerwise_reload_of_drafter_keeps_copy(
 ):
     """A drafter weight update reloads the drafter layerwise; the derived copy
     must come back unchanged, not be re-quantized."""
-    head = _target_head(monkeypatch)
+    head = _target_head()
     drafter = torch.nn.Module()
     record_metadata_for_reloading(drafter)
     drafter.lm_head = quantized_lm_head_copy(head, "nvfp4")
@@ -244,7 +305,7 @@ def test_token_ranges_head_scores_only_its_ranges(
         assert out.shape == ref.shape == (64, VOCAB)
         torch.testing.assert_close(out[:, inside], ref[:, inside], rtol=0, atol=0)
         assert torch.isneginf(out[:, ~inside]).all()
-        head.weight.data.copy_(_target_head(monkeypatch, seed=1).weight)
+        head.weight.data.copy_(_target_head(seed=1).weight)
 
 
 @pytest.mark.parametrize(

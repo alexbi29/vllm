@@ -434,6 +434,11 @@ class Fp8PtpcOnlineLinearMethod(OnlineLinearBase):
                 "for rowwise scaled_mm."
             )
 
+    def quantize_weight(
+        self, weight: torch.Tensor, scale: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return _fp8_quant_per_channel(weight, scale), scale
+
     def process_weights_after_loading(self, layer: Module) -> None:
         if getattr(layer, "_already_called_process_weights_after_loading", False):
             return
@@ -445,7 +450,7 @@ class Fp8PtpcOnlineLinearMethod(OnlineLinearBase):
             amax, _is_tp_sharded(layer, reduces_output_dim=False)
         )
         weight_scale = _fp8_channel_scale(amax)
-        qweight = _fp8_quant_per_channel(weight, weight_scale)
+        qweight, weight_scale = self.quantize_weight(weight, weight_scale)
 
         replace_parameter(layer, "weight", qweight.t())
         replace_parameter(layer, "weight_scale", weight_scale)

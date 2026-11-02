@@ -400,8 +400,9 @@ steps:
   - vllm/model_executor/layers/attention
   - vllm/utils/flashinfer.py
   - tests/kernels/attention
+  - tests/v1/attention/test_gemma4_compact.py
   commands:
-    - pytest -v -s kernels/attention
+    - pytest -v -s kernels/attention v1/attention/test_gemma4_compact.py
   mirror:
     amd:
       label: ":amd: (MI300) Attention Kernels"
@@ -417,11 +418,12 @@ steps:
       - vllm/v1/attention
       - vllm/model_executor/layers/attention
       - tests/kernels/attention
+      - tests/v1/attention/test_gemma4_compact.py
       - vllm/_aiter_ops.py
       - vllm/envs.py
       - vllm/platforms/rocm.py
       commands:
-      - pytest -v -s kernels/attention --ignore=kernels/attention/test_triton_unified_attention_diffkv.py --ignore=kernels/attention/test_rocm_aiter_mla_decode.py --ignore=kernels/attention/test_rocm_aiter_mla_decode_metadata.py --ignore=kernels/attention/test_rocm_aiter_mla_fp8_support.py --ignore=kernels/attention/test_rocm_aiter_mla_op_registration.py
+      - pytest -v -s kernels/attention v1/attention/test_gemma4_compact.py --ignore=kernels/attention/test_triton_unified_attention_diffkv.py --ignore=kernels/attention/test_rocm_aiter_mla_decode.py --ignore=kernels/attention/test_rocm_aiter_mla_decode_metadata.py --ignore=kernels/attention/test_rocm_aiter_mla_fp8_support.py --ignore=kernels/attention/test_rocm_aiter_mla_op_registration.py
 
 - label: ":nvidia: (H100) Attention DiffKV Kernels"
   key: kernels-attention-diffkv-test-h100
