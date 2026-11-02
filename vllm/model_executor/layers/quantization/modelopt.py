@@ -1052,6 +1052,10 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             self._build_moe_kernel(layer)
             return
 
+        # Recompute derived scales after an in-place checkpoint reload.
+        if hasattr(layer, "nvfp4_up_scale_ratio"):
+            delattr(layer, "nvfp4_up_scale_ratio")
+
         if self.per_token_activation:
             layer.w13_input_scale.data.fill_(1.0)
             layer.w2_input_scale.data.fill_(1.0)
