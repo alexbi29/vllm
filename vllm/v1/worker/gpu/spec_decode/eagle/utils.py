@@ -66,10 +66,10 @@ def share_target_lm_head(
             )
         return None
     head = target_lm_head
-    if quantization is not None:
-        head = quantized_lm_head_copy(target_lm_head, quantization)
     if token_ranges is not None:
-        head = subset_lm_head_copy(target_lm_head, token_ranges)
+        head = subset_lm_head_copy(target_lm_head, token_ranges, quantization)
+    elif quantization is not None:
+        head = quantized_lm_head_copy(target_lm_head, quantization)
     if draft_lm_head is not None:
         del draft_model.lm_head
     draft_model.lm_head = head

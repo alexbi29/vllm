@@ -559,8 +559,8 @@ class SpeculativeConfig:
     target verifies with its full head, so only the acceptance length can
     change. The ranges are row slices of the target weight (no copy). Useful
     for large vocabularies whose BPE ids are ordered by frequency. EAGLE/MTP
-    on Model Runner V2 with TP1 only; exclusive with
-    draft_lm_head_quantization."""
+    on Model Runner V2 with TP1 only. With draft_lm_head_quantization, only
+    the selected rows are quantized, into one compact head."""
     use_local_argmax_reduction: bool = False
     """Use vocab-parallel local argmax instead of all-gathering full logits
     for draft token generation. Reduces communication from O(vocab_size) to

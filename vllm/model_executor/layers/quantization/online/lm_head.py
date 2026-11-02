@@ -160,9 +160,12 @@ def refresh_quantized_lm_heads(model: Module) -> None:
     Copies in place, so CUDA graphs keep pointing at valid tensors.
     """
     for module in model.modules():
-        if module not in _SOURCES:
+        if module in _SUBSET_SOURCES:
+            fresh = _quantized_rows_copy(*_SUBSET_SOURCES[module])
+        elif module in _SOURCES:
+            fresh = _quantize_copy(*_SOURCES[module])
+        else:
             continue
-        fresh = _quantize_copy(*_SOURCES[module])
         for name, tensor in chain(
             fresh.named_parameters(recurse=False), fresh.named_buffers(recurse=False)
         ):
@@ -227,15 +230,64 @@ class _LMHeadSubsetMethod(UnquantizedEmbeddingMethod):
             dtype=x.dtype,
             device=x.device,
         )
+        compact = getattr(layer, "compact", None)
+        if compact is None:
+            for start, end in self.ranges:
+                out[..., start:end] = torch.nn.functional.linear(
+                    x, layer.weight[start:end]
+                )
+            return out
+        # The quantized rows of all ranges, back to back, in one GEMM.
+        scores = compact.quant_method.apply(compact, x)
+        offset = 0
         for start, end in self.ranges:
-            out[..., start:end] = torch.nn.functional.linear(x, layer.weight[start:end])
+            out[..., start:end] = scores[..., offset : offset + end - start]
+            offset += end - start
         return out
 
 
-def subset_lm_head_copy(
-    lm_head: ParallelLMHead, ranges: list[tuple[int, int]]
+# Each compact quantized row copy maps to (source head, ranges, quantization).
+_SUBSET_SOURCES: WeakKeyDictionary[Module, tuple[ParallelLMHead, list, str]] = (
+    WeakKeyDictionary()
+)
+
+
+def _quantized_rows_copy(
+    lm_head: ParallelLMHead, ranges: list[tuple[int, int]], quantization: str
 ) -> ParallelLMHead:
-    """A drafter head that scores only the token ids in `ranges` (TP1)."""
+    """Quantize only the rows in `ranges`, concatenated, into a compact head."""
+    rows = sum(end - start for start, end in ranges)
+    dtype = lm_head.weight.dtype
+    with set_default_torch_dtype(dtype):
+        staging = ParallelLMHead(
+            rows,
+            lm_head.embedding_dim,
+            params_dtype=dtype,
+            padding_size=1,
+            prefix=lm_head.prefix,
+            disable_tp=True,
+        )
+    staging = staging.to(lm_head.weight.device)
+    offset = 0
+    for start, end in ranges:
+        staging.weight.data[offset : offset + end - start].copy_(
+            lm_head.weight.data[start:end]
+        )
+        offset += end - start
+    # The temporary BF16 rows are released with `staging` once quantized.
+    return _quantize_copy(staging, quantization)
+
+
+def subset_lm_head_copy(
+    lm_head: ParallelLMHead,
+    ranges: list[tuple[int, int]],
+    quantization: Literal["fp8", "nvfp4"] | None = None,
+) -> ParallelLMHead:
+    """A drafter head that scores only the token ids in `ranges` (TP1).
+
+    With `quantization`, only the selected rows are quantized, into one
+    compact head that `refresh_quantized_lm_heads` re-derives from `lm_head`.
+    """
     if lm_head.tp_size != 1 or not isinstance(
         lm_head.quant_method, (UnquantizedEmbeddingMethod, UnquantizedLinearMethod)
     ):
@@ -259,11 +311,17 @@ def subset_lm_head_copy(
     for param in head.parameters(recurse=False):
         if hasattr(param, "weight_loader"):
             del param.weight_loader
+    if quantization is not None:
+        compact = _quantized_rows_copy(lm_head, ranges, quantization)
+        get_layerwise_info(compact).reset()
+        _SUBSET_SOURCES[compact] = (lm_head, ranges, quantization)
+        head.compact = compact
     get_layerwise_info(head).reset()
     logger.info(
-        "Drafter lm_head restricted to %d of %d tokens: %s",
+        "Drafter lm_head restricted to %d of %d tokens%s: %s",
         sum(b - a for a, b in ranges),
         vocab,
+        f" ({quantization})" if quantization is not None else "",
         ranges,
     )
     return head
