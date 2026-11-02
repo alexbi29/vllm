@@ -449,20 +449,15 @@ def kernel_unified_attention(
     block_table_offset = seq_idx * block_table_stride
 
     if COMPACT_GEMMA4_RAW:
-        ud0 = tl.arange(0, 256)
-        ud0 = tl.where(ud0 < 192, ud0 + 64, ud0 + 128)
-        ud1 = tl.arange(0, 128) + 384
         rd = tl.arange(0, 128)
         rd = tl.where(rd < 64, rd, rd + 192)
         td = tl.arange(0, 4) + 316
         qbase = query_offset_0 * query_stride_0 + query_offset_1 * query_stride_1
         qvalid = query_mask_0 & query_mask_1
-        Q_u0 = tl.load(
-            query_ptr + qbase[:, None] + ud0[None, :], qvalid[:, None], other=0.0
-        )
-        Q_u1 = tl.load(
-            query_ptr + qbase[:, None] + ud1[None, :], qvalid[:, None], other=0.0
-        )
+        # The 384 unrotated dims score against the raw V tile itself: one dot
+        # over all 512 dims with the rotated query dims zeroed, so the reader
+        # loads the V region once instead of again as a transposed K tile.
+        Q_unrotated = tl.where(((offs_d % 256) >= 64)[None, :], Q, 0.0).to(Q.dtype)
         Q_rot = tl.load(
             query_ptr + qbase[:, None] + rd[None, :], qvalid[:, None], other=0.0
         )
@@ -577,20 +572,6 @@ def kernel_unified_attention(
                     physical_block_idx * stride_v_cache_0
                     + kv_head_idx * stride_v_cache_2
                     + (seq_offset % BLOCK_SIZE) * stride_v_cache_1
-                )
-                K_u0 = tl.load(
-                    value_cache_ptr
-                    + value_row[None, :]
-                    + ud0[:, None] * stride_v_cache_3,
-                    tile_mask[None, :],
-                    other=0.0,
-                )
-                K_u1 = tl.load(
-                    value_cache_ptr
-                    + value_row[None, :]
-                    + ud1[:, None] * stride_v_cache_3,
-                    tile_mask[None, :],
-                    other=0.0,
                 )
                 tail_dim = tl.arange(0, 4) + 60
                 tail_a = tl.load(
@@ -755,9 +736,10 @@ def kernel_unified_attention(
         # S : (BLOCK_M, TILE_SIZE)
         S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
         if COMPACT_GEMMA4_RAW:
-            raw_score = (tl.dot(Q_u0, K_u0) + tl.dot(Q_u1, K_u1)) * (
-                raw_inverse * raw_gamma
-            )[None, :]
+            raw_score = (
+                tl.dot(Q_unrotated, tl.trans(V_load))
+                * (raw_inverse * raw_gamma)[None, :]
+            )
             raw_score += tl.dot(Q_rot, K_rot)
             raw_score += tl.sum(Q_tail[:, None, :] * K_tail[None, :, :], axis=2)
             S += score_scale * raw_score
