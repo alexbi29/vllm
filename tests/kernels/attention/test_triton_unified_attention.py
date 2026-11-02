@@ -156,6 +156,108 @@ def test_gemma4_raw_compact_fp64_reference(length, query_len, shift):
     assert (actual - expected).square().mean() <= (dense - expected).square().mean()
 
 
+def _raw_rope_table(rows: int) -> torch.Tensor:
+    frequency = torch.cat(
+        [1 / (1e6 ** (torch.arange(64).float() * 2 / 512)), torch.zeros(192)]
+    )
+    angles = torch.arange(rows).float()[:, None] * frequency[None, :]
+    return torch.cat([angles.cos(), angles.sin()], -1).to(torch.bfloat16)
+
+
+def test_gemma4_raw_compact_rows_do_not_depend_on_batched_prefill():
+    """A verification row's P@V arithmetic must not change with its batch."""
+    from vllm.v1.attention.ops.gemma4_raw_cache import write_raw_compact_cache
+
+    generator = torch.Generator().manual_seed(20261103)
+    lengths, query_lens = [300, 64], [4, 17]
+    rope = _raw_rope_table(512).to(DEVICE_TYPE)
+    gamma = torch.tensor([0.062255859375], dtype=torch.bfloat16, device=DEVICE_TYPE)
+    cache = torch.zeros((4, 2, 256, 640), dtype=torch.bfloat16, device=DEVICE_TYPE)
+    tables = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32, device=DEVICE_TYPE)
+    for seq, length in enumerate(lengths):
+        raw = torch.randn(length, 2, 512, generator=generator).to(torch.bfloat16)
+        logical = torch.arange(length)
+        slots = (tables[seq].cpu()[logical // 256] * 256 + logical % 256).to(
+            DEVICE_TYPE
+        )
+        write_raw_compact_cache(
+            raw.to(DEVICE_TYPE),
+            logical.to(DEVICE_TYPE),
+            cache,
+            slots,
+            rope,
+            gamma,
+            1e-6,
+        )
+    query = torch.randn(sum(query_lens), 16, 512, generator=generator).to(
+        device=DEVICE_TYPE, dtype=torch.bfloat16
+    )
+    k, v = cache.transpose(1, 2).split([128, 512], -1)
+
+    def run(num_seqs):
+        rows = sum(query_lens[:num_seqs])
+        out = torch.empty_like(query[:rows])
+        starts = [0]
+        for query_len in query_lens[:num_seqs]:
+            starts.append(starts[-1] + query_len)
+        unified_attention(
+            q=query[:rows],
+            k=k,
+            v=v,
+            out=out,
+            cu_seqlens_q=torch.tensor(starts, dtype=torch.int32, device=DEVICE_TYPE),
+            max_seqlen_q=max(query_lens[:num_seqs]),
+            seqused_k=torch.tensor(
+                lengths[:num_seqs], dtype=torch.int32, device=DEVICE_TYPE
+            ),
+            max_seqlen_k=max(lengths[:num_seqs]),
+            softmax_scale=1.0,
+            causal=True,
+            window_size=(-1, -1),
+            block_table=tables[:num_seqs],
+            softcap=0.0,
+            q_descale=None,
+            k_descale=None,
+            v_descale=None,
+            seq_threshold_3D=0,
+            compact_k_norm=gamma,
+            compact_raw_rope=rope,
+        )
+        return out
+
+    alone = run(1)
+    batched = run(2)
+    assert torch.equal(alone, batched[: query_lens[0]])
+
+
+def test_gemma4_raw_writer_ignores_positions_outside_rope_table():
+    """The writer must bound RoPE rows like the reader, never reading past them."""
+    from vllm.v1.attention.ops.gemma4_raw_cache import write_raw_compact_cache
+
+    generator = torch.Generator().manual_seed(20261104)
+    raw = torch.randn(4, 2, 512, generator=generator).to(
+        device=DEVICE_TYPE, dtype=torch.bfloat16
+    )
+    # The 8-row table is a view of a larger buffer, so an unbounded read of
+    # row 20 returns visible values instead of faulting or reading zeros.
+    backing = torch.full((32, 512), 0.5, dtype=torch.bfloat16)
+    backing[:8] = _raw_rope_table(8)
+    rope = backing.to(DEVICE_TYPE)[:8]
+    positions = torch.tensor([0, 1, 7, 20], device=DEVICE_TYPE)
+    slots = torch.arange(4, device=DEVICE_TYPE)
+    gamma = torch.tensor([0.0625], dtype=torch.bfloat16, device=DEVICE_TYPE)
+    cache = torch.zeros((1, 2, 256, 640), dtype=torch.bfloat16, device=DEVICE_TYPE)
+    write_raw_compact_cache(raw, positions, cache, slots, rope, gamma, 1e-6)
+    # Out-of-table rows store no rotation, and keep their position metadata.
+    assert not cache[0, :, 3, :124].any()
+    assert cache[0, :, :3, :124].any()
+    words = cache.view(torch.int16)[0, :, 3, 126:128].to(torch.int64) & 65535
+    assert torch.equal(
+        (words[..., 0] | words[..., 1] << 16).cpu(), torch.full((2,), 20)
+    )
+    torch.testing.assert_close(cache[0, :, :4, 128:].transpose(0, 1), raw)
+
+
 NUM_HEADS = [(4, 4), (8, 2), (5, 1)]
 HEAD_SIZES = [128, 256]
 BLOCK_SIZES = [16]

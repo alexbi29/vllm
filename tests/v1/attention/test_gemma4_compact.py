@@ -11,17 +11,10 @@ from vllm.v1.attention.backends.gemma4_compact import Gemma4CompactBackend
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVQuantMode
 
 
-@pytest.mark.parametrize("scalar", [True, False])
-def test_compact_format_is_selected_from_loaded_weights_and_stays_fixed(
-    default_vllm_config, scalar
-):
+def _raw_impl(norm, rope):
     from vllm.v1.attention.backends.gemma4_compact import Gemma4CompactRawImpl
 
-    norm = torch.full((512,), 0.0625, dtype=torch.bfloat16)
-    if not scalar:
-        norm[0] = 0.125
-    rope = torch.zeros(32, 512, dtype=torch.bfloat16)
-    impl = Gemma4CompactRawImpl(
+    return Gemma4CompactRawImpl(
         16,
         512,
         1.0,
@@ -30,20 +23,119 @@ def test_compact_format_is_selected_from_loaded_weights_and_stays_fixed(
         None,
         "bfloat16",
         compact_k_norm=norm,
-        compact_raw_rope=rope,
+        compact_raw_rope_source=SimpleNamespace(cos_sin_cache=rope),
     )
+
+
+@pytest.mark.parametrize("scalar", [True, False])
+def test_compact_format_is_selected_from_loaded_weights_and_stays_fixed(
+    default_vllm_config, scalar
+):
+    norm = torch.full((512,), 0.0625, dtype=torch.bfloat16)
+    if not scalar:
+        norm[0] = 0.125
+    rope = torch.zeros(32, 512, dtype=torch.bfloat16)
+    impl = _raw_impl(norm, rope)
+    # Before loading, the reader and the writer agree on the normalized format.
+    assert not impl.use_raw_storage and impl.compact_raw_rope is None
     impl.process_weights_after_loading(torch.bfloat16)
     assert impl.use_raw_storage is scalar
     if scalar:
         assert impl.compact_raw_rope is rope
+        assert impl.compact_raw_k_norm.shape == (1,)
+        assert impl.compact_raw_k_norm.data_ptr() == norm.data_ptr()
         norm[0] = 0.125
         with pytest.raises(ValueError, match="full model reload"):
             impl.process_weights_after_loading(torch.bfloat16)
     else:
-        assert impl.compact_raw_rope is None
+        assert impl.compact_raw_rope is None and impl.compact_raw_k_norm is None
         norm.fill_(0.0625)
         impl.process_weights_after_loading(torch.bfloat16)
         assert not impl.use_raw_storage
+
+
+def test_raw_reader_tracks_the_current_rope_table(default_vllm_config):
+    """RotaryEmbedding may replace cos_sin_cache after the impl is built."""
+    norm = torch.full((512,), 0.0625, dtype=torch.bfloat16)
+    impl = _raw_impl(norm, torch.zeros(32, 512, dtype=torch.float32))
+    impl.process_weights_after_loading(torch.bfloat16)
+    replaced = torch.ones(32, 512, dtype=torch.bfloat16)
+    impl._rope_source.cos_sin_cache = replaced
+    assert impl.compact_raw_rope is replaced
+
+
+def test_raw_draft_reader_follows_target_format(default_vllm_config):
+    """An MTP copy made before the target loads must not keep a stale format."""
+    from vllm.v1.attention.backends.gemma4_compact import (
+        Gemma4CompactRawBackend,
+        share_compact_kv_with_draft,
+    )
+
+    norm = torch.full((512,), 0.0625, dtype=torch.bfloat16)
+    rope = torch.zeros(32, 512, dtype=torch.bfloat16)
+    impl = _raw_impl(norm, rope)
+    target = SimpleNamespace(
+        impl=impl,
+        head_size=512,
+        num_kv_heads=2,
+        kv_cache_dtype="bfloat16",
+        attn_backend=Gemma4CompactRawBackend,
+        backend="raw",
+    )
+    draft = SimpleNamespace(
+        impl=SimpleNamespace(scale=0.5),
+        head_size=512,
+        num_heads=8,
+        num_kv_heads=2,
+        kv_cache_dtype="bfloat16",
+    )
+    share_compact_kv_with_draft(draft, target, "model.layers.0.self_attn.attn")
+    assert not draft.impl.use_raw_storage and draft.impl.compact_raw_rope is None
+    impl.process_weights_after_loading(torch.bfloat16)
+    draft.impl.process_weights_after_loading(torch.bfloat16)
+    assert draft.impl.use_raw_storage
+    assert draft.impl.compact_raw_rope is rope
+    assert draft.impl.compact_raw_k_norm is impl.compact_raw_k_norm
+    assert draft.impl.num_heads == 8 and impl.num_heads == 16
+
+
+def test_raw_impl_rejects_the_position_free_kv_update(default_vllm_config):
+    norm = torch.full((512,), 0.0625, dtype=torch.bfloat16)
+    impl = _raw_impl(norm, torch.zeros(32, 512, dtype=torch.bfloat16))
+    impl.process_weights_after_loading(torch.bfloat16)
+    with pytest.raises(RuntimeError, match="gemma4_raw_compact_cache_update"):
+        impl.do_kv_cache_update(None, None, None, None, None)
+
+
+@pytest.mark.parametrize(
+    "fp8,kv_transfer,batch_invariant,expected",
+    [
+        (False, False, False, "GEMMA4_COMPACT_RAW"),
+        (False, False, True, "GEMMA4_COMPACT"),
+        (False, True, False, "GEMMA4_COMPACT"),
+        (True, False, False, "GEMMA4_COMPACT_FP8"),
+    ],
+)
+def test_compact_backend_selection(
+    monkeypatch, fp8, kv_transfer, batch_invariant, expected
+):
+    """Raw rows have no batch-invariant reader; such runs keep normalized rows."""
+    from vllm.model_executor.models import gemma4
+
+    monkeypatch.setattr(gemma4.envs, "VLLM_BATCH_INVARIANT", batch_invariant)
+    rope = SimpleNamespace(cos_sin_cache=torch.zeros(4, 512))
+    k_norm = SimpleNamespace(weight=torch.ones(512), variance_epsilon=1e-6)
+    args = gemma4._compact_attention_args(
+        SimpleNamespace(gemma4_compact_fp8_storage=fp8),
+        SimpleNamespace(kv_transfer_config=object() if kv_transfer else None),
+        rope,
+        k_norm,
+    )
+    assert args["attn_backend"].get_name() == expected
+    assert args["compact_k_norm"] is k_norm.weight
+    assert ("compact_raw_rope_source" in args) == (expected == "GEMMA4_COMPACT_RAW")
+    if expected == "GEMMA4_COMPACT_RAW":
+        assert args["compact_raw_rope_source"] is rope
 
 
 def test_raw_compact_preserves_global_page_geometry():

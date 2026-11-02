@@ -43,6 +43,11 @@ def share_compact_kv_with_draft(
     draft_impl.num_queries_per_kv = draft.num_heads // draft.num_kv_heads
     draft_impl.scale = draft_scale
     draft_impl.kv_sharing_target_layer_name = target_layer_name
+    if isinstance(draft_impl, Gemma4CompactRawImpl):
+        # Read in the target's storage format, even if it is fixed later.
+        draft_impl._format_owner = cast(
+            "Gemma4CompactRawImpl", target.impl
+        )._format_owner
     draft.impl = draft_impl
 
 
@@ -204,33 +209,67 @@ class Gemma4CompactRawBackend(Gemma4CompactBackend):
 
 
 class Gemma4CompactRawImpl(Gemma4CompactImpl):
-    """Raw shared projections with FP32 normalization metadata in four slots."""
+    """Raw shared projections with FP32 normalization metadata in four slots.
 
-    def __init__(self, *args, compact_raw_rope, compact_raw_epsilon=1e-6, **kwargs):
+    Raw rows can only be written by ``gemma4_raw_compact_cache_update``, which
+    receives the token positions. The storage format is fixed by the target
+    layer's loaded KNorm weight; MTP readers are shallow copies of the target
+    impl and follow that owner, so the writer, the reader and the model agree
+    on one ``use_raw_storage`` value.
+    """
+
+    def __init__(
+        self, *args, compact_raw_rope_source, compact_raw_epsilon=1e-6, **kwargs
+    ):
         super().__init__(*args, **kwargs)
-        self.compact_raw_rope = compact_raw_rope
+        # RotaryEmbedding may replace cos_sin_cache after construction (dtype
+        # matching, device moves); always read the table its owner rotates Q with.
+        self._rope_source = compact_raw_rope_source
         self.compact_raw_epsilon = compact_raw_epsilon
-        self.use_raw_storage = False
+        self._format_owner = self
+        self._use_raw_storage = False
         self._format_initialized = False
+        self._raw_k_norm: torch.Tensor | None = None
+
+    @property
+    def use_raw_storage(self) -> bool:
+        return self._format_owner._use_raw_storage
+
+    @property
+    def compact_raw_rope(self) -> torch.Tensor | None:
+        """RoPE table for raw rows; ``None`` selects the normalized format."""
+        owner = self._format_owner
+        if not owner._use_raw_storage:
+            return None
+        return owner._rope_source.cos_sin_cache
+
+    @property
+    def compact_raw_k_norm(self) -> torch.Tensor | None:
+        """Scalar KNorm view for the raw reader, precomputed at load time."""
+        return self._format_owner._raw_k_norm
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         super().process_weights_after_loading(act_dtype)
+        if self._format_owner is not self:
+            return
         # Loading/reloading is the synchronization boundary. The forward path
         # reads a scalar weight without a host-device check on every step.
         scalar_norm = bool(torch.all(self.compact_k_norm == self.compact_k_norm[0]))
         if self._format_initialized:
-            if self.use_raw_storage and not scalar_norm:
+            if self._use_raw_storage and not scalar_norm:
                 raise ValueError(
                     "Reloading raw compact KV with vector KNorm weights requires "
                     "a full model reload"
                 )
         else:
-            self.use_raw_storage = scalar_norm
+            self._use_raw_storage = scalar_norm
             self._format_initialized = True
-            if not scalar_norm:
-                self.compact_raw_rope = None
+        self._raw_k_norm = self.compact_k_norm[:1] if self._use_raw_storage else None
 
     def do_kv_cache_update(self, layer, key, value, kv_cache, slot_mapping):
-        write_compact_cache(
-            key, value, kv_cache, slot_mapping, raw_storage=self.use_raw_storage
-        )
+        if self.use_raw_storage:
+            raise RuntimeError(
+                "Raw compact KV rows need token positions; write them with "
+                "gemma4_raw_compact_cache_update instead of the K/V cache update"
+            )
+        write_compact_cache(key, value, kv_cache, slot_mapping)

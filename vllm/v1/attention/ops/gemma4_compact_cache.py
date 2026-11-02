@@ -27,7 +27,6 @@ def _write_compact_cache(
     cache_token_stride: tl.int64,
     BLOCK_SIZE: tl.constexpr,
     FP8_STORAGE: tl.constexpr = False,
-    RAW_STORAGE: tl.constexpr = False,
 ):
     token = tl.program_id(0)
     head = tl.program_id(1)
@@ -42,14 +41,10 @@ def _write_compact_cache(
     kr = tl.arange(0, 128)
     kd = tl.where(kr < 64, kr, kr + 192)
     key_ptr = key + token * key_token_stride + head * key_head_stride + kd
-    if RAW_STORAGE:
-        bits = tl.load(key_ptr.to(tl.pointer_type(tl.uint16)))
-        tl.store((cache + base + kr).to(tl.pointer_type(tl.uint16)), bits)
-    else:
-        k = tl.load(key_ptr)
-        if FP8_STORAGE:
-            k = tl.minimum(tl.maximum(k.to(tl.float32), -448.0), 448.0)
-        tl.store(cache + base + kr, k)
+    k = tl.load(key_ptr)
+    if FP8_STORAGE:
+        k = tl.minimum(tl.maximum(k.to(tl.float32), -448.0), 448.0)
+    tl.store(cache + base + kr, k)
     vd = tl.arange(0, 512)
     v = tl.load(value + token * value_token_stride + head * value_head_stride + vd)
     if FP8_STORAGE:
@@ -57,12 +52,10 @@ def _write_compact_cache(
     tl.store(cache + base + 128 + vd, v)
 
 
-def write_compact_cache(key, value, cache, slots, fp8_storage=False, raw_storage=False):
+def write_compact_cache(key, value, cache, slots, fp8_storage=False):
     """Write paged compact cache; negative slots are graph-padding tokens."""
     if key.dtype != torch.bfloat16 or value.dtype != torch.bfloat16:
         raise ValueError("Gemma4 compact KV requires BF16 keys and values")
-    if raw_storage and fp8_storage:
-        raise ValueError("Raw compact KV requires BF16 storage")
     storage_dtype = torch.float8_e4m3fn if fp8_storage else torch.bfloat16
     if cache.dtype != storage_dtype or cache.shape[-1] != 640:
         raise ValueError("Gemma4 compact KV storage dtype or row size mismatch")
@@ -84,5 +77,4 @@ def write_compact_cache(key, value, cache, slots, fp8_storage=False, raw_storage
         cache.stride(2),
         cache.shape[2],
         FP8_STORAGE=fp8_storage,
-        RAW_STORAGE=raw_storage,
     )

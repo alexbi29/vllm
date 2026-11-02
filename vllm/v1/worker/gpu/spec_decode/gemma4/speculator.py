@@ -48,10 +48,15 @@ def _copy_target_kv_scales(attn: nn.Module, target_attn: nn.Module) -> None:
 
 
 class Gemma4Speculator(TargetDependentARSpeculator):
+    # Fixed at load time: it selects the captured graph structure, so later
+    # checks must agree with capture, and propose() avoids env lookups.
+    _q_only_drafting: bool | None = None
+
     def load_model(self, target_model: nn.Module) -> None:
         super().load_model(target_model)
+        self._q_only_drafting = self._q_only_drafting_supported()
         if envs.VLLM_GEMMA4_Q_ONLY_DRAFTING:
-            if self.use_q_only_drafting:
+            if self._q_only_drafting:
                 logger.info(
                     "Gemma4 Q-only drafting enabled; skip full-row draft prefill"
                 )
@@ -63,8 +68,15 @@ class Gemma4Speculator(TargetDependentARSpeculator):
 
     @property
     def use_q_only_drafting(self) -> bool:
+        if self._q_only_drafting is None:
+            return self._q_only_drafting_supported()
+        return self._q_only_drafting
+
+    def _q_only_drafting_supported(self) -> bool:
+        # A PCP manager is attached after loading, but only when PCP > 1,
+        # which the parallel-size check below already excludes.
         parallel = self.vllm_config.parallel_config
-        return (
+        return bool(
             envs.VLLM_GEMMA4_Q_ONLY_DRAFTING
             and self.pcp_manager is None
             and not self.supports_mm_inputs

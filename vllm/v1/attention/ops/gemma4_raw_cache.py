@@ -37,99 +37,7 @@ def load_raw_metadata(key_cache, row_offsets, mask):
     return inverse_rms, positions
 
 
-@triton.jit(do_not_specialize=["num_tokens"])
-def _pack_raw_key(
-    key,
-    raw,
-    positions,
-    num_tokens,
-    key_stride_t: tl.int64,
-    key_stride_h: tl.int64,
-    raw_stride_t: tl.int64,
-    raw_stride_h: tl.int64,
-    position_stride: tl.int64,
-    NUM_HEADS: tl.constexpr,
-    EPSILON: tl.constexpr,
-    ROWS: tl.constexpr,
-):
-    rows = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
-    token = rows // NUM_HEADS
-    head = rows % NUM_HEADS
-    dim = tl.arange(0, 512)
-    valid = token < num_tokens
-    x = tl.load(
-        raw
-        + token[:, None] * raw_stride_t
-        + head[:, None] * raw_stride_h
-        + dim[None, :],
-        valid[:, None],
-        other=0.0,
-    ).to(tl.float32)
-    inverse = tl.rsqrt(tl.sum(x * x, axis=1) / 512.0 + EPSILON)
-    position = tl.load(positions + token * position_stride, valid, other=0).to(tl.int32)
-    # These four rotated coordinates are reconstructed by the reader from raw
-    # projection values and the original RoPE table. Integer copies preserve
-    # metadata even when a 16-bit word resembles a BF16 NaN.
-    metadata = key + token * key_stride_t + head * key_stride_h + 316
-    _store_u32_as_u16(metadata, inverse, valid)
-    _store_u32_as_u16(metadata + 2, position, valid)
-
-
-def pack_raw_compact_key(
-    key: torch.Tensor, raw: torch.Tensor, positions: torch.Tensor, epsilon: float
-) -> None:
-    if (
-        key.dtype != torch.bfloat16
-        or raw.dtype != torch.bfloat16
-        or key.shape != raw.shape
-        or key.ndim != 3
-        or key.shape[-1] != 512
-        or key.stride(-1) != 1
-        or raw.stride(-1) != 1
-        or positions.ndim != 1
-        or positions.shape[0] != key.shape[0]
-        or positions.dtype not in (torch.int32, torch.int64)
-        or key.device != raw.device
-        or positions.device != key.device
-        or epsilon <= 0
-    ):
-        raise ValueError(
-            "Raw compact KV requires matching BF16 512-d projections and positions"
-        )
-    if not key.shape[0]:
-        return
-    _pack_raw_key[(triton.cdiv(key.shape[0] * key.shape[1], 4),)](
-        key,
-        raw,
-        positions,
-        key.shape[0],
-        key.stride(0),
-        key.stride(1),
-        raw.stride(0),
-        raw.stride(1),
-        positions.stride(0),
-        key.shape[1],
-        epsilon,
-        ROWS=4,
-        num_warps=4,
-    )
-
-
-def _pack_raw_compact_key_fake(
-    key: torch.Tensor, raw: torch.Tensor, positions: torch.Tensor, epsilon: float
-) -> None:
-    pass
-
-
-direct_register_custom_op(
-    op_name="pack_gemma4_raw_compact_key",
-    op_func=pack_raw_compact_key,
-    mutates_args=["key"],
-    fake_impl=_pack_raw_compact_key_fake,
-)
-
-
-@triton.jit(do_not_specialize=["num_tokens"])
+@triton.jit(do_not_specialize=["num_tokens", "rope_rows"])
 def _write_raw_cache(
     raw,
     positions,
@@ -145,6 +53,7 @@ def _write_raw_cache(
     cache_stride_t: tl.int64,
     position_stride: tl.int64,
     rope_stride: tl.int64,
+    rope_rows,
     NUM_HEADS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     EPSILON: tl.constexpr,
@@ -173,12 +82,16 @@ def _write_raw_cache(
     partner = (kd + 256) % 512
     a = tl.gather(xf, tl.broadcast_to(kd[None, :], (ROWS, 128)), 1)
     b = tl.gather(xf, tl.broadcast_to(partner[None, :], (ROWS, 128)), 1)
+    # Match the reader: positions outside the RoPE table contribute no rotation.
+    in_table = valid & (position >= 0) & (position < rope_rows)
     rope_base = position.to(tl.int64) * rope_stride
     c = tl.load(
-        rope + rope_base[:, None] + (kd % 256)[None, :], valid[:, None], other=0.0
+        rope + rope_base[:, None] + (kd % 256)[None, :], in_table[:, None], other=0.0
     ).to(tl.float32)
     s = tl.load(
-        rope + rope_base[:, None] + 256 + (kd % 256)[None, :], valid[:, None], other=0.0
+        rope + rope_base[:, None] + 256 + (kd % 256)[None, :],
+        in_table[:, None],
+        other=0.0,
     ).to(tl.float32)
     rotated = (a * c + tl.where(kd[None, :] < 256, -b * s, b * s)) * (inverse * gamma)[
         :, None
@@ -242,6 +155,7 @@ def write_raw_compact_cache(raw, positions, cache, slots, rope, weight, epsilon)
         cache.stride(2),
         positions.stride(0),
         rope.stride(0),
+        rope.shape[0],
         raw.shape[1],
         cache.shape[2],
         epsilon,
