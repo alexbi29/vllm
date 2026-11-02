@@ -652,10 +652,10 @@ class TritonAttentionImpl(AttentionImpl):
         # kernel, which dequantizes per-(token, head) inline via constexpr
         # branches (INT8 / FP8) and dispatches to the packed INT4 kernel.
         compact_k_norm = getattr(self, "compact_k_norm", None)
+        # Non-None only while the impl stores raw rows (see Gemma4CompactRawImpl).
         compact_raw_rope = getattr(self, "compact_raw_rope", None)
         if compact_raw_rope is not None:
-            assert compact_k_norm is not None
-            compact_k_norm = compact_k_norm[:1]
+            compact_k_norm = getattr(self, "compact_raw_k_norm", None)
         if compact_k_norm is not None:
             key_cache, value_cache = kv_cache.transpose(1, 2).split([128, 512], dim=-1)
             q_descale = k_descale = v_descale = None

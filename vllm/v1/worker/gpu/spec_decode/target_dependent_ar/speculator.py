@@ -369,7 +369,7 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
                 next_prefill_tokens,
                 self.max_num_reqs,
             )
-            self._prepare_eplb_forward(num_reqs)
+            # The first draft forward runs in _generate_draft, which prepares EPLB.
 
         decode_batch_sync, num_batch_tokens = (
             self._build_uniform_batch_dp_sync(

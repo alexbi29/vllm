@@ -345,6 +345,15 @@ def kernel_unified_attention(
         BLOCK_Q, cur_batch_query_len - q_block_local_idx * BLOCK_Q
     )
 
+    # Raw compact KV: prefill sequences use one BF16 P@V product, while decode
+    # and verification rows (up to four query tokens) keep the split hi/lo
+    # product. Decide per sequence so a row's arithmetic does not depend on
+    # which other requests share its batch.
+    if RAW_SINGLE_PV:  # noqa: SIM108 (constexpr branch)
+        raw_single_pv = cur_batch_query_len > 4
+    else:
+        raw_single_pv = False
+
     offs_m = tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, HEAD_SIZE_PADDED)
     offs_t = tl.arange(0, TILE_SIZE)
@@ -799,12 +808,10 @@ def kernel_unified_attention(
                 V = tl.where(sw_mask_v, V, 0.0)
             if COMPACT_GEMMA4_RAW:
                 scaled_p = P * raw_inverse[None, :]
-                if RAW_SINGLE_PV:
-                    acc += tl.dot(scaled_p.to(V.dtype), V)
-                else:
-                    p_hi = scaled_p.to(V.dtype)
+                p_hi = scaled_p.to(V.dtype)
+                acc += tl.dot(p_hi, V)
+                if not raw_single_pv:
                     p_lo = (scaled_p - p_hi.to(tl.float32)).to(V.dtype)
-                    acc += tl.dot(p_hi, V)
                     acc += tl.dot(p_lo, V)
             elif USE_PER_TOKEN_HEAD_SCALES:
                 # Per-token-head quant: apply v_scale to P instead of V.
@@ -1615,7 +1622,7 @@ def unified_attention(
         COMPACT_ROPE_ROWS=compact_raw_rope.shape[0]
         if compact_raw_rope is not None
         else 0,
-        RAW_SINGLE_PV=compact_raw_rope is not None and max_seqlen_q > 4,
+        RAW_SINGLE_PV=compact_raw_rope is not None,
         **launch_kwargs,
     )
 
