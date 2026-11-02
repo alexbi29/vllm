@@ -223,6 +223,10 @@ to 128x128-block FP8 with dynamic 1x128 activation scales. This is lossy:
 Qwen's own FP8 checkpoint keeps these layers in BF16. Qualify output quality
 before enabling it.
 
+Post-load FP8 placement releases the original BF16 backing allocation while
+preserving the parameter object and its weight loader. This allows the smaller
+FP8 weights to return memory to the KV-cache budget.
+
 The following kernel options also default off:
 
 - `qwen4_exp_sm120_bf16_gemm` selects measured small-row BF16 projection
