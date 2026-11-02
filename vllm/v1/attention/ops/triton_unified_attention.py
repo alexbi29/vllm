@@ -15,6 +15,7 @@ import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.ops.gemma4_raw_cache import load_raw_metadata
 from vllm.v1.attention.ops.triton_attention_helpers import (
     apply_alibi_to_score,
     apply_softcap,
@@ -407,6 +408,11 @@ def kernel_unified_attention(
     MM_PREFIX_CLAMP_SW: tl.constexpr = False,
     COMPACT_GEMMA4_KV: tl.constexpr = False,
     compact_k_norm_ptr=None,
+    COMPACT_GEMMA4_RAW: tl.constexpr = False,
+    compact_rope_ptr=None,
+    COMPACT_ROPE_STRIDE: tl.constexpr = 0,
+    COMPACT_ROPE_ROWS: tl.constexpr = 0,
+    RAW_SINGLE_PV: tl.constexpr = False,
     SCORE_MAX_ONLY: tl.constexpr = False,
     USE_PREFIX_MAX: tl.constexpr = False,
     score_prefix_max_ptr=None,
@@ -470,6 +476,58 @@ def kernel_unified_attention(
     query_mask_0 = tl.where(query_pos < cur_batch_query_len, 1, 0).to(tl.int1)
     query_mask_1 = tl.where(query_offset_1 < num_query_heads, 1, 0).to(tl.int1)
 
+    if COMPACT_GEMMA4_RAW and not USE_SINKS:  # noqa: SIM102
+        if seq_len == 1:
+            physical = tl.load(block_tables_ptr + seq_idx * block_table_stride).to(
+                tl.int64
+            )
+            key_row = physical * stride_k_cache_0 + kv_head_idx * stride_k_cache_2
+            inverse_one, _ = load_raw_metadata(key_cache_ptr, key_row, True)
+            one_value = (
+                tl.load(
+                    value_cache_ptr
+                    + physical * stride_v_cache_0
+                    + kv_head_idx * stride_v_cache_2
+                    + offs_d * stride_v_cache_3,
+                    dim_mask,
+                    other=0.0,
+                ).to(tl.float32)
+                * inverse_one
+            )
+            exact_one = tl.broadcast_to(one_value[None, :], (BLOCK_M, HEAD_SIZE_PADDED))
+            valid_one = query_mask_0 & query_mask_1
+            if IS_3D:
+                offsets = (
+                    query_offset_0[:, None].to(tl.int64)
+                    * (num_query_heads * NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
+                    + query_offset_1[:, None]
+                    * (NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
+                    + segm_idx * HEAD_SIZE_PADDED
+                    + offs_d[None, :]
+                )
+                tl.store(
+                    segm_output_ptr + offsets,
+                    exact_one,
+                    valid_one[:, None] & dim_mask[None, :],
+                )
+                scalars = (
+                    query_offset_0.to(tl.int64) * num_query_heads + query_offset_1
+                ) * NUM_SEGMENTS_PER_SEQ + segm_idx
+                tl.store(segm_max_ptr + scalars, 0.0, valid_one)
+                tl.store(segm_expsum_ptr + scalars, 1.0, valid_one)
+            else:
+                offsets = (
+                    query_offset_0[:, None].to(tl.int64) * output_stride_0
+                    + query_offset_1[:, None] * output_stride_1
+                    + offs_d[None, :]
+                )
+                tl.store(
+                    output_ptr + offsets,
+                    exact_one,
+                    valid_one[:, None] & dim_mask[None, :],
+                )
+            return
+
     # Q : (BLOCK_M, HEAD_SIZE_PADDED)
     if USE_TD_QO:
         Q = _load_q_td(
@@ -494,6 +552,29 @@ def kernel_unified_attention(
         )
 
     block_table_offset = seq_idx * block_table_stride
+
+    if COMPACT_GEMMA4_RAW:
+        ud0 = tl.arange(0, 256)
+        ud0 = tl.where(ud0 < 192, ud0 + 64, ud0 + 128)
+        ud1 = tl.arange(0, 128) + 384
+        rd = tl.arange(0, 128)
+        rd = tl.where(rd < 64, rd, rd + 192)
+        td = tl.arange(0, 4) + 316
+        qbase = query_offset_0 * query_stride_0 + query_offset_1 * query_stride_1
+        qvalid = query_mask_0 & query_mask_1
+        Q_u0 = tl.load(
+            query_ptr + qbase[:, None] + ud0[None, :], qvalid[:, None], other=0.0
+        )
+        Q_u1 = tl.load(
+            query_ptr + qbase[:, None] + ud1[None, :], qvalid[:, None], other=0.0
+        )
+        Q_rot = tl.load(
+            query_ptr + qbase[:, None] + rd[None, :], qvalid[:, None], other=0.0
+        )
+        Q_tail = tl.load(
+            query_ptr + qbase[:, None] + td[None, :], qvalid[:, None], other=0.0
+        ).to(tl.float32)
+        raw_gamma = tl.load(compact_k_norm_ptr).to(tl.float32)
 
     M = init_softmax_M(
         sink_ptr, query_offset_1, query_mask_1, segm_idx, BLOCK_M, USE_SINKS, IS_3D
@@ -582,22 +663,93 @@ def kernel_unified_attention(
                 mask=dim_mask[None, :] & tile_mask[:, None],
                 other=0.0,
             )
-            rotated = (offs_d % 256) < 64
-            compact_dim = (offs_d // 256) * 64 + offs_d % 256
-            k_offset = (
-                physical_block_idx[None, :] * stride_k_cache_0
-                + kv_head_idx * stride_k_cache_2
-                + compact_dim[:, None] * stride_k_cache_3
-                + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
-            )
-            rotated_k = tl.load(
-                key_cache_ptr + k_offset,
-                mask=rotated[:, None] & tile_mask[None, :],
-                other=0.0,
-            )
-            norm = tl.load(compact_k_norm_ptr + offs_d, dim_mask, other=0.0)
-            reconstructed = (V_load.T.to(tl.float32) * norm[:, None]).to(tl.bfloat16)
-            K_load = tl.where(rotated[:, None], rotated_k, reconstructed)
+            if COMPACT_GEMMA4_RAW:
+                row = (
+                    physical_block_idx * stride_k_cache_0
+                    + kv_head_idx * stride_k_cache_2
+                    + (seq_offset % BLOCK_SIZE) * stride_k_cache_1
+                )
+                raw_inverse, raw_position = load_raw_metadata(
+                    key_cache_ptr, row, tile_mask
+                )
+                rot_dim = tl.arange(0, 128)
+                K_rot = tl.load(
+                    key_cache_ptr + row[None, :] + rot_dim[:, None],
+                    (rot_dim[:, None] < 124) & tile_mask[None, :],
+                    other=0.0,
+                )
+                value_row = (
+                    physical_block_idx * stride_v_cache_0
+                    + kv_head_idx * stride_v_cache_2
+                    + (seq_offset % BLOCK_SIZE) * stride_v_cache_1
+                )
+                K_u0 = tl.load(
+                    value_cache_ptr
+                    + value_row[None, :]
+                    + ud0[:, None] * stride_v_cache_3,
+                    tile_mask[None, :],
+                    other=0.0,
+                )
+                K_u1 = tl.load(
+                    value_cache_ptr
+                    + value_row[None, :]
+                    + ud1[:, None] * stride_v_cache_3,
+                    tile_mask[None, :],
+                    other=0.0,
+                )
+                tail_dim = tl.arange(0, 4) + 60
+                tail_a = tl.load(
+                    value_cache_ptr
+                    + value_row[:, None]
+                    + (tail_dim[None, :] + 256) * stride_v_cache_3,
+                    tile_mask[:, None],
+                    other=0.0,
+                ).to(tl.float32)
+                tail_b = tl.load(
+                    value_cache_ptr
+                    + value_row[:, None]
+                    + tail_dim[None, :] * stride_v_cache_3,
+                    tile_mask[:, None],
+                    other=0.0,
+                ).to(tl.float32)
+                rope_row = raw_position.to(tl.int64) * COMPACT_ROPE_STRIDE
+                rope_valid = (
+                    tile_mask & (raw_position >= 0) & (raw_position < COMPACT_ROPE_ROWS)
+                )
+                cosine = tl.load(
+                    compact_rope_ptr + rope_row[:, None] + tail_dim[None, :],
+                    rope_valid[:, None],
+                    other=0.0,
+                ).to(tl.float32)
+                sine = tl.load(
+                    compact_rope_ptr + rope_row[:, None] + 256 + tail_dim[None, :],
+                    rope_valid[:, None],
+                    other=0.0,
+                ).to(tl.float32)
+                K_tail = (tail_a * cosine + tail_b * sine) * (raw_inverse * raw_gamma)[
+                    :, None
+                ]
+                # Only the raw branch's split operands are consumed below.
+                K_load = tl.full((HEAD_SIZE_PADDED, TILE_SIZE), 0, tl.bfloat16)
+            else:
+                rotated = (offs_d % 256) < 64
+                compact_dim = (offs_d // 256) * 64 + offs_d % 256
+                k_offset = (
+                    physical_block_idx[None, :] * stride_k_cache_0
+                    + kv_head_idx * stride_k_cache_2
+                    + compact_dim[:, None] * stride_k_cache_3
+                    + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+                )
+                rotated_k = tl.load(
+                    key_cache_ptr + k_offset,
+                    mask=rotated[:, None] & tile_mask[None, :],
+                    other=0.0,
+                )
+                norm = tl.load(compact_k_norm_ptr + offs_d, dim_mask, other=0.0)
+                reconstructed = (V_load.T.to(tl.float32) * norm[:, None]).to(
+                    tl.bfloat16
+                )
+                K_load = tl.where(rotated[:, None], rotated_k, reconstructed)
         elif USE_TD:
             # All TILE_SIZE slots within a single KV tile map to one
             # physical block (guaranteed by ``BLOCK_SIZE % TILE_SIZE == 0``
@@ -707,7 +859,14 @@ def kernel_unified_attention(
 
         # S : (BLOCK_M, TILE_SIZE)
         S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
-        if USE_PER_TOKEN_HEAD_SCALES:
+        if COMPACT_GEMMA4_RAW:
+            raw_score = (tl.dot(Q_u0, K_u0) + tl.dot(Q_u1, K_u1)) * (
+                raw_inverse * raw_gamma
+            )[None, :]
+            raw_score += tl.dot(Q_rot, K_rot)
+            raw_score += tl.sum(Q_tail[:, None, :] * K_tail[None, :, :], axis=2)
+            S += score_scale * raw_score
+        elif USE_PER_TOKEN_HEAD_SCALES:
             # Per-token-head quant: fuse softmax_scale with per-head k_scale
             # to avoid a separate BLOCK_M × TILE_SIZE multiply on S.
             S += tl.dot(Q, K) * (score_scale * k_token_head_scales[None, :])
@@ -752,7 +911,16 @@ def kernel_unified_attention(
                 else:
                     sw_mask_v = (dist < SLIDING_WINDOW) & (dist > -SLIDING_WINDOW)
                 V = tl.where(sw_mask_v, V, 0.0)
-            if USE_PER_TOKEN_HEAD_SCALES:
+            if COMPACT_GEMMA4_RAW:
+                scaled_p = P * raw_inverse[None, :]
+                if RAW_SINGLE_PV:
+                    acc += tl.dot(scaled_p.to(V.dtype), V)
+                else:
+                    p_hi = scaled_p.to(V.dtype)
+                    p_lo = (scaled_p - p_hi.to(tl.float32)).to(V.dtype)
+                    acc += tl.dot(p_hi, V)
+                    acc += tl.dot(p_lo, V)
+            elif USE_PER_TOKEN_HEAD_SCALES:
                 # Per-token-head quant: apply v_scale to P instead of V.
                 P_v = (P * v_token_head_scales[None, :]).to(V.dtype)
                 acc += tl.dot(P_v, V)
@@ -1055,12 +1223,24 @@ def unified_attention(
     mm_prefix_clamp_sliding_window: bool = False,
     compact_k_norm=None,
     compact_fp8_storage: bool = False,
+    compact_raw_rope=None,
 ):
     compact_storage_dtype = (
         torch.float8_e4m3fn if compact_fp8_storage else torch.bfloat16
     )
     if compact_fp8_storage and compact_k_norm is None:
         raise ValueError("FP8 compact storage requires the Gemma4 compact layout")
+    if compact_raw_rope is not None and (
+        compact_fp8_storage
+        or compact_k_norm is None
+        or is_batch_invariant
+        or compact_raw_rope.ndim != 2
+        or compact_raw_rope.shape[1] != 512
+        or compact_raw_rope.dtype not in (torch.bfloat16, torch.float32)
+        or compact_raw_rope.stride(1) != 1
+        or compact_raw_rope.device != q.device
+    ):
+        raise ValueError("Raw compact KV requires a RoPE table and BF16 storage")
     if compact_k_norm is not None and (
         q.shape[-1] != 512
         or k.shape[-1] != 128
@@ -1070,7 +1250,7 @@ def unified_attention(
         or v.dtype != compact_storage_dtype
         or kv_quant_mode != KVQuantMode.NONE
         or compact_k_norm.dtype != torch.bfloat16
-        or compact_k_norm.shape != (512,)
+        or compact_k_norm.shape != ((1,) if compact_raw_rope is not None else (512,))
         or use_td
     ):
         raise ValueError("Invalid compact Gemma4 KV layout or dtype")
@@ -1240,6 +1420,11 @@ def unified_attention(
         ):
             # More warps reduce FP8 reconstruction spills without repacking KV.
             launch_num_warps = 8
+
+    # head_size 256 with many query rows per sequence (e.g. diffusion-gemma
+    if compact_raw_rope is not None:
+        launch_num_stages = 2
+        launch_num_warps = 4
 
     # head_size 256 with many query rows per sequence (e.g. diffusion-gemma
     # bidirectional canvas passes) is prefill-shaped, but the decode-oriented
@@ -1686,10 +1871,23 @@ def unified_attention(
         MM_PREFIX_CLAMP_SW=mm_prefix_clamp_sliding_window,
         COMPACT_GEMMA4_KV=compact_k_norm is not None,
         compact_k_norm_ptr=compact_k_norm,
+        COMPACT_GEMMA4_RAW=compact_raw_rope is not None,
+        compact_rope_ptr=compact_raw_rope,
+        COMPACT_ROPE_STRIDE=compact_raw_rope.stride(0)
+        if compact_raw_rope is not None
+        else 0,
+        COMPACT_ROPE_ROWS=compact_raw_rope.shape[0]
+        if compact_raw_rope is not None
+        else 0,
+        RAW_SINGLE_PV=compact_raw_rope is not None and max_seqlen_q > 4,
         **launch_kwargs,
     )
 
-    faithful_split = use_3d and score_prefix_max is not None
+    # The raw reader retains the low part of scaled probabilities; it does not
+    # need an extra QK pass to reproduce the old single-BF16 probability cast.
+    faithful_split = (
+        use_3d and score_prefix_max is not None and compact_raw_rope is None
+    )
     if faithful_split:
         kernel_unified_attention[grid](
             **kernel_kwargs,
