@@ -56,11 +56,6 @@ class EagleSpeculatorConfig(DraftModelSpeculatorConfig):
         if spec.draft_lm_head_token_ranges is not None:
             from vllm.config.speculative import normalize_token_ranges
 
-            if spec.draft_lm_head_quantization is not None:
-                raise ValueError(
-                    "draft_lm_head_token_ranges and draft_lm_head_quantization "
-                    "are mutually exclusive."
-                )
             spec.draft_lm_head_token_ranges = normalize_token_ranges(
                 spec.draft_lm_head_token_ranges
             )
