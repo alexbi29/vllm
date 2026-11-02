@@ -439,6 +439,33 @@ def _compact_local_geometry_supported(config, global_kv_heads: int) -> bool:
     )
 
 
+def _compact_attention_args(hf_config, vllm_config, rotary_emb, k_norm) -> dict:
+    """Backend and reader inputs for a compact global attention layer."""
+    from vllm.v1.attention.backends.gemma4_compact import Gemma4CompactBackend
+
+    args: dict = {
+        "attn_backend": Gemma4CompactBackend,
+        "compact_k_norm": k_norm.weight,
+    }
+    if getattr(hf_config, "gemma4_compact_fp8_storage", False):
+        from vllm.v1.attention.backends.gemma4_compact_fp8 import (
+            Gemma4CompactFp8Backend,
+        )
+
+        args["attn_backend"] = Gemma4CompactFp8Backend
+    elif vllm_config.kv_transfer_config is None and not envs.VLLM_BATCH_INVARIANT:
+        # The raw reader has no batch-invariant variant; such runs and KV
+        # transfer keep the normalized compact representation.
+        from vllm.v1.attention.backends.gemma4_compact import (
+            Gemma4CompactRawBackend,
+        )
+
+        args["attn_backend"] = Gemma4CompactRawBackend
+        args["compact_raw_rope_source"] = rotary_emb
+        args["compact_raw_epsilon"] = k_norm.variance_epsilon
+    return args
+
+
 class Gemma4Attention(nn.Module):
     def __init__(
         self,
@@ -597,10 +624,8 @@ class Gemma4Attention(nn.Module):
             is_neox_style=True,
         )
 
-        compact_args = {}
+        compact_args: dict = {}
         if self.use_compact_kv:
-            from vllm.v1.attention.backends.gemma4_compact import Gemma4CompactBackend
-
             logger.info_once(
                 "Gemma4 compact %s global KV enabled (640 values/token/head)",
                 "FP8"
@@ -623,24 +648,9 @@ class Gemma4Attention(nn.Module):
                     "ratio, and no LoRA or target KV sharing"
                 )
             _validate_compact_weight_quantization(quant_config, self.qkv_proj)
-            compact_args = {
-                "attn_backend": Gemma4CompactBackend,
-                "compact_k_norm": self.k_norm.weight,
-            }
-            if getattr(hf_config, "gemma4_compact_fp8_storage", False):
-                from vllm.v1.attention.backends.gemma4_compact_fp8 import (
-                    Gemma4CompactFp8Backend,
-                )
-
-                compact_args["attn_backend"] = Gemma4CompactFp8Backend
-            elif vllm_config.kv_transfer_config is None:
-                from vllm.v1.attention.backends.gemma4_compact import (
-                    Gemma4CompactRawBackend,
-                )
-
-                compact_args["attn_backend"] = Gemma4CompactRawBackend
-                compact_args["compact_raw_rope"] = self.rotary_emb.cos_sin_cache
-                compact_args["compact_raw_epsilon"] = self.k_norm.variance_epsilon
+            compact_args = _compact_attention_args(
+                hf_config, vllm_config, self.rotary_emb, self.k_norm
+            )
 
         self.attn = Attention(
             self.num_heads,

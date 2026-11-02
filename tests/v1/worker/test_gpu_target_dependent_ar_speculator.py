@@ -780,3 +780,31 @@ def test_rebuilt_prefill_metadata_uses_target_batch_slots():
     assert target_slots.data_ptr() == speculator.block_tables.slot_mappings.data_ptr()
     assert target_slots.shape == (1, 6)
     assert slot_mappings["draft"].tolist() == list(range(6))
+
+
+@pytest.mark.parametrize("supported", [True, False])
+def test_gemma4_q_only_choice_is_fixed_at_load(monkeypatch, supported):
+    """Capture and propose() must agree; propose() must not re-read the env."""
+    from vllm.v1.worker.gpu.spec_decode.gemma4 import speculator as gemma4_spec
+
+    speculator = object.__new__(gemma4_spec.Gemma4Speculator)
+    parallel = SimpleNamespace(
+        tensor_parallel_size=1,
+        data_parallel_size=1,
+        pipeline_parallel_size=1,
+        prefill_context_parallel_size=1,
+    )
+    speculator.vllm_config = SimpleNamespace(parallel_config=parallel)
+    speculator.pcp_manager = None
+    speculator.supports_mm_inputs = not supported
+    monkeypatch.setattr(gemma4_spec.envs, "VLLM_GEMMA4_Q_ONLY_DRAFTING", True)
+    monkeypatch.setattr(
+        TargetDependentARSpeculator, "load_model", lambda self, target_model: None
+    )
+
+    speculator.load_model(torch.nn.Module())
+    assert speculator.use_q_only_drafting is supported
+
+    monkeypatch.setattr(gemma4_spec.envs, "VLLM_GEMMA4_Q_ONLY_DRAFTING", False)
+    speculator.supports_mm_inputs = supported
+    assert speculator.use_q_only_drafting is supported
