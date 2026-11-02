@@ -1748,29 +1748,57 @@ def test_modelopt_block_quant_loads_expert_blocks_with_aligned_tp_slices(
 
 
 @pytest.mark.parametrize("unequal", [False, True])
-def test_nvfp4_up_global_preserves_fc2_dequant_units(unequal):
-    """An up-factor correction must not also rescale the down dequant alpha."""
-    from types import SimpleNamespace
-
+@pytest.mark.parametrize("reload_unequal", [None, False, True])
+def test_nvfp4_up_global_preserves_fc2_dequant_units(unequal, reload_unequal):
+    """Fresh and reloaded scales must keep the original down dequant units."""
+    from vllm.model_executor.layers.fused_moe import modular_kernel as mk
     from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.fused_moe.config import (
+        FusedMoEConfig,
+        FusedMoEParallelConfig,
+        RoutingMethodType,
+    )
     from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutlass_moe import (
         FlashInferExperts,
     )
     from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import NvFp4MoeBackend
+    from vllm.model_executor.layers.fused_moe.prepare_finalize.no_dp_ep import (
+        MoEPrepareAndFinalizeNoDPEPModular,
+    )
     from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4FusedMoE
 
-    method = ModelOptNvFp4FusedMoE.__new__(ModelOptNvFp4FusedMoE)
-    method.per_token_activation = False
-    method.use_a16 = False
-    method.nvfp4_backend = NvFp4MoeBackend.FLASHINFER_CUTLASS
-    method.experts_cls = Mock()
-    method.moe = SimpleNamespace(
-        is_act_and_mul=True,
-        moe_parallel_config=SimpleNamespace(enable_eplb=False),
+    moe = FusedMoEConfig(
+        num_experts=2,
+        experts_per_token=1,
+        hidden_dim=64,
+        intermediate_size=32,
+        num_local_experts=2,
+        num_logical_experts=2,
+        moe_parallel_config=FusedMoEParallelConfig.make_no_parallel(),
+        activation=MoEActivation.GELU_TANH,
+        in_dtype=torch.bfloat16,
+        device="cpu",
+        routing_method=RoutingMethodType.Renormalize,
     )
-    layer = torch.nn.Module()
-    layer.activation = MoEActivation.GELU_TANH
-    layer._expert_routing_tables = lambda: None
+    target = "vllm.model_executor.layers.quantization.modelopt."
+    with patch(
+        target + "select_nvfp4_moe_backend",
+        return_value=(NvFp4MoeBackend.FLASHINFER_CUTLASS, FlashInferExperts),
+    ):
+        method = ModelOptNvFp4FusedMoE(
+            ModelOptNvFp4Config(is_checkpoint_nvfp4_serialized=True), moe
+        )
+
+    class ExpertLayer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.activation = MoEActivation.GELU_TANH
+            self.moe_config = moe
+
+        def _expert_routing_tables(self):
+            return None
+
+    layer = ExpertLayer()
     globals_ = torch.tensor([[0.1, 0.08], [0.2, 0.3]])
     if not unequal:
         globals_[:, 1] = globals_[:, 0]
@@ -1784,8 +1812,15 @@ def test_nvfp4_up_global_preserves_fc2_dequant_units(unequal):
         "w13_input_scale": torch.full((2, 2), 2.0),
         "w2_input_scale": torch.full((2,), 3.0),
     }
-    for name, value in values.items():
-        layer.register_parameter(name, torch.nn.Parameter(value, requires_grad=False))
+
+    def load_checkpoint(scales):
+        for name, value in values.items():
+            value = scales if name == "w13_weight_scale_2" else value
+            layer.register_parameter(
+                name, torch.nn.Parameter(value.clone(), requires_grad=False)
+            )
+
+    load_checkpoint(globals_)
     original_weights = {
         name: values[name].clone()
         for name in ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale")
@@ -1804,27 +1839,30 @@ def test_nvfp4_up_global_preserves_fc2_dequant_units(unequal):
         )
 
     def kernel(**kw):
-        experts = SimpleNamespace(quant_config=kw["moe_quant_config"])
-
-        def process(layer):
-            FlashInferExperts.process_weights_after_loading(experts, layer)
-
-        return SimpleNamespace(
-            fused_experts=SimpleNamespace(process_weights_after_loading=process)
+        return mk.FusedMoEKernel(
+            MoEPrepareAndFinalizeNoDPEPModular(),
+            FlashInferExperts(moe, kw["moe_quant_config"]),
         )
 
-    target = "vllm.model_executor.layers.quantization.modelopt."
     with (
         patch(target + "is_weights_pre_processed", return_value=False),
         patch(target + "convert_to_nvfp4_moe_kernel_format", side_effect=convert),
         patch(target + "make_nvfp4_moe_kernel", side_effect=kernel),
     ):
         method.process_weights_after_loading(layer)
+        if reload_unequal is not None:
+            globals_ = torch.tensor([[0.1, 0.12], [0.2, 0.1]])
+            if not reload_unequal:
+                globals_[:, 1] = globals_[:, 0]
+            load_checkpoint(globals_)
+            method.process_weights_after_loading(layer)
 
     ratio = globals_[:, 1] / globals_[:, 0]
     assert method.moe_quant_config is not None
     torch.testing.assert_close(method.moe_quant_config.a2_gscale, ratio / 3)
     torch.testing.assert_close(layer.w2_weight_scale_2, torch.tensor([1.5, 1.8]))
     torch.testing.assert_close(layer.w13_weight_scale_2, globals_[:, 0] * 2)
+    if reload_unequal is False:
+        assert not hasattr(layer, "nvfp4_up_scale_ratio")
     for name, value in original_weights.items():
         torch.testing.assert_close(getattr(layer, name), value)
