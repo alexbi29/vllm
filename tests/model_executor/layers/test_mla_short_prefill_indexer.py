@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import weakref
 from types import SimpleNamespace
 
 import pytest
@@ -11,7 +12,10 @@ import vllm.models.deepseek_v32.attention as deepseek_attention
 from vllm.config import CUDAGraphMode
 from vllm.models.deepseek_v32 import attention as deepseek_v32_attention
 from vllm.models.deepseek_v32.attention import DeepseekV32Attention
-from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
+from vllm.v1.attention.backends.mla.indexer import (
+    DeepseekV32IndexerMetadata,
+    DeepseekV32IndexerPrefillChunkMetadata,
+)
 
 INDEXER_LAYER = "model.layers.0.self_attn.indexer.k_cache"
 MLA_LAYER = "model.layers.0.self_attn.attn"
@@ -89,6 +93,90 @@ def make_mla_metadata(*, use_dense_mha: bool = True, num_decode_tokens: int = 0)
         num_decode_tokens=num_decode_tokens,
         prefill=SimpleNamespace(use_dense_mha=use_dense_mha),
     )
+
+
+def test_prefill_releases_logits_before_allocating_next_chunk(monkeypatch):
+    metadata = make_indexer_metadata(num_prefill_tokens=4)
+    assert metadata.prefill is not None
+    metadata.prefill.chunks = [
+        DeepseekV32IndexerPrefillChunkMetadata(
+            block_table=torch.empty(0, dtype=torch.int32),
+            token_start=start,
+            token_end=start + 2,
+            cu_seqlen_ks=torch.zeros(2, dtype=torch.int32),
+            cu_seqlen_ke=torch.full((2,), 4, dtype=torch.int32),
+            cu_seq_lens=torch.tensor([0, 4], dtype=torch.int32),
+            token_to_seq=torch.zeros(2, dtype=torch.int32),
+            total_seq_lens=4,
+            max_seqlen_k=4,
+            num_reqs=1,
+            local_cu_seq_lens=torch.tensor([0, 4]),
+            max_local_total_seq_lens=4,
+            local_total_seq_lens=4,
+            skip_kv_gather=True,
+            pcp_deinterleave_idx=None,
+        )
+        for start in (0, 2)
+    ]
+    monkeypatch.setattr(
+        sparse_indexer,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            attn_metadata={INDEXER_LAYER: metadata},
+            cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
+        ),
+    )
+    monkeypatch.setattr(
+        sparse_indexer.current_platform, "fp8_dtype", lambda: torch.float16
+    )
+    monkeypatch.setattr(
+        sparse_indexer,
+        "current_workspace_manager",
+        lambda: SimpleNamespace(
+            get_simultaneous=lambda *specs: [
+                torch.empty(shape, dtype=dtype) for shape, dtype in specs
+            ]
+        ),
+    )
+    references: list[weakref.ReferenceType[torch.Tensor]] = []
+
+    def allocate_logits(q, kv, *args, **kwargs):
+        # A live prior chunk doubles the allocation that profiling reserved.
+        assert not references or references[-1]() is None
+        result = torch.arange(4, dtype=torch.float32).expand(2, 4).clone()
+        references.append(weakref.ref(result))
+        return result
+
+    def select(logits, start, end, output, *args):
+        output.copy_(logits.topk(2, dim=-1).indices)
+
+    monkeypatch.setattr(sparse_indexer, "fp8_fp4_mqa_logits", allocate_logits)
+    monkeypatch.setattr(sparse_indexer.ops, "top_k_per_row_prefill", select)
+    output = torch.empty((4, 2), dtype=torch.int32)
+    result = sparse_indexer.sparse_attn_indexer(
+        torch.empty(4, 1),
+        INDEXER_LAYER,
+        torch.empty(1),
+        torch.empty(4, 1, 4, dtype=torch.float16),
+        None,
+        None,
+        torch.ones(4, 1),
+        128,
+        "ue8m0",
+        2,
+        4,
+        4096,
+        4,
+        output,
+        True,
+        False,
+        False,
+        None,
+    )
+    assert result is output
+    assert len(references) == 2
+    assert all(reference() is None for reference in references)
+    torch.testing.assert_close(output, torch.tensor([[3, 2]] * 4, dtype=torch.int32))
 
 
 @pytest.mark.parametrize(

@@ -29,6 +29,7 @@ from vllm.model_executor.layers.fused_moe.deep_gemm_utils import (
     ep_gather,
 )
 from vllm.model_executor.layers.fused_moe.experts.deep_gemm_moe import (
+    DeepGemmFP4Experts,
     _fp8_workspace_shape,
 )
 from vllm.model_executor.layers.fused_moe.experts.triton_deep_gemm_moe import (
@@ -45,6 +46,186 @@ from vllm.utils.deep_gemm import (
 )
 
 BLOCK_SIZE = [128, 128]
+
+
+@pytest.mark.parametrize("num_tokens", [6, 12, 72, 128])
+@pytest.mark.parametrize("clamp", [None, 7.0])
+def test_indexed_fp4_activation_replays_live_permutation(num_tokens, clamp):
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+        silu_mul_quant_fp8_packed_triton,
+    )
+
+    torch.manual_seed(917)
+    x = torch.randn(num_tokens, 128, device="cuda", dtype=torch.bfloat16)
+    aq, scales = per_token_group_quant_fp8(x, 128, use_ue8m0=True)
+    ids = torch.zeros((num_tokens, 6), device="cuda", dtype=torch.int64)
+    expert_map = torch.tensor([0, -1, 1, -1, 2, -1, 3, -1], device="cuda")
+    padded_rows = min(num_tokens * 6, 4) * 128 + num_tokens * 6
+    activations = (
+        torch.randn(padded_rows, 4096, device="cuda", dtype=torch.bfloat16) * 4
+    )
+
+    def invoke():
+        _, _, _, inverse, _ = deepgemm_moe_permute(aq, scales, ids, 4, expert_map, None)
+        return silu_mul_quant_fp8_packed_triton(
+            activations, clamp_limit=clamp, row_indices=inverse.reshape(-1)
+        ) + (inverse,)
+
+    invoke()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual_q, actual_s, inverse = invoke()
+    reference_q, reference_s = silu_mul_quant_fp8_packed_triton(
+        activations, clamp_limit=clamp
+    )
+    for mode in range(3):
+        ids.copy_(torch.arange(num_tokens * 6, device="cuda").reshape_as(ids) % 8)
+        if mode == 1:
+            ids.fill_(7)
+            ids[0, 0] = 6
+        elif mode == 2:
+            ids.fill_(7)
+        graph.replay()
+        torch.accelerator.synchronize()
+        expected_local = expert_map[ids] >= 0
+        assert torch.equal(inverse >= 0, expected_local)
+        live = inverse[expected_local].long()
+        assert live.unique().numel() == live.numel()
+        assert torch.equal(
+            actual_q.view(torch.uint8)[live], reference_q.view(torch.uint8)[live]
+        )
+        assert torch.equal(actual_s[live], reference_s[live])
+
+
+@pytest.mark.cpu_test
+def test_registered_alignment_operator_preserves_small_expert_batches(monkeypatch):
+    """Torch-library arity errors must not silently restore 128-row padding."""
+    import vllm.utils.deep_gemm as dg
+    from vllm.model_executor.layers.fused_moe.deep_gemm_utils import (
+        compute_aligned_M_and_alignment,
+    )
+
+    received = []
+    library = torch.library.Library("test_dg_alignment", "FRAGMENT")
+    library.define("alignment(int? expected_m=None) -> int")
+
+    def alignment(expected_m):
+        received.append(expected_m)
+        return 32 if expected_m <= 8 else 128
+
+    library.impl("alignment", alignment, "CompositeExplicitAutograd")
+    monkeypatch.setattr(dg, "_lazy_init", lambda: None)
+    monkeypatch.setattr(
+        dg,
+        "_get_theoretical_mk_alignment_for_contiguous_layout_impl",
+        torch.ops.test_dg_alignment.alignment,
+    )
+    assert compute_aligned_M_and_alignment(6, 6, 128, 128, None) == (1152, 32)
+    assert received == [1]
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("arguments", [1, 2])
+def test_alignment_python_binding_compatibility(monkeypatch, arguments):
+    import vllm.utils.deep_gemm as dg
+
+    received = []
+
+    def legacy(expected_m):
+        received.append((expected_m,))
+        return 32
+
+    def grouped(expected_m, groups):
+        received.append((expected_m, groups))
+        return 32
+
+    monkeypatch.setattr(dg, "_lazy_init", lambda: None)
+    monkeypatch.setattr(
+        dg,
+        "_get_theoretical_mk_alignment_for_contiguous_layout_impl",
+        legacy if arguments == 1 else grouped,
+    )
+    assert dg.get_theoretical_mk_alignment_for_contiguous_layout(36, 128) == 32
+    assert received == ([(1,)] if arguments == 1 else [(36, 128)])
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "expected_m,groups,sm12x,expected",
+    [
+        (None, None, True, 128),
+        (1, None, True, 64),
+        (64, None, True, 64),
+        (65, None, True, 128),
+        (512, 8, True, 64),
+        (513, 8, True, 128),
+        (512, 8, False, 128),
+    ],
+)
+def test_sm12x_legacy_alignment_steps_down_at_per_expert_boundary(
+    monkeypatch, expected_m, groups, sm12x, expected
+):
+    """A legacy library must not force small SM12x expert batches to 128 rows."""
+    import vllm.utils.deep_gemm as dg
+
+    monkeypatch.setattr(dg, "_lazy_init", lambda: None)
+    monkeypatch.setattr(
+        dg,
+        "_get_theoretical_mk_alignment_for_contiguous_layout_impl",
+        lambda expected_m: 128,
+    )
+    monkeypatch.setattr(
+        dg.current_platform, "is_device_capability_family", lambda family: sm12x
+    )
+    assert (
+        dg.get_theoretical_mk_alignment_for_contiguous_layout(expected_m, groups)
+        == expected
+    )
+    for invalid_groups in (0, -1):
+        with pytest.raises(ValueError, match="num_groups must be positive"):
+            dg.get_theoretical_mk_alignment_for_contiguous_layout(
+                expected_m, invalid_groups
+            )
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "per_expert,enabled,capability,sm120,expected",
+    [
+        (1, True, True, True, 32),
+        (32, True, True, True, 32),
+        (33, True, True, True, 64),
+        (1, False, True, True, 64),
+        (1, True, False, True, 64),
+        (1, True, None, True, 64),
+        (1, True, True, False, 128),
+    ],
+)
+def test_sm120_fp4_m32_alignment_requires_matching_native_support(
+    monkeypatch, per_expert, enabled, capability, sm120, expected
+):
+    """M32 must never reach an older native selector or an unrelated caller."""
+    from types import SimpleNamespace
+
+    import vllm.utils.deep_gemm as dg
+
+    module = SimpleNamespace()
+    if capability is not None:
+        module.supports_sm120_grouped_fp8_fp4_m32 = lambda: capability
+    monkeypatch.setattr(dg, "_lazy_init", lambda: None)
+    monkeypatch.setattr(dg, "_import_deep_gemm", lambda: module)
+    monkeypatch.setattr(
+        dg, "_get_theoretical_mk_alignment_for_contiguous_layout_impl", lambda m: 128
+    )
+    monkeypatch.setattr(
+        dg.current_platform, "is_device_capability_family", lambda family: sm120
+    )
+    assert (
+        dg.get_theoretical_mk_alignment_for_contiguous_layout(
+            per_expert * 128, 128, allow_sm120_fp4_m32=enabled
+        )
+        == expected
+    )
 
 
 def test_ep_gather_uses_64_bit_row_offsets():
@@ -464,7 +645,11 @@ def make_mxfp4_weights(
       w1_bf16: (E, 2N, K)   — original BF16 for reference
       w2_bf16: (E, K, N)    — original BF16 for reference
     """
-    from deep_gemm.utils.math import per_token_cast_to_fp4
+    from vllm.utils.deep_gemm import _import_deep_gemm
+
+    per_token_cast_to_fp4 = importlib.import_module(
+        _import_deep_gemm().__name__ + ".utils.math"
+    ).per_token_cast_to_fp4
 
     dtype = torch.bfloat16
     gran_k = 32  # MXFP4 block size
@@ -632,3 +817,130 @@ def test_deepgemm_fp4_vs_triton(
             f"DeepGEMM FP4 path was not executed during the test. "
             f"Call counter: {call_counter['cnt']}"
         )
+
+
+@pytest.mark.skipif(
+    not DeepGemmFP4Experts._supports_current_device(),
+    reason="Requires Blackwell DeepGEMM FP4 kernels",
+)
+@pytest.mark.parametrize("activation", [MoEActivation.SILU, MoEActivation.SITU])
+@pytest.mark.parametrize("m,e", [(6, 4), (96, 16), (128, 16), (129, 16)])
+def test_resident_csf_matches_native_moe_across_local_routes(
+    activation, m, e, monkeypatch, workspace_init
+):
+    """Shared scratch must preserve native output after routing and layer changes."""
+    from types import SimpleNamespace
+
+    from torch.multiprocessing.reductions import StorageWeakRef
+
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.model_executor.layers.fused_moe.experts.deep_gemm_moe import (
+        DeepGemmFP4Experts,
+    )
+    from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
+        _pack_deepgemm_mxfp4_scales,
+    )
+    from vllm.model_executor.layers.fused_moe.utils import count_expert_num_tokens
+    from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
+    from vllm.platforms import current_platform
+
+    torch.manual_seed(917)
+    n, k = 512, 1024
+    w1, w2, s1, s2, *_ = make_mxfp4_weights(e, n, k)
+    s1, s2 = _pack_deepgemm_mxfp4_scales(w1, w2, s1, s2)
+    config = VllmConfig()
+    config.kernel_config.mxfp4_scale_compression = True
+    config.model_config = SimpleNamespace(
+        hf_text_config=SimpleNamespace(num_hidden_layers=2)
+    )
+    moe = make_dummy_moe_config(activation=activation)
+    moe.activation_situ_beta = 4.0
+    moe.activation_situ_linear_beta = 25.0
+
+    def build(a, b):
+        quant = FusedMoEQuantConfig(
+            _a1=FusedMoEQuantDesc(current_platform.fp8_dtype(), GroupShape(128, 128)),
+            _a2=FusedMoEQuantDesc(current_platform.fp8_dtype(), GroupShape(128, 128)),
+            _w1=FusedMoEQuantDesc("mxfp4", scale=a),
+            _w2=FusedMoEQuantDesc("mxfp4", scale=b),
+        )
+        experts = DeepGemmFP4Experts(moe, quant)
+        kernel = mk.FusedMoEKernel(
+            maybe_make_prepare_finalize(
+                moe, quant, allow_new_interface=True, use_monolithic=False
+            ),
+            experts,
+        )
+        return experts, kernel
+
+    native, reference = build(s1, s2)
+    # Preserve native strides when making independent load-time parameters.
+    layer = torch.nn.Module()
+    layer.layer_name = "model.layers.0.mlp.experts"
+    for name, original in (("w13_weight_scale", s1), ("w2_weight_scale", s2)):
+        copy = torch.empty_strided(
+            original.shape,
+            original.stride(),
+            dtype=original.dtype,
+            device=original.device,
+        )
+        copy.copy_(original)
+        layer.register_parameter(name, torch.nn.Parameter(copy, requires_grad=False))
+    packed, candidate = build(layer.w13_weight_scale, layer.w2_weight_scale)
+    # replace_parameter keeps the registered Parameter and rebinds its data, so
+    # check that the original scale storage itself is released.
+    old = StorageWeakRef(layer.w13_weight_scale.untyped_storage())
+    with set_current_vllm_config(config):
+        packed.process_weights_after_loading(layer)
+    assert packed._csf_scales is not None
+    assert old.expired()
+    assert layer.w13_weight_scale.data_ptr() == packed.w1_scale.data_ptr()
+    with pytest.raises(RuntimeError, match="State export"):
+        layer.state_dict()
+
+    # EP map: even global expert IDs belong to this rank, odd ones are remote.
+    expert_map = torch.arange(e, device="cuda").repeat_interleave(2)
+    expert_map[1::2] = -1
+    tokens = torch.randn(m, k, device="cuda", dtype=torch.bfloat16) * (k**-0.5)
+    weights = torch.full((m, 2), 0.5, device="cuda")
+    original_apply = packed.apply
+    provide_metadata = False
+
+    def apply_with_metadata(**kwargs):
+        if provide_metadata:
+            counts = count_expert_num_tokens(kwargs["topk_ids"], e, expert_map)
+            kwargs["expert_tokens_meta"] = mk.ExpertTokensMetadata(counts, None)
+        return original_apply(**kwargs)
+
+    monkeypatch.setattr(packed, "apply", apply_with_metadata)
+    for provide_metadata in (False, True):
+        for ids in ([0, 2], [1, 3], [4, 6], [0, 7]):
+            topk_ids = torch.tensor(ids, device="cuda").expand(m, 2).contiguous()
+            args = dict(
+                hidden_states=tokens,
+                w1=w1,
+                w2=w2,
+                topk_weights=weights,
+                topk_ids=topk_ids,
+                global_num_experts=2 * e,
+                activation=activation,
+                expert_map=expert_map,
+                apply_router_weight_on_input=False,
+            )
+            expected = reference.apply(**args).clone()
+            packed.w1_scale.fill_(0)
+            packed.w2_scale.fill_(0)
+            actual = candidate.apply(**args)
+            assert torch.equal(actual, expected)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        replay_output = candidate.apply(**args)
+    for ids in ([0, 2], [1, 3], [4, 6], [0, 7]):
+        args["topk_ids"].copy_(torch.tensor(ids, device="cuda").expand(m, 2))
+        expected = reference.apply(**args).clone()
+        packed.w1_scale.fill_(0)
+        packed.w2_scale.fill_(0)
+        graph.replay()
+        torch.accelerator.synchronize()
+        assert torch.equal(replay_output, expected)

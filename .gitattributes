@@ -1,0 +1,2 @@
+# Unified patches contain space-prefixed empty context lines.
+cmake/patches/*.patch -whitespace

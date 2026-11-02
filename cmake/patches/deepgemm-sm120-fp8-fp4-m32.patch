@@ -1,0 +1,81 @@
+diff --git a/csrc/apis/config.hpp b/csrc/apis/config.hpp
+index fccbe4a..01ddfeb 100644
+--- a/csrc/apis/config.hpp
++++ b/csrc/apis/config.hpp
+@@ -28,6 +28,9 @@ static void set_tc_util(const int64_t& new_tc_util) {
+ static int64_t get_tc_util() {
+     return int64_t(runtime->get_tc_util());
+ }
++static bool supports_sm120_grouped_fp8_fp4_m32() {
++    return true;
++}
+ static void set_pdl(const bool& new_enable_pdl) {
+     jit->default_launch_options.enable_pdl = new_enable_pdl;
+ }
+@@ -53,6 +56,7 @@ STABLE_TORCH_LIBRARY_FRAGMENT(deep_gemm, m) {
+     m.def("get_num_sms() -> int");
+     m.def("set_tc_util(int new_tc_util) -> ()");
+     m.def("get_tc_util() -> int");
++    m.def("supports_sm120_grouped_fp8_fp4_m32() -> bool");
+     m.def("set_pdl(bool new_enable_pdl) -> ()");
+     m.def("get_pdl() -> bool");
+     m.def("use_deterministic_algorithms(bool enabled) -> ()");
+@@ -67,6 +71,7 @@ STABLE_TORCH_LIBRARY_IMPL(deep_gemm, CompositeExplicitAutograd, m) {
+     m.impl("get_num_sms", TORCH_BOX(&deep_gemm::config::get_num_sms));
+     m.impl("set_tc_util", TORCH_BOX(&deep_gemm::config::set_tc_util));
+     m.impl("get_tc_util", TORCH_BOX(&deep_gemm::config::get_tc_util));
++    m.impl("supports_sm120_grouped_fp8_fp4_m32", TORCH_BOX(&deep_gemm::config::supports_sm120_grouped_fp8_fp4_m32));
+     m.impl("set_pdl", TORCH_BOX(&deep_gemm::config::set_pdl));
+     m.impl("get_pdl", TORCH_BOX(&deep_gemm::config::get_pdl));
+     m.impl("use_deterministic_algorithms", TORCH_BOX(&deep_gemm::config::use_deterministic_algorithms));
+diff --git a/csrc/jit_kernels/heuristics/sm120.hpp b/csrc/jit_kernels/heuristics/sm120.hpp
+index cc7f61d..9ca6db8 100644
+--- a/csrc/jit_kernels/heuristics/sm120.hpp
++++ b/csrc/jit_kernels/heuristics/sm120.hpp
+@@ -44,7 +44,13 @@ struct SM120ArchSpec {
+         const bool is_small_n = (n_for_tile > 0 and n_for_tile <= 32);
+ 
+         std::vector<int> block_m_candidates;
+-        if (runtime_align <= kMinBlockM)
++        const bool use_grouped_fp8_fp4_m32 = runtime_align == 32
++            and is_m_grouped_contiguous(desc.gemm_type)
++            and desc.a_dtype == torch::headeronly::ScalarType::Float8_e4m3fn
++            and desc.b_dtype == kPackedFP4;
++        if (use_grouped_fp8_fp4_m32)
++            block_m_candidates.push_back(32);
++        else if (runtime_align <= kMinBlockM)
+             block_m_candidates.push_back(64);
+         else {
+             if (is_small_n)
+diff --git a/deep_gemm/_C.py b/deep_gemm/_C.py
+index 86dbcdc..e2dc31c 100644
+--- a/deep_gemm/_C.py
++++ b/deep_gemm/_C.py
+@@ -58,6 +58,7 @@ set_num_sms = _torch_ops.set_num_sms
+ get_num_sms = _torch_ops.get_num_sms
+ set_tc_util = _torch_ops.set_tc_util
+ get_tc_util = _torch_ops.get_tc_util
++supports_sm120_grouped_fp8_fp4_m32 = _torch_ops.supports_sm120_grouped_fp8_fp4_m32
+ set_pdl = _torch_ops.set_pdl
+ get_pdl = _torch_ops.get_pdl
+ set_ignore_compile_dims = _torch_ops.set_ignore_compile_dims
+@@ -737,6 +738,7 @@ _PUBLIC_API = [
+     'epilogue', 'locality_domain',
+     'set_num_sms', 'get_num_sms',
+     'set_tc_util', 'get_tc_util',
++    'supports_sm120_grouped_fp8_fp4_m32',
+     'set_pdl', 'get_pdl',
+     'use_deterministic_algorithms',
+     'set_ignore_compile_dims',
+diff --git a/deep_gemm/__init__.py b/deep_gemm/__init__.py
+index d2dace0..6659f89 100644
+--- a/deep_gemm/__init__.py
++++ b/deep_gemm/__init__.py
+@@ -20,6 +20,7 @@ from ._C import (
+     get_num_sms,
+     set_tc_util,
+     get_tc_util,
++    supports_sm120_grouped_fp8_fp4_m32,
+     set_ignore_compile_dims,
+     set_block_size_multiple_of,
+     set_pdl,

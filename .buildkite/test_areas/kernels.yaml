@@ -632,6 +632,7 @@ steps:
   - vllm/model_executor/layers/fused_moe
   - vllm/model_executor/layers/quantization
   - tests/kernels/quantization/test_block_fp8.py
+  - tests/kernels/quantization/test_mxfp4_csf.py
   - tests/kernels/moe/test_deepgemm.py
   - tests/kernels/moe/test_batched_deepgemm.py
   - tests/kernels/attention/test_deepgemm_attention.py
@@ -639,6 +640,7 @@ steps:
   commands:
     - python3 ../tools/check_wheel_deepgemm.py
     - pytest -v -s kernels/quantization/test_block_fp8.py
+    - pytest -v -s kernels/quantization/test_mxfp4_csf.py
     - pytest -v -s kernels/moe/test_deepgemm.py
     - pytest -v -s kernels/moe/test_batched_deepgemm.py
     - pytest -v -s kernels/attention/test_deepgemm_attention.py
@@ -699,6 +701,9 @@ steps:
   device: b200-k8s
   # optional: true
   source_file_dependencies:
+  - vllm/model_executor/layers/quantization/utils/mxfp4_csf.py
+  - vllm/model_executor/layers/fused_moe/experts/deep_gemm_moe.py
+  - tests/kernels/moe/test_deepgemm.py
   - csrc/quantization/fp4/
   - csrc/nvfp4_kv_cache_kernels.cu
   - csrc/quantization/w8a8/cutlass/
@@ -768,6 +773,7 @@ steps:
     - pytest -v -s tests/kernels/quantization/test_nvfp4_quant.py
     - pytest -v -s tests/kernels/quantization/test_nvfp4_scaled_mm.py
     - pytest -v -s tests/kernels/quantization/test_mxfp4_qutlass.py
+    - pytest -v -s tests/kernels/moe/test_deepgemm.py -k resident_csf
     - pytest -v -s tests/kernels/moe/test_flashinfer.py
     - pytest -v -s tests/kernels/moe/test_trtllm_nvfp4_moe.py
     - pytest -v -s tests/kernels/mamba/test_gdn_prefill_cutedsl.py
