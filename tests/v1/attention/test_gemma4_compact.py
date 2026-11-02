@@ -11,6 +11,63 @@ from vllm.v1.attention.backends.gemma4_compact import Gemma4CompactBackend
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVQuantMode
 
 
+@pytest.mark.parametrize("scalar", [True, False])
+def test_compact_format_is_selected_from_loaded_weights_and_stays_fixed(
+    default_vllm_config, scalar
+):
+    from vllm.v1.attention.backends.gemma4_compact import Gemma4CompactRawImpl
+
+    norm = torch.full((512,), 0.0625, dtype=torch.bfloat16)
+    if not scalar:
+        norm[0] = 0.125
+    rope = torch.zeros(32, 512, dtype=torch.bfloat16)
+    impl = Gemma4CompactRawImpl(
+        16,
+        512,
+        1.0,
+        2,
+        None,
+        None,
+        "bfloat16",
+        compact_k_norm=norm,
+        compact_raw_rope=rope,
+    )
+    impl.process_weights_after_loading(torch.bfloat16)
+    assert impl.use_raw_storage is scalar
+    if scalar:
+        assert impl.compact_raw_rope is rope
+        norm[0] = 0.125
+        with pytest.raises(ValueError, match="full model reload"):
+            impl.process_weights_after_loading(torch.bfloat16)
+    else:
+        assert impl.compact_raw_rope is None
+        norm.fill_(0.0625)
+        impl.process_weights_after_loading(torch.bfloat16)
+        assert not impl.use_raw_storage
+
+
+def test_raw_compact_preserves_global_page_geometry():
+    from vllm.v1.attention.backends.gemma4_compact import Gemma4CompactRawBackend
+
+    spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=2,
+        head_size=512,
+        dtype=torch.bfloat16,
+        head_size_v=512,
+    )
+    current = Gemma4CompactBackend.customize_spec(spec)
+    raw = Gemma4CompactRawBackend.customize_spec(spec)
+    assert raw == current
+    assert raw.page_size_bytes == current.page_size_bytes
+    assert Gemma4CompactRawBackend.get_kv_cache_shape(3, 256, 2, 512) == (
+        3,
+        2,
+        256,
+        640,
+    )
+
+
 def _weight_config(name):
     from vllm.model_executor.layers.quantization.compressed_tensors import (
         compressed_tensors,
@@ -223,6 +280,7 @@ def test_compact_forward_uses_one_shared_projection_result(compact, omit_v):
         q_size=512,
         kv_size=512,
         use_compact_kv=compact,
+        use_compact_raw=False,
         omit_v_proj=omit_v,
         num_heads=1,
         num_kv_heads=1,

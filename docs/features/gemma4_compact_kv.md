@@ -10,9 +10,9 @@ vllm serve /path/to/Gemma-4-26B-A4B-NVFP4 \
     --hf-overrides '{"gemma4_compact_kv":true,"gemma4_compact_no_v_proj":true}'
 ```
 
-Each global head stores 128 rotated K elements and 512 normalized V elements,
-640 BF16 values in total. The reader reconstructs unrotated K from V and the
-target's K-normalization weight. Global cache payload falls37.5% compared with
+Each global head stores 640 BF16 words in total. With scalar K-normalization
+weights, it retains 512 shared projection values before normalization, 124
+rotated K coordinates, and four metadata words. Global cache payload falls37.5% compared with
 separate 512-element K and V. Sliding-window cache and model weights keep their
 existing formats. The page planner, active prefill reservations and graph
 allocations determine the resulting logical capacity.
@@ -21,6 +21,45 @@ Compact KV requires BF16 activations and explicit BF16 KV with quantized model
 weights. LoRA, target cross-layer KV sharing and incompatible head/rotation
 geometry are rejected. Compact FP8 storage is a separate experimental option;
 the recipe above retains BF16 cache precision.
+
+## Raw compact BF16 storage
+
+Compact BF16 storage uses the shared projection before normalization, without
+an additional configuration flag. It retains an FP32 inverse RMS
+and the key position in four words of the existing rotated-key region; those
+four key components are reconstructed from the raw projection and original RoPE
+table. The row size and page geometry stay the same. Total usable cache capacity
+still depends on profiling reservations and graph allocations.
+
+The reader applies normalization to the unrotated scores and value-weighting in
+FP32, keeping the ordinary softmax denominator. Short queries retain the low
+part of BF16-scaled probabilities; larger prefills use one value dot product.
+This reduces redundant cache rounding rather than matching a particular dense
+kernel's outputs. Lower mathematical RMS error does not guarantee closer
+individual output values or identical generated trajectories. Latency depends on
+workload and execution shape.
+
+Raw storage requires BF16 activations/cache, scalar KNorm weights and the existing
+supported compact geometry. Vector KNorm weights and configured KV transfer use
+the previous normalized-V representation automatically. The representation is
+fixed after the initial weight load; changing raw storage to vector KNorm weights
+requires a full model reload. Compact FP8 storage retains its own format.
+Cache copies must preserve all
+bits, including the four metadata words; numeric transformations of packed cache
+payloads are invalid.
+
+## FP8 assistant-head scales
+
+The existing `draft_lm_head_quantization="fp8"` option fits per-row weight scales
+at load time. A fixed scale search and least-squares updates retain the original
+quantization whenever FP64 row reconstruction error would increase. The tied
+BF16 embedding remains unchanged, and runtime FP8 weight layout, scale storage
+and per-token activation quantization are unchanged. Reloads re-derive the head
+in place, preserving captured tensor addresses.
+
+This reduces weight RMS error without another inference operation. It does not
+guarantee lower logit or softmax error for every input. Only draft scoring changes;
+target verification remains strict, while proposals and acceptance can change.
 
 ## NVFP4 checkpoint reload
 

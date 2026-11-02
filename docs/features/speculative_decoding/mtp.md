@@ -96,7 +96,9 @@ vllm serve XiaomiMiMo/MiMo-7B-Base \
   model speculation.
 - When the MTP head shares the target's unquantized lm_head (most MTP models),
   `"draft_lm_head_quantization": "fp8"` or `"nvfp4"` in `--speculative-config`
-  gives the drafter a quantized copy of that head (Model Runner V2). The target
+  gives the drafter a quantized copy of that head (Model Runner V2). FP8 copies
+  fit their per-row weight scales at load time with an FP64 reconstruction-error
+  guard; their runtime layout and activation quantization are unchanged. The target
   still verifies with its own head, so outputs are unchanged; only the
   acceptance length can move. It helps most on bandwidth-bound GPUs with a
   large vocabulary. The copy costs about one byte (FP8) or 0.56 bytes (NVFP4)
