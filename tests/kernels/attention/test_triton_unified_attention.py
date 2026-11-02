@@ -28,6 +28,134 @@ pytestmark = pytest.mark.skip_global_cleanup
 
 DEVICE_TYPE = current_platform.device_type
 
+
+@pytest.mark.parametrize(
+    "length,query_len,shift", [(1, 1, 0), (17, 4, 65530), (257, 17, 0)]
+)
+def test_gemma4_raw_compact_fp64_reference(length, query_len, shift):
+    """Raw cache metadata and attention reduce error without enlarging pages."""
+    from vllm.v1.attention.ops.gemma4_raw_cache import write_raw_compact_cache
+
+    generator = torch.Generator().manual_seed(20261102 + length)
+    raw = torch.randn(length + 1, 2, 512, generator=generator).to(torch.bfloat16)
+    query = torch.randn(query_len, 16, 512, generator=generator).to(torch.bfloat16)
+    positions = torch.arange(length + 1) + shift
+    frequency = torch.cat(
+        [1 / (1e6 ** (torch.arange(64).float() * 2 / 512)), torch.zeros(192)]
+    )
+    angles = torch.arange(shift + length + 1).float()[:, None] * frequency[None, :]
+    rope = torch.cat([angles.cos(), angles.sin()], -1).to(torch.bfloat16)
+    gamma = torch.tensor(0.062255859375, dtype=torch.bfloat16)
+    values = raw[:length].double()
+    values = values * torch.rsqrt(values.square().mean(-1, keepdim=True) + 1e-6)
+    a, b = (values * gamma.double()).chunk(2, -1)
+    c, s = rope[positions[:length]].double().chunk(2, -1)
+    keys = torch.cat(
+        [a * c[:, None, :] - b * s[:, None, :], b * c[:, None, :] + a * s[:, None, :]],
+        -1,
+    )
+    mask = (
+        torch.arange(length)[None, :]
+        <= (length - query_len + torch.arange(query_len))[:, None]
+    )
+
+    def reference(k, v):
+        score = torch.einsum(
+            "qhd,khd->hqk", query.double(), k.repeat_interleave(8, 1).double()
+        )
+        score = score.masked_fill(~mask[None, :, :], -torch.inf)
+        return torch.einsum(
+            "hqk,khd->qhd", score.softmax(-1), v.repeat_interleave(8, 1).double()
+        )
+
+    expected = reference(keys, values)
+    used = (length + 255) // 256
+    pages = torch.arange(used, 0, -1)
+    table = pages.to(device=DEVICE_TYPE, dtype=torch.int32)[None, :]
+    logical = torch.arange(length)
+    slots = torch.cat(
+        [pages[logical // 256] * 256 + logical % 256, torch.tensor([-1])]
+    ).to(DEVICE_TYPE)
+    cache = torch.full(
+        (used + 1, 2, 256, 640), 42, dtype=torch.bfloat16, device=DEVICE_TYPE
+    )
+    write_raw_compact_cache(
+        raw.to(DEVICE_TYPE),
+        positions.to(DEVICE_TYPE),
+        cache,
+        slots,
+        rope.to(DEVICE_TYPE),
+        gamma.reshape(1).to(DEVICE_TYPE),
+        1e-6,
+    )
+    assert torch.equal(cache[0].cpu(), torch.full_like(cache[0], 42, device="cpu"))
+    physical = torch.div(slots[:length], 256, rounding_mode="floor")
+    indices = slots[:length] % 256
+    words = (
+        cache.view(torch.int16)[physical, :, indices, 126:128].to(torch.int64) & 65535
+    )
+    decoded = (words[..., 0] | words[..., 1] << 16).cpu()
+    assert torch.equal(decoded, positions[:length, None].expand(-1, 2))
+    k, v = cache.transpose(1, 2).split([128, 512], -1)
+    q = query.to(DEVICE_TYPE)
+    output = torch.empty_like(q)
+    unified_attention(
+        q=q,
+        k=k,
+        v=v,
+        out=output,
+        cu_seqlens_q=torch.tensor(
+            [0, query_len], dtype=torch.int32, device=DEVICE_TYPE
+        ),
+        max_seqlen_q=query_len,
+        seqused_k=torch.tensor([length], dtype=torch.int32, device=DEVICE_TYPE),
+        max_seqlen_k=length,
+        softmax_scale=1.0,
+        causal=True,
+        window_size=(-1, -1),
+        block_table=table,
+        softcap=0.0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        seq_threshold_3D=0,
+        compact_k_norm=gamma.reshape(1).to(DEVICE_TYPE),
+        compact_raw_rope=rope.to(DEVICE_TYPE),
+    )
+    actual = output.cpu().double()
+    assert torch.isfinite(actual).all()
+    dense_k = torch.zeros(
+        (used + 1, 256, 2, 512), dtype=torch.bfloat16, device=DEVICE_TYPE
+    )
+    dense_v = torch.zeros_like(dense_k)
+    dense_k[physical, indices] = keys.to(device=DEVICE_TYPE, dtype=torch.bfloat16)
+    dense_v[physical, indices] = values.to(device=DEVICE_TYPE, dtype=torch.bfloat16)
+    dense_out = torch.empty_like(q)
+    unified_attention(
+        q=q,
+        k=dense_k,
+        v=dense_v,
+        out=dense_out,
+        cu_seqlens_q=torch.tensor(
+            [0, query_len], dtype=torch.int32, device=DEVICE_TYPE
+        ),
+        max_seqlen_q=query_len,
+        seqused_k=torch.tensor([length], dtype=torch.int32, device=DEVICE_TYPE),
+        max_seqlen_k=length,
+        softmax_scale=1.0,
+        causal=True,
+        window_size=(-1, -1),
+        block_table=table,
+        softcap=0.0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        seq_threshold_3D=0,
+    )
+    dense = dense_out.cpu().double()
+    assert (actual - expected).square().mean() <= (dense - expected).square().mean()
+
+
 NUM_HEADS = [(4, 4), (8, 2), (5, 1)]
 HEAD_SIZES = [128, 256]
 BLOCK_SIZES = [16]

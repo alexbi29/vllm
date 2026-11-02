@@ -64,6 +64,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.triton_utils import tl, triton
+from vllm.utils.torch_utils import _encode_layer_name
 from vllm.v1.attention.backends.utils import KVSharingFastPrefillMetadata
 
 from .interfaces import (
@@ -632,6 +633,14 @@ class Gemma4Attention(nn.Module):
                 )
 
                 compact_args["attn_backend"] = Gemma4CompactFp8Backend
+            elif vllm_config.kv_transfer_config is None:
+                from vllm.v1.attention.backends.gemma4_compact import (
+                    Gemma4CompactRawBackend,
+                )
+
+                compact_args["attn_backend"] = Gemma4CompactRawBackend
+                compact_args["compact_raw_rope"] = self.rotary_emb.cos_sin_cache
+                compact_args["compact_raw_epsilon"] = self.k_norm.variance_epsilon
 
         self.attn = Attention(
             self.num_heads,
@@ -652,6 +661,12 @@ class Gemma4Attention(nn.Module):
             mm_prefix_clamp_sliding_window=self.is_sliding,
             prefix=f"{prefix}.attn",
             **compact_args,
+        )
+
+    @property
+    def use_compact_raw(self) -> bool:
+        return self.use_compact_kv and bool(
+            getattr(self.attn.impl, "use_raw_storage", False)
         )
 
     def forward(
@@ -681,15 +696,34 @@ class Gemma4Attention(nn.Module):
             q = self.q_norm(q)
             q = q.flatten(-2, -1)
 
-            k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
-            k = self.k_norm(k)
-            k = k.flatten(-2, -1)
-            q, k = self.rotary_emb(positions, q, k)
-
-            v = v.unflatten(-1, (self.num_kv_heads, self.head_dim))
-            v = self.v_norm(v)
-            v = v.flatten(-2, -1)
-            attn_output = self.attn(q, k, v)
+            if self.use_compact_raw:
+                q, _ = self.rotary_emb(positions, q, None)
+                layer_name = _encode_layer_name(self.attn.layer_name)
+                dependency = torch.ops.vllm.gemma4_raw_compact_cache_update(
+                    v.unflatten(-1, (self.num_kv_heads, self.head_dim)),
+                    positions,
+                    layer_name,
+                )
+                attn_output = torch.empty_like(q)
+                torch.ops.vllm.unified_attention_with_output(
+                    q.unflatten(-1, (self.num_heads, self.head_dim)),
+                    None,
+                    None,
+                    attn_output.unflatten(-1, (self.num_heads, self.head_dim)),
+                    layer_name,
+                    None,
+                    None,
+                    dependency,
+                )
+            else:
+                k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
+                k = self.k_norm(k)
+                k = k.flatten(-2, -1)
+                q, k = self.rotary_emb(positions, q, k)
+                v = v.unflatten(-1, (self.num_kv_heads, self.head_dim))
+                v = self.v_norm(v)
+                v = v.flatten(-2, -1)
+                attn_output = self.attn(q, k, v)
 
         output, _ = self.o_proj(attn_output)
 
