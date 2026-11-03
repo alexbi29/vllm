@@ -160,6 +160,44 @@ def test_raw_compact_preserves_global_page_geometry():
     )
 
 
+def test_compact_hybrid_prefix_hits_land_on_small_blocks():
+    """Gemma 26B/31B local pages pad to the compact global page, so hybrid
+    prefix-cache hits stay fine-grained (lcm 64) instead of 80/256 -> 1280."""
+    import math
+
+    from vllm.v1.core.kv_cache_planning import unify_kv_cache_spec_page_size
+    from vllm.v1.kv_cache_interface import SlidingWindowSpec
+
+    local = SlidingWindowSpec(
+        block_size=16,
+        num_kv_heads=8,
+        head_size=256,
+        dtype=torch.bfloat16,
+        sliding_window=1024,
+    )
+    compact = Gemma4CompactBackend.customize_spec(
+        FullAttentionSpec(
+            block_size=16,
+            num_kv_heads=2,
+            head_size=512,
+            dtype=torch.bfloat16,
+            head_size_v=512,
+        )
+    )
+    specs = {f"local.{i}": local for i in range(5)} | {"global.0": compact}
+    unified = unify_kv_cache_spec_page_size(specs)
+
+    assert unified["global.0"].block_size == 64
+    assert unified["local.0"].block_size == 16
+    assert {s.page_size_bytes for s in unified.values()} == {compact.page_size_bytes}
+    # Only the window-bounded local pages are padded (by 25%).
+    padded_local = unified["local.0"]
+    assert isinstance(padded_local, SlidingWindowSpec)
+    assert padded_local.page_size_padded == compact.page_size_bytes
+    assert compact.page_size_bytes * 4 == local.page_size_bytes * 5
+    assert math.lcm(*(s.block_size for s in unified.values())) == 64
+
+
 def _weight_config(name):
     from vllm.model_executor.layers.quantization.compressed_tensors import (
         compressed_tensors,
