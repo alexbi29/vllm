@@ -135,11 +135,13 @@ class Gemma4CompactBackend(TritonAttentionBackend):
             raise ValueError("Compact Gemma4 KV requires BF16 global 512-d attention")
         # Gemma26B/31B local layers have four times as many KV heads and
         # 256-d K/V. Their bytes/token : compact global bytes/token is 16:5.
-        # Global blocks of 256 and local blocks of 80 share a page size
-        # without padding away the compression. The generic hybrid planner
-        # grows the local blocks from 16 to 80 during page unification.
+        # Unpadded pages would need 80/256-token blocks, and hybrid
+        # prefix-cache hits land on the LCM of the group block sizes (1280
+        # tokens). 64-token global blocks instead let the planner pad the
+        # 16-token local pages by 25% (local KV is window-bounded), so hits
+        # land every 64 tokens and the global pages stay compact.
         return replace(
-            spec, block_size=lcm(spec.block_size, 256), state_content_bytes=640 * 2
+            spec, block_size=lcm(spec.block_size, 64), state_content_bytes=640 * 2
         )
 
     @staticmethod
