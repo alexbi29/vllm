@@ -3,7 +3,7 @@
 
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
 import pytest
 import torch
@@ -637,7 +637,7 @@ def test_q_only_multi_step_decode_starts_at_draft_step_zero(
 def test_q_only_skips_ordinary_decode_input_preparation(monkeypatch):
     """Q-only inputs come from prepare_q_only_decode_inputs in propose()."""
     speculator = object.__new__(_QOnlyTestSpeculator)
-    launched = Mock()
+    launched = MagicMock()
     monkeypatch.setattr(spec_module, "_prepare_decode_inputs_kernel", launched)
     speculator._prepare_decode_inputs(None, None, 2, False, None)
     launched.__getitem__.assert_not_called()
