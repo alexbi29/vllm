@@ -516,3 +516,87 @@ If you observe that GPU utilization is lower than expected, CPU contention may b
 vLLM supports multiple attention backends optimized for different hardware and use cases. The backend is automatically selected based on your GPU architecture, model type, and configuration, but you can also manually specify one for optimal performance.
 
 For detailed information on available backends, their feature support, and how to configure them, see the [Attention Backend Feature Support](../design/attention_backends.md) documentation.
+
+## Experimental Gemma4 Shared-MLP GEMM on SM120
+
+Set `VLLM_GEMMA4_DENSE_CUDNN=1` before starting a fresh worker to opt into a
+pinned cuDNN implementation of Gemma4's small-batch BF16 shared-MLP
+projections. It is disabled by default. The target profile is
+`nvidia/Gemma-4-26B-A4B-NVFP4` on SM120 with tensor parallelism 1; its shared
+MLP weights are BF16 even though its expert weights are NVFP4. This option
+does not change expert quantization or KV precision.
+
+The optimization requires FlashInfer `0.7.0.post1` or `0.7.2` and their
+audited cuDNN override-shape APIs, which require cuDNN backend 9.23.1 or newer.
+The private graph builders it calls are byte-identical in both releases; other
+FlashInfer versions fail closed. The model measurements use a separately qualified environment
+with the system cuDNN 9.24.0 backend; wheel metadata alone does not identify
+the loaded backend. Upgrading a dependency alone does not qualify another build.
+It applies to contiguous, 16-byte-aligned BF16 CUDA
+operands with shared-MLP weights of shape `(4224, 2816)` or `(2816, 2112)` and
+2, 3, 4, 6 or 8 input rows. Other rows retain Torch linear execution. LoRA,
+bias, tensor parallelism greater than 1, DBO/ubatching and other devices do
+not install this optimization. Graph-replay measurements do not establish
+eager-mode performance.
+
+Each eligible loaded weight is prewarmed and checked against Torch before
+capture. The selected plan must report engine 10, knob 12 = 18 and zero
+required and supplied workspace. Incompatible APIs, missing plans, nonzero
+workspace or failed prewarm comparisons cause an error rather than heuristic
+retuning. `gemma4_dense_cudnn_state()` in the worker exposes observed plan and
+installation receipts; its Python call counters cover prewarm, eager and
+capture calls, not CUDA graph replays. These checks do not prove output
+identity for every possible input or qualify a different dependency build.
+
+Changing the option separates compilation caches and requires a restart.
+First-time compilation can increase the transient activation peak used by
+automatic KV profiling. To reproduce the populated-cache capacity condition,
+populate the compilation cache with the same model, option and serving
+settings, stop that worker, then load fresh weights in a new process using
+the populated cache. Keep the initial profile log and recheck the new boot's
+reported KV capacity. Zero GEMM workspace alone does not establish unchanged
+total GPU memory or KV capacity. No memory-budget override is required.
+
+vLLM automatically compiles and caches this path with ordinary cache settings;
+no experiment cache, copied compiled artifact or per-model cache override is
+required. A local clean startup with normal caching reproduced the saved
+128-token IDs, selected logprobs and top-20 scores exactly at 8K and 64K on
+both replicas. This validates those probes, not every possible continuation.
+Surrounding compiled reductions can select different launch configurations
+when rebuilding a cache, so changing the compilation cache, serving profile
+or dependencies still requires rechecking outputs and the actual KV budget.
+Fixed-input GEMM equality does not establish sample-efficiency equivalence
+for concurrent generation.
+
+## Experimental Gemma4 W12 Weight Storage on SM120
+
+Set `VLLM_GEMMA4_W12=1` before starting a fresh worker to store the target
+Gemma4 model's BF16 attention projections, shared-MLP projections and tied
+embedding/LM head in W12, a lossless 12-bit coding of BF16 weights ported from
+[SpecPilot](https://github.com/StargazerX0/SpecPilot) (commit `78c42af`,
+Apache-2.0). It is disabled by default and needs an SM120/SM121 GPU, a build
+containing the `w12_gemm` kernels, the V2 model runner, tensor and pipeline
+parallelism 1 and no LoRA; otherwise startup fails instead of silently running
+without it. The
+target profile is `nvidia/Gemma-4-26B-A4B-NVFP4`; NVFP4 experts, the router,
+the vision tower and the MTP assistant keep their own paths.
+
+After loading, each eligible weight is re-encoded on the GPU, its device
+decode is compared bit for bit with the loaded weight, the GEMM is checked
+against a reference at 3 and 64 rows and above its decode crossover, and the
+BF16 original is freed. For Gemma4-26B the 120 BF16 linears shrink from
+3.29 GB to 2.48 GB and the tied 262144 x 2816 table from 1.48 GB to 1.11 GB
+(4.77 GB to 3.59 GB in total, plus a 64 MB shared workspace); the embedding
+lookup gathers exact BF16 rows from W12. Weights in the W12 format
+cannot be reloaded in place.
+
+Up to a per-shape row count (48-112 rows, measured with CUDA graphs on an
+RTX PRO 6000) the projections run the W12 kernel in 64-row launches, which
+reads about 25% fewer bytes than BF16. Larger batches decode the weight into
+one shared BF16 scratch (52 MB) and use `torch.mm`, adding the decode time to
+prefill. The LM head always uses the kernel. The shared-MLP gate/up projection
+applies GELU-tanh with vLLM's `gelu_tanh_and_mul` rounding in the GEMM
+epilogue. This option supersedes `VLLM_GEMMA4_DENSE_CUDNN` for the weights it
+replaces. Outputs are deterministic for a fixed GPU but not bitwise equal to
+cuBLAS, because the accumulation order differs. `gemma4_w12_state()` in the
+worker reports installed and skipped weights and the freed and resident bytes.

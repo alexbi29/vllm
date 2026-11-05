@@ -8,6 +8,7 @@ import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
+from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.worker.gpu.dp_utils import DPSyncState, dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
@@ -18,6 +19,8 @@ from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import (
     AutoRegressiveSpeculator,
 )
 from vllm.v1.worker.utils import AttentionGroup, get_uniform_decode_token_count
+
+logger = init_logger(__name__)
 
 
 class TargetDependentARSpeculator(AutoRegressiveSpeculator):
@@ -39,18 +42,72 @@ class TargetDependentARSpeculator(AutoRegressiveSpeculator):
 
         self.inputs_embeds: torch.Tensor | None = None
 
+    @property
+    def use_q_only_drafting(self) -> bool:
+        """Whether every draft step is a one-query decode over the target KV.
+
+        Q-only drafters (the Gemma4 MTP assistant) have no draft prefill: the
+        first draft step runs on the last accepted target hidden row.
+        """
+        return False
+
+    @property
+    def _first_decode_step(self) -> int:
+        return 0 if self.use_q_only_drafting else 1
+
+    def _configure_decode_metadata_update(self) -> None:
+        if self.use_q_only_drafting:
+            # Q-only runs every step, including a single one, as a decode.
+            super(AutoRegressiveSpeculator, self)._configure_decode_metadata_update()
+            return
+        super()._configure_decode_metadata_update()
+
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
-        self.prefill_cudagraph_manager = SpeculatorCudaGraphManager(
-            self.vllm_config,
-            self.device,
-            cudagraph_mode,
-            self.vllm_config.get_decode_cudagraph_query_lens(
-                self.num_speculative_steps + 1
-            ),
-            # Draft prefill shares the target's padded attention metadata.
-            varlen_decode=self.enable_adaptive_verification,
-        )
+        if self.use_q_only_drafting:
+            self.prefill_cudagraph_manager = None
+        else:
+            self.prefill_cudagraph_manager = SpeculatorCudaGraphManager(
+                self.vllm_config,
+                self.device,
+                cudagraph_mode,
+                self.vllm_config.get_decode_cudagraph_query_lens(
+                    self.num_speculative_steps + 1
+                ),
+                # Draft prefill shares the target's padded attention metadata.
+                varlen_decode=self.enable_adaptive_verification,
+            )
         super().init_cudagraph_manager(cudagraph_mode)
+
+    def capture(self) -> None:
+        if not self.use_q_only_drafting:
+            super().capture()
+            return
+        logger.info("Capturing Q-only autoregressive speculator...")
+        self.last_token_indices.zero_()
+        self.idx_mapping.zero_()
+        self.current_draft_step.zero_()
+        # No draft prefill: capture one-query decode graphs for every step,
+        # including a single speculative step.
+        assert self.decode_cudagraph_manager is not None
+        self.on_multi_step_decode_begin(self.max_num_reqs)
+        decode_fn = (
+            self._fused_multi_step_decode
+            if self.supports_decode_metadata_update
+            else self._decode
+        )
+        self.decode_cudagraph_manager.capture(
+            decode_fn,
+            self.model_state,
+            self.input_buffers,
+            self.block_tables,
+            self.attn_groups,
+            self.kv_cache_config,
+            progress_bar_desc="Capturing decode CUDA graphs",
+            specialize_spec_tokens=self.supports_decode_metadata_update
+            and self.speculative_config.uses_dynamic_speculative_decoding(),
+            include_single_step=True,
+        )
+        self.on_multi_step_decode_end(self.max_num_reqs)
 
     def load_model(self, target_model: nn.Module) -> None:
         super().load_model(target_model)
@@ -79,6 +136,9 @@ class TargetDependentARSpeculator(AutoRegressiveSpeculator):
         skip_attn: bool,
         batch_desc: Any,
     ) -> None:
+        if self.use_q_only_drafting:
+            # prepare_q_only_decode_inputs already ran in propose().
+            return
         _prepare_decode_inputs_kernel[(num_reqs + 1,)](
             self.draft_tokens[:num_reqs, 0],
             self.draft_tokens.stride(0),
@@ -159,6 +219,37 @@ class TargetDependentARSpeculator(AutoRegressiveSpeculator):
             seeds,
             dummy_run=dummy_run,
         )
+
+        if self.use_q_only_drafting:
+            # No independent KV needs warming for the Q-only assistant.
+            if num_speculative_tokens == 0:
+                self.draft_tokens[:num_reqs].fill_(-1)
+                return self.draft_tokens[:num_reqs]
+            prepare_q_only_decode_inputs(
+                self.hidden_states,
+                self.current_draft_step,
+                self.input_buffers,
+                self.sample_src_positions,
+                hidden_states,
+                input_batch,
+                num_sampled,
+                num_rejected,
+                last_sampled,
+                next_prefill_tokens,
+                self.max_num_reqs,
+            )
+            # The first draft forward runs in _decode, which prepares EPLB.
+            self._run_multi_step_decode(
+                input_batch,
+                num_rejected,
+                num_reqs,
+                dummy_run and skip_attn_for_dummy_run,
+                dp_sync_state,
+                input_batch.seq_lens_cpu_upper_bound,
+                is_profile,
+                num_speculative_tokens,
+            )
+            return self.draft_tokens[:num_reqs]
 
         # Get the input ids and last token indices for the speculator.
         prepare_prefill_inputs(
@@ -614,6 +705,125 @@ def _prepare_decode_inputs_kernel(
         tl.store(positions_ptr + req_idx, position)
         seq_len = tl.minimum(seq_len + 1, max_model_len)
     tl.store(seq_lens_ptr + req_idx, seq_len)
+
+
+@triton.jit
+def _prepare_q_only_decode_inputs_kernel(
+    draft_input_ids_ptr,
+    draft_positions_ptr,
+    sample_src_positions_ptr,
+    draft_query_start_loc_ptr,
+    draft_seq_lens_ptr,
+    draft_hidden_states_ptr,
+    draft_hidden_states_stride,
+    draft_current_step_ptr,
+    target_hidden_states_ptr,
+    target_hidden_states_stride,
+    target_positions_ptr,
+    target_seq_lens_ptr,
+    query_start_loc_ptr,
+    idx_mapping_ptr,
+    num_sampled_ptr,
+    num_rejected_ptr,
+    last_sampled_ptr,
+    next_prefill_tokens_ptr,
+    hidden_size,
+    max_num_reqs,
+    BLOCK_SIZE: tl.constexpr,
+):
+    req_idx = tl.program_id(0)
+    num_reqs = tl.num_programs(0) - 1
+
+    if req_idx == num_reqs:
+        # Reset draft_current_step to 0.
+        tl.store(draft_current_step_ptr, 0)
+        # Compute query_start_loc: 0 .. num_reqs, padded with num_reqs for CUDA graphs.
+        for i in range(0, max_num_reqs + 1, BLOCK_SIZE):
+            block = i + tl.arange(0, BLOCK_SIZE)
+            q = tl.where(block < num_reqs, block, num_reqs)
+            mask = block < max_num_reqs + 1
+            tl.store(draft_query_start_loc_ptr + block, q, mask=mask)
+        # Pad draft_seq_lens for CUDA graphs.
+        for i in range(num_reqs, max_num_reqs, BLOCK_SIZE):
+            block = i + tl.arange(0, BLOCK_SIZE)
+            mask = block < max_num_reqs
+            tl.store(draft_seq_lens_ptr + block, 0, mask=mask)
+        return
+
+    query_end = tl.load(query_start_loc_ptr + req_idx + 1)
+    num_rejected = tl.load(num_rejected_ptr + req_idx)
+    last_token_index = (query_end - num_rejected - 1).to(tl.int64)
+
+    req_state_idx = tl.load(idx_mapping_ptr + req_idx)
+    num_sampled = tl.load(num_sampled_ptr + req_idx)
+    if num_sampled > 0:
+        next_token = tl.load(last_sampled_ptr + req_state_idx).to(tl.int32)
+    else:
+        next_token = tl.load(next_prefill_tokens_ptr + req_state_idx).to(tl.int32)
+
+    tl.store(draft_input_ids_ptr + req_idx, next_token)
+
+    pos = tl.load(target_positions_ptr + last_token_index)
+    tl.store(draft_positions_ptr + req_idx, pos)
+    tl.store(sample_src_positions_ptr + req_idx, pos + 1)
+
+    target_seq_len = tl.load(target_seq_lens_ptr + req_idx)
+    seq_len = target_seq_len - num_rejected
+    tl.store(draft_seq_lens_ptr + req_idx, seq_len)
+
+    # Copy hidden states for this request:
+    # target_hidden_states[last_token_index] -> draft_hidden_states[req_idx]
+    src_row_ptr = (
+        target_hidden_states_ptr + last_token_index * target_hidden_states_stride
+    )
+    dst_row_ptr = (
+        draft_hidden_states_ptr + req_idx.to(tl.int64) * draft_hidden_states_stride
+    )
+    for i in range(0, hidden_size, BLOCK_SIZE):
+        block = i + tl.arange(0, BLOCK_SIZE)
+        mask = block < hidden_size
+        val = tl.load(src_row_ptr + block, mask=mask)
+        tl.store(dst_row_ptr + block, val, mask=mask)
+
+
+def prepare_q_only_decode_inputs(
+    draft_hidden_states: torch.Tensor,
+    current_draft_step: torch.Tensor,
+    input_buffers: InputBuffers,
+    sample_src_positions: torch.Tensor,
+    target_hidden_states: torch.Tensor,
+    input_batch: InputBatch,
+    num_sampled: torch.Tensor,
+    num_rejected: torch.Tensor,
+    last_sampled: torch.Tensor,
+    next_prefill_tokens: torch.Tensor,
+    max_num_reqs: int,
+):
+    num_reqs = input_batch.num_reqs
+    _, hidden_size = draft_hidden_states.shape
+    _prepare_q_only_decode_inputs_kernel[(num_reqs + 1,)](
+        input_buffers.input_ids,
+        input_buffers.positions,
+        sample_src_positions,
+        input_buffers.query_start_loc,
+        input_buffers.seq_lens,
+        draft_hidden_states,
+        draft_hidden_states.stride(0),
+        current_draft_step,
+        target_hidden_states,
+        target_hidden_states.stride(0),
+        input_batch.positions,
+        input_batch.seq_lens,
+        input_batch.query_start_loc,
+        input_batch.idx_mapping,
+        num_sampled,
+        num_rejected,
+        last_sampled,
+        next_prefill_tokens,
+        hidden_size,
+        max_num_reqs,
+        BLOCK_SIZE=1024,
+    )
 
 
 @triton.jit

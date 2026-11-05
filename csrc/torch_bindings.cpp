@@ -335,6 +335,21 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
   // BF16/FP32 x FP32 -> FP32 router GEMM for H=3072, E=256, M<=32 (SM90+).
   // conditionally compiled so impl registration is in source file
   ops.def("fp32_router_gemm(Tensor! output, Tensor mat_a, Tensor mat_b) -> ()");
+
+  // W12 lossless 12-bit BF16 weight GEMM / decode / embedding (SM120).
+  // conditionally compiled so impl registration is in source file
+  ops.def(
+      "w12_gemm(Tensor x, Tensor planes, Tensor scale, Tensor esc_rp, "
+      "Tensor esc_col, Tensor esc_val, Tensor! out, Tensor! workspace, "
+      "Tensor! counters, int num_ctas, int max_segments, int n, int act, "
+      "bool esc_per_segment, bool pdl) -> ()");
+  ops.def(
+      "w12_decode(Tensor planes, Tensor scale, Tensor! out, int n, int k, "
+      "bool interleave) -> ()");
+  ops.def("w12_scatter(Tensor! out, Tensor idx, Tensor val) -> ()");
+  ops.def(
+      "w12_embedding(Tensor! out, Tensor ids, Tensor planes, Tensor scale, "
+      "Tensor esc_rp, Tensor esc_col, Tensor esc_bf16, int n) -> ()");
 #endif
 
   // Merge attn states

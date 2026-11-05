@@ -11,12 +11,14 @@ from collections import defaultdict
 
 import torch.nn as nn
 
+import vllm.envs as envs
 from vllm.compilation.backends import set_model_tag
 from vllm.config import VllmConfig, replace
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.model_loader.utils import get_draft_load_config
+from vllm.v1.attention.backends.gemma4_compact import share_compact_kv_with_draft
 from vllm.v1.worker.gpu.spec_decode.target_dependent_ar.speculator import (
     TargetDependentARSpeculator,
 )
@@ -46,6 +48,44 @@ def _copy_target_kv_scales(attn: nn.Module, target_attn: nn.Module) -> None:
 
 
 class Gemma4Speculator(TargetDependentARSpeculator):
+    # Fixed at load time: it selects the captured graph structure, so later
+    # checks must agree with capture, and propose() avoids env lookups.
+    _q_only_drafting: bool | None = None
+
+    def load_model(self, target_model: nn.Module) -> None:
+        super().load_model(target_model)
+        self._q_only_drafting = self._q_only_drafting_supported()
+        if envs.VLLM_GEMMA4_Q_ONLY_DRAFTING:
+            if self._q_only_drafting:
+                logger.info(
+                    "Gemma4 Q-only drafting enabled; skip full-row draft prefill"
+                )
+            else:
+                logger.warning(
+                    "Gemma4 Q-only drafting requires TP/PP/DP/PCP=1 and "
+                    "text-only draft inputs; retaining full-row draft prefill"
+                )
+
+    @property
+    def use_q_only_drafting(self) -> bool:
+        if self._q_only_drafting is None:
+            return self._q_only_drafting_supported()
+        return self._q_only_drafting
+
+    def _q_only_drafting_supported(self) -> bool:
+        # A PCP manager is attached after loading, but only when PCP > 1,
+        # which the parallel-size check below already excludes.
+        parallel = self.vllm_config.parallel_config
+        return bool(
+            envs.VLLM_GEMMA4_Q_ONLY_DRAFTING
+            and self.pcp_manager is None
+            and not self.supports_mm_inputs
+            and parallel.tensor_parallel_size == 1
+            and parallel.data_parallel_size == 1
+            and parallel.pipeline_parallel_size == 1
+            and parallel.prefill_context_parallel_size == 1
+        )
+
     @property
     def advance_draft_positions(self) -> bool:
         # Gemma4 MTP is Q-only and reads K/V from the target's existing cache.
@@ -66,6 +106,23 @@ class Gemma4Speculator(TargetDependentARSpeculator):
             )
         self._setup_gemma4_kv_sharing(draft_model, target_attn_layer_names)
         self._share_embeddings(draft_model, target_model)
+        quantization = self.speculative_config.draft_lm_head_quantization
+        if quantization is not None:
+            if getattr(draft_model, "masked_embedding", None) is not None:
+                raise ValueError(
+                    "draft_lm_head_quantization does not support Gemma4 MTP "
+                    "drafters with centroid-masked embeddings"
+                )
+            from vllm.model_executor.layers.quantization.online.lm_head import (
+                quantized_lm_head_copy,
+            )
+
+            # The assistant drafts with its own draft-dim head (tied to its
+            # embedding), not the target's; quantize a copy of that head and
+            # keep the BF16 weight for the embedding lookup.
+            draft_model.lm_head = quantized_lm_head_copy(
+                draft_model.lm_head, quantization
+            )
         return draft_model
 
     def _create_draft_vllm_config(self) -> VllmConfig:
@@ -163,6 +220,8 @@ class Gemma4Speculator(TargetDependentARSpeculator):
             ]
             _copy_target_kv_scales(attn, target_attn)
 
+            if getattr(target_config, "gemma4_compact_kv", False):
+                share_compact_kv_with_draft(attn, target_attn, target_layer_name)
             logger.info(
                 "Gemma4 MTP: draft layer %d (%s) -> %s",
                 draft_idx,

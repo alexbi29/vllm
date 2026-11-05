@@ -788,6 +788,24 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
                    "(requires SM90+ and CUDA >= 12.0).")
   endif()
 
+  # W12 lossless 12-bit BF16 weight GEMM (SM120 mma.sync + TMA; Gemma4 opt-in).
+  if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
+    cuda_archs_loose_intersection(W12_GEMM_ARCHS "12.0f" "${CUDA_ARCHS}")
+  else()
+    cuda_archs_loose_intersection(W12_GEMM_ARCHS "12.0a;12.1a" "${CUDA_ARCHS}")
+  endif()
+  if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8 AND W12_GEMM_ARCHS)
+    set(W12_GEMM_SRCS "csrc/w12_gemm_sm120.cu")
+    set_gencode_flags_for_srcs(
+      SRCS "${W12_GEMM_SRCS}"
+      CUDA_ARCHS "${W12_GEMM_ARCHS}")
+    list(APPEND VLLM_STABLE_EXT_SRC "${W12_GEMM_SRCS}")
+    message(STATUS "Building w12_gemm_sm120 for archs: ${W12_GEMM_ARCHS}")
+  else()
+    message(STATUS "Not building w12_gemm_sm120 as no compatible archs found "
+                   "(requires SM120 and CUDA >= 12.8).")
+  endif()
+
   #
   # CUTLASS scaled_mm kernels (moved from _C to _C_stable_libtorch)
   #

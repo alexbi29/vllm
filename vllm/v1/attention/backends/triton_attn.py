@@ -114,7 +114,7 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
         self.num_heads_q = get_num_attention_heads_from_layers(
             vllm_config, layer_names
         ) or model_config.get_num_attention_heads(vllm_config.parallel_config)
-        self.num_heads_kv = kv_cache_spec.num_kv_heads
+        self.num_heads_kv = self._get_num_heads_kv(kv_cache_spec, vllm_config)
         self.headdim = kv_cache_spec.head_size
 
         # Check if CUDA Graphs are enabled for decode
@@ -219,6 +219,12 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
                 dtype=torch.int32,
                 device=device,
             )
+
+    def _get_num_heads_kv(
+        self, kv_cache_spec: AttentionSpec, vllm_config: VllmConfig
+    ) -> int:
+        # Subclasses whose layers differ from the spec geometry may override.
+        return kv_cache_spec.num_kv_heads
 
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata
@@ -491,7 +497,7 @@ class TritonAttentionImpl(AttentionImpl):
         kv_cache_dtype: str,
         logits_soft_cap: float | None = None,
         attn_type: AttentionType = AttentionType.DECODER,
-        kv_sharing_target_layer_name: int | None = None,
+        kv_sharing_target_layer_name: str | None = None,
         sinks: torch.Tensor | None = None,
         use_alibi_sqrt: bool = False,
         chunk_lookback: int = -1,
@@ -648,7 +654,16 @@ class TritonAttentionImpl(AttentionImpl):
         # Per-token-head quantized KV cache: handled by the core unified
         # kernel, which dequantizes per-(token, head) inline via constexpr
         # branches (INT8 / FP8) and dispatches to the packed INT4 kernel.
-        if self._is_per_token_head_quant:
+        compact_k_norm = getattr(self, "compact_k_norm", None)
+        # Non-None only while the impl stores raw rows (see Gemma4CompactRawImpl).
+        compact_raw_rope = getattr(self, "compact_raw_rope", None)
+        if compact_raw_rope is not None:
+            compact_k_norm = getattr(self, "compact_raw_k_norm", None)
+        if compact_k_norm is not None:
+            key_cache, value_cache = kv_cache.transpose(1, 2).split([128, 512], dim=-1)
+            q_descale = k_descale = v_descale = None
+            k_scale_cache = v_scale_cache = None
+        elif self._is_per_token_head_quant:
             key_cache, value_cache = self._pth_key_value_caches(kv_cache)
             k_scale_cache = self._k_scale_cache
             v_scale_cache = self._v_scale_cache
@@ -734,6 +749,9 @@ class TritonAttentionImpl(AttentionImpl):
             mm_prefix_clamp_sliding_window=getattr(
                 layer, "mm_prefix_clamp_sliding_window", False
             ),
+            compact_k_norm=compact_k_norm,
+            compact_fp8_storage=getattr(self, "compact_fp8_storage", False),
+            compact_raw_rope=compact_raw_rope,
         )
 
         return output
