@@ -302,7 +302,10 @@ class Gemma4MLP(nn.Module):
             prefix=f"{prefix}.down_proj",
         )
         self.act_fn = get_act_and_mul_fn(hidden_activation)
-        if envs.VLLM_GEMMA4_DENSE_CUDNN:
+        # Set when VLLM_GEMMA4_W12 fuses the activation into gate_up.
+        self.w12_fused_act = False
+        # W12 replaces these BF16 weights after loading, superseding cuDNN.
+        if envs.VLLM_GEMMA4_DENSE_CUDNN and not envs.VLLM_GEMMA4_W12:
             from vllm.model_executor.layers.gemma4_dense_cudnn import (
                 install_gemma4_mlp_cudnn,
             )
@@ -312,7 +315,7 @@ class Gemma4MLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+        x = gate_up if self.w12_fused_act else self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
 
@@ -1643,6 +1646,8 @@ class Gemma4ForCausalLM(
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
+        # Post-load W12 installation may run outside the config context.
+        self._w12_vllm_config = vllm_config if envs.VLLM_GEMMA4_W12 else None
 
         # --- MixtureOfExperts protocol ---
         self.moe_layers: list[nn.Module] = [
@@ -1683,6 +1688,13 @@ class Gemma4ForCausalLM(
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
+
+    def process_weights_after_loading(self) -> None:
+        # Runs after every layer's own post-load processing.
+        if envs.VLLM_GEMMA4_W12:
+            from vllm.model_executor.layers.gemma4_w12 import install_gemma4_w12
+
+            install_gemma4_w12(self, self._w12_vllm_config)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)

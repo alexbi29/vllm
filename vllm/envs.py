@@ -96,6 +96,7 @@ if TYPE_CHECKING:
     VLLM_BATCH_INVARIANT: bool = False
     VLLM_GEMMA4_DENSE_CUDNN: bool = False
     VLLM_GEMMA4_Q_ONLY_DRAFTING: bool = False
+    VLLM_GEMMA4_W12: bool = False
     VLLM_TRITON_USE_TD: bool | None = None
     VLLM_GPU_SYNC_CHECK: Literal["warn", "error"] | None = None
     MAX_JOBS: str | None = None
@@ -684,6 +685,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_GEMMA4_Q_ONLY_DRAFTING": lambda: bool(
         int(os.getenv("VLLM_GEMMA4_Q_ONLY_DRAFTING", "0"))
     ),
+    # Opt-in SM120 lossless 12-bit (W12) storage for Gemma4's BF16 linears.
+    "VLLM_GEMMA4_W12": lambda: bool(int(os.getenv("VLLM_GEMMA4_W12", "0"))),
     "VLLM_REPLICATE_EMBED": lambda: (
         os.getenv("VLLM_REPLICATE_EMBED", "0").strip().lower() in ("1", "true")
     ),
