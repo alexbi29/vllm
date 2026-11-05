@@ -494,6 +494,7 @@ def test_narrow_tile_needs_the_alignment_hint(monkeypatch) -> None:
     assert capture.kwargs["HEAD_STRIDE_ALIGNED_8"] is False
     assert capture.kwargs["BLOCK_N"] == 32
 
+
 @pytest.mark.parametrize("head_dim", [256, 512])
 @pytest.mark.parametrize("seq_len", [129, 513])
 @pytest.mark.parametrize("window", [0, 64])

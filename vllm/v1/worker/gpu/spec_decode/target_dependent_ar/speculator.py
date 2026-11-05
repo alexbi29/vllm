@@ -8,6 +8,7 @@ import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
+from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.worker.gpu.dp_utils import DPSyncState, dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
@@ -17,7 +18,6 @@ from vllm.v1.worker.gpu.spec_decode.autoregressive.cudagraph_utils import (
 from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import (
     AutoRegressiveSpeculator,
 )
-from vllm.logger import init_logger
 from vllm.v1.worker.utils import AttentionGroup, get_uniform_decode_token_count
 
 logger = init_logger(__name__)
