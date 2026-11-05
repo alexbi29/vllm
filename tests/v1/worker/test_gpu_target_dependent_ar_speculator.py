@@ -609,7 +609,9 @@ def test_q_only_multi_step_decode_starts_at_draft_step_zero(
     speculator.attn_groups = []
     speculator.block_tables = SimpleNamespace(input_block_tables=[])
     steps = []
-    decode = Mock(side_effect=lambda *a, **k: steps.append(int(speculator.current_draft_step)))
+    decode = Mock(
+        side_effect=lambda *a, **k: steps.append(int(speculator.current_draft_step))
+    )
     monkeypatch.setattr(speculator, "_decode", decode)
     run_fullgraph = Mock(
         side_effect=lambda _: steps.append(int(speculator.current_draft_step))

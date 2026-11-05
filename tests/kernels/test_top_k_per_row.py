@@ -2966,6 +2966,7 @@ def test_decode_chunk_budget_disabled_fitting_and_invalid():
     with pytest.raises(ValueError, match="16 logits rows"):
         _decode_chunk_ranges(32, 1024, 1024, 2)
 
+
 @pytest.mark.parametrize("rows", [1, 6, 12, 72, 292, 512, 8192])
 @pytest.mark.parametrize("width", [512, 544])
 @pytest.mark.parametrize("capture_graph", [False, True])
