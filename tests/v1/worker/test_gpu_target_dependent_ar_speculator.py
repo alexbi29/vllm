@@ -3,7 +3,7 @@
 
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
 import pytest
 import torch
@@ -578,6 +578,69 @@ def test_multi_step_decode_replays_captured_graph_as_expected(
 
     assert decode.call_count == expected_eager_calls
     assert run_fullgraph.call_count == expected_graph_replays
+
+
+class _QOnlyTestSpeculator(_TestSpeculator):
+    @property
+    def use_q_only_drafting(self) -> bool:
+        return True
+
+
+@pytest.mark.parametrize(
+    ("method_name", "cg_mode", "expected_eager_calls", "expected_graph_replays"),
+    [
+        ("_multi_step_decode", CUDAGraphMode.NONE, 4, 0),
+        ("_multi_step_decode", CUDAGraphMode.FULL, 0, 4),
+        ("_run_fused_multi_step_decode", CUDAGraphMode.NONE, 4, 0),
+        ("_run_fused_multi_step_decode", CUDAGraphMode.FULL, 0, 1),
+    ],
+)
+def test_q_only_multi_step_decode_starts_at_draft_step_zero(
+    monkeypatch, method_name, cg_mode, expected_eager_calls, expected_graph_replays
+):
+    """Q-only drafting has no draft prefill, so step 0 also runs as a decode."""
+    speculator = object.__new__(_QOnlyTestSpeculator)
+    speculator.num_speculative_steps = 4
+    speculator.current_draft_step = torch.tensor(7)
+    speculator.input_buffers = SimpleNamespace(
+        positions=torch.arange(2), query_start_loc=torch.arange(3)
+    )
+    speculator.idx_mapping = torch.arange(2)
+    speculator.attn_groups = []
+    speculator.block_tables = SimpleNamespace(input_block_tables=[])
+    steps = []
+    decode = Mock(
+        side_effect=lambda *a, **k: steps.append(int(speculator.current_draft_step))
+    )
+    monkeypatch.setattr(speculator, "_decode", decode)
+    run_fullgraph = Mock(
+        side_effect=lambda _: steps.append(int(speculator.current_draft_step))
+    )
+    speculator.decode_cudagraph_manager = SimpleNamespace(run_fullgraph=run_fullgraph)
+
+    getattr(speculator, method_name)(
+        num_reqs=2,
+        skip_attn=True,
+        batch_desc=BatchExecutionDescriptor(cg_mode=cg_mode, num_tokens=2, num_reqs=2),
+        seq_lens_cpu_upper_bound=None,
+        num_tokens_across_dp=None,
+        num_speculative_steps=4,
+    )
+
+    assert speculator._first_decode_step == 0
+    assert decode.call_count == expected_eager_calls
+    assert run_fullgraph.call_count == expected_graph_replays
+    if method_name == "_multi_step_decode" or cg_mode == CUDAGraphMode.NONE:
+        assert steps == [0, 1, 2, 3]
+
+
+def test_q_only_skips_ordinary_decode_input_preparation(monkeypatch):
+    """Q-only inputs come from prepare_q_only_decode_inputs in propose()."""
+    speculator = object.__new__(_QOnlyTestSpeculator)
+    launched = MagicMock()
+    monkeypatch.setattr(spec_module, "_prepare_decode_inputs_kernel", launched)
+    speculator._prepare_decode_inputs(None, None, 2, False, None)
+    launched.__getitem__.assert_not_called()
 
 
 def test_fused_full_graph_maps_split_group_block_tables():
