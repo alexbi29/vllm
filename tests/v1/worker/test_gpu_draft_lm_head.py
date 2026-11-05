@@ -219,3 +219,106 @@ def test_layerwise_reload_of_drafter_keeps_copy(
     assert after.keys() == before.keys()
     for name, tensor in before.items():
         assert torch.equal(after[name], tensor), name
+
+
+@requires_cuda
+def test_token_ranges_head_scores_only_its_ranges(
+    default_vllm_config, dist_init, monkeypatch
+):
+    """Inside the ranges the logits equal the target's; outside they are -inf,
+    and the copy shares (not copies) the target weight, so in-place target
+    updates are seen without re-deriving anything."""
+    from vllm.model_executor.layers.quantization.online.lm_head import (
+        subset_lm_head_copy,
+    )
+
+    head = _target_head(monkeypatch)
+    ranges = [(0, 1000), (3900, VOCAB)]
+    draft_head = subset_lm_head_copy(head, ranges)
+    assert draft_head.weight.data_ptr() == head.weight.data_ptr()
+
+    logits_processor = LogitsProcessor(VOCAB)
+    hidden = torch.randn(64, HIDDEN, device="cuda", dtype=torch.bfloat16)
+    inside = torch.zeros(VOCAB, dtype=torch.bool, device="cuda")
+    for a, b in ranges:
+        inside[a:b] = True
+    for _ in range(2):
+        ref = logits_processor(head, hidden)
+        out = logits_processor(draft_head, hidden)
+        assert out.shape == ref.shape == (64, VOCAB)
+        torch.testing.assert_close(out[:, inside], ref[:, inside], rtol=0, atol=0)
+        assert torch.isneginf(out[:, ~inside]).all()
+        head.weight.data.copy_(_target_head(monkeypatch, seed=1).weight)
+
+
+@pytest.mark.parametrize(
+    "ranges", [[], [[5, 5]], [[-1, 4]], [[0, 4, 8]]], ids=["empty", "eq", "neg", "3"]
+)
+def test_token_ranges_rejects_invalid(ranges):
+    from vllm.config.speculative import normalize_token_ranges
+
+    with pytest.raises(ValueError):
+        normalize_token_ranges(ranges)
+    assert normalize_token_ranges([[0, 8], [10, 12]]) == [(0, 8), (10, 12)]
+
+
+@requires_cuda
+@pytest.mark.parametrize("quantization", ["fp8", NVFP4])
+def test_token_ranges_quantize_only_their_rows(
+    default_vllm_config, dist_init, monkeypatch, quantization
+):
+    """Token ranges and draft-head quantization compose: only the selected rows
+    are quantized, their logits match a quantized full head, the rest stay -inf,
+    and a target update re-derives the compact copy in place."""
+    from vllm.model_executor.layers.quantization.online.lm_head import (
+        subset_lm_head_copy,
+    )
+
+    head = _target_head(monkeypatch)
+    ranges = [(0, 1000), (3900, VOCAB)]
+    rows = sum(b - a for a, b in ranges)
+    draft_head = subset_lm_head_copy(head, ranges, quantization)
+    compact = draft_head.compact
+    assert compact.weight.dtype != torch.bfloat16
+    assert compact.output_size_per_partition == rows
+    assert draft_head.weight.data_ptr() == head.weight.data_ptr()
+
+    logits_processor = LogitsProcessor(VOCAB)
+    hidden = torch.randn(64, HIDDEN, device="cuda", dtype=torch.bfloat16)
+    inside = torch.zeros(VOCAB, dtype=torch.bool, device="cuda")
+    for a, b in ranges:
+        inside[a:b] = True
+    out = logits_processor(draft_head, hidden).float()
+    ref = logits_processor(head, hidden).float()
+    assert torch.isneginf(out[:, ~inside]).all()
+    rel_err = (out[:, inside] - ref[:, inside]).norm() / ref[:, inside].norm()
+    assert rel_err < (0.05 if quantization == "fp8" else 0.15)
+    if quantization == "fp8":
+        # Per-row scales: the rows quantize exactly as in a full quantized head.
+        full = logits_processor(quantized_lm_head_copy(head, "fp8"), hidden).float()
+        torch.testing.assert_close(out[:, inside], full[:, inside])
+
+    drafter = torch.nn.Module()
+    drafter.lm_head = draft_head
+    ptrs = {k: t.data_ptr() for k, t in _tensors(compact).items()}
+    head.weight.data.copy_(_target_head(monkeypatch, seed=1).weight)
+    refresh_quantized_lm_heads(drafter)
+    fresh = _tensors(subset_lm_head_copy(head, ranges, quantization).compact)
+    for name, tensor in _tensors(compact).items():
+        assert tensor.data_ptr() == ptrs[name]
+        if name != "workspace":
+            assert torch.equal(tensor, fresh[name]), name
+
+
+def test_token_ranges_accept_draft_head_quantization():
+    from types import SimpleNamespace
+
+    from vllm.v1.worker.gpu.spec_decode.eagle.config import EagleSpeculatorConfig
+
+    spec = SimpleNamespace(
+        draft_lm_head_quantization="fp8",
+        draft_lm_head_token_ranges=[[0, 8], [10, 12]],
+        draft_model_config=None,
+    )
+    EagleSpeculatorConfig.apply_options(spec)
+    assert spec.draft_lm_head_token_ranges == [(0, 8), (10, 12)]
