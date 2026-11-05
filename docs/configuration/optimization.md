@@ -567,3 +567,36 @@ when rebuilding a cache, so changing the compilation cache, serving profile
 or dependencies still requires rechecking outputs and the actual KV budget.
 Fixed-input GEMM equality does not establish sample-efficiency equivalence
 for concurrent generation.
+
+## Experimental Gemma4 W12 Weight Storage on SM120
+
+Set `VLLM_GEMMA4_W12=1` before starting a fresh worker to store the target
+Gemma4 model's BF16 attention projections, shared-MLP projections and tied
+embedding/LM head in W12, a lossless 12-bit coding of BF16 weights ported from
+[SpecPilot](https://github.com/StargazerX0/SpecPilot) (commit `78c42af`,
+Apache-2.0). It is disabled by default and needs an SM120/SM121 GPU, a build
+containing the `w12_gemm` kernels, the V2 model runner, tensor and pipeline
+parallelism 1 and no LoRA; otherwise startup fails instead of silently running
+without it. The
+target profile is `nvidia/Gemma-4-26B-A4B-NVFP4`; NVFP4 experts, the router,
+the vision tower and the MTP assistant keep their own paths.
+
+After loading, each eligible weight is re-encoded on the GPU, its device
+decode is compared bit for bit with the loaded weight, the GEMM is checked
+against a reference at 3 and 64 rows and above its decode crossover, and the
+BF16 original is freed. For Gemma4-26B the 120 BF16 linears shrink from
+3.29 GB to 2.48 GB and the tied 262144 x 2816 table from 1.48 GB to 1.11 GB
+(4.77 GB to 3.59 GB in total, plus a 64 MB shared workspace); the embedding
+lookup gathers exact BF16 rows from W12. Weights in the W12 format
+cannot be reloaded in place.
+
+Up to a per-shape row count (48-112 rows, measured with CUDA graphs on an
+RTX PRO 6000) the projections run the W12 kernel in 64-row launches, which
+reads about 25% fewer bytes than BF16. Larger batches decode the weight into
+one shared BF16 scratch (52 MB) and use `torch.mm`, adding the decode time to
+prefill. The LM head always uses the kernel. The shared-MLP gate/up projection
+applies GELU-tanh with vLLM's `gelu_tanh_and_mul` rounding in the GEMM
+epilogue. This option supersedes `VLLM_GEMMA4_DENSE_CUDNN` for the weights it
+replaces. Outputs are deterministic for a fixed GPU but not bitwise equal to
+cuBLAS, because the accumulation order differs. `gemma4_w12_state()` in the
+worker reports installed and skipped weights and the freed and resident bytes.
