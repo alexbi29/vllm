@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Configuration-level regression tests for Qwen4Exp GDN/PLE RecoverSSM selection.
 
-``--use-replayssm`` with speculative decoding selects RecoverSSM for Qwen4Exp, as it
-does for Kimi-K3 KDA. The MTP drafter's derived config shares ``cache_config`` and must
+`--use-replayssm` with speculative decoding selects RecoverSSM for Qwen4Exp, as it
+does for Kimi-K3 KDA. The MTP drafter's derived config shares `cache_config` and must
 keep the choice. These tests run the real validator function against stand-in configs.
 """
 

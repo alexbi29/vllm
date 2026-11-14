@@ -16,8 +16,9 @@ logger = init_logger(__name__)
 # Audited on NVIDIA Gemma4-26B checkpoint weights, M=2/3/4/6/8.
 # Attention/logits projections and other rows retain Torch's implementation.
 _TACTIC = (10, ((12, 18),))
-# 0.7.2 and 0.7.2.post1 retain the audited private cuDNN builders below.
-_FLASHINFER_VERSIONS = ("0.7.0.post1", "0.7.2", "0.7.2.post1")
+# 0.7.4 retains the BF16 graph builder; its wrapper resolves tuning buckets
+# per call. Execution below still requires the observed exact zero-scratch plan.
+_FLASHINFER_VERSIONS = ("0.7.0.post1", "0.7.2", "0.7.2.post1", "0.7.4")
 _SHAPES = {(4224, 2816), (2816, 2112)}
 _ROWS = {2, 3, 4, 6, 8}
 _DISPATCH: Counter[str] = Counter()

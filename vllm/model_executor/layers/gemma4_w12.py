@@ -5,7 +5,7 @@
 # vllm/model_executor/layers/w12_linear.py and csrc/w12_gemm_sm120.cu.
 """Opt-in lossless W12 storage for Gemma4's BF16 linears on SM120.
 
-``VLLM_GEMMA4_W12=1`` re-encodes the target model's BF16 attention
+`VLLM_GEMMA4_W12=1` re-encodes the target model's BF16 attention
 projections, shared-MLP projections and the tied embedding / LM head into
 the W12 format after loading, verifies every weight bit-exactly and frees the
 BF16 originals. Weights stream 12.03 bits instead of 16, so small-batch

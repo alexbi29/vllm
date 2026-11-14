@@ -624,8 +624,8 @@ def ll_bf16_router_gemm_dispatch_impl(
 
     This must be a custom op because our torch.compile integration does not
     support runtime dispatching on num_tokens: models calling the gate from
-    ``@support_torch_compile`` model code have all Dynamo guards dropped by
-    vLLM, so a plain Python branch on ``x.shape[0]`` would be frozen at first
+    `@support_torch_compile` model code have all Dynamo guards dropped by
+    vLLM, so a plain Python branch on `x.shape[0]` would be frozen at first
     trace (whichever size traces first).
     """
     m = x.shape[0]

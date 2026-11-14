@@ -140,6 +140,7 @@ def test_unknown_indexed_graph_api_is_rejected(monkeypatch):
         ("0.7.0.post1", "_get_cudnn_handle"),
         ("0.7.2", "_get_cudnn_handle"),
         ("0.7.2.post1", "_get_cudnn_handle"),
+        ("0.7.4", "_get_cudnn_handle"),
     ],
 )
 def test_unqualified_flashinfer_dependency_is_rejected(version, missing):

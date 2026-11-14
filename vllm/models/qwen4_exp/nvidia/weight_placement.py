@@ -2,11 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Opt-in post-load placement of Qwen4Exp BF16 weights.
 
-``move_embedding_to_host`` keeps the input embedding table in pinned host
+`move_embedding_to_host` keeps the input embedding table in pinned host
 memory and reads it through UVA: a lookup touches only the batch rows, so the
 table's device memory goes to the KV cache at a small PCIe cost.
 
-``quantize_dense_fp8`` requantizes matching BF16 projections to 128x128-block
+`quantize_dense_fp8` requantizes matching BF16 projections to 128x128-block
 FP8 weights with dynamic 1x128 activation quantization. This is lossy.
 """
 

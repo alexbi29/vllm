@@ -3,7 +3,7 @@
 """Unit tests for the reasoning/answer temperature split on SamplingParams.
 
 These lock in the contract the InputBatch split gate relies on: an unset
-``reasoning_temperature`` must mean "mirror temperature" (no split, no
+`reasoning_temperature` must mean "mirror temperature" (no split, no
 overhead), while a set, differing value opts the request into phase-dependent
 sampling.
 """

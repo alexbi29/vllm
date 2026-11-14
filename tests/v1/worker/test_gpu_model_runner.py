@@ -8,6 +8,7 @@ import pytest
 import torch
 
 import vllm.model_executor.model_loader.reload.inplace as reload_inplace_module
+from vllm.config import VllmConfig
 from vllm.lora.layers import LoRAMappingType
 from vllm.lora.request import LoRARequest
 from vllm.model_executor.layers.attention import Attention

@@ -162,7 +162,7 @@ def unsupported(vllm_config) -> list[str]:
         ),
         (
             vllm_config.cache_config.use_replayssm
-            or vllm_config.cache_config.use_kda_recoverssm,
+            or vllm_config.cache_config.use_recoverssm,
             "ReplaySSM / RecoverSSM (--use-replayssm)",
         ),
     )

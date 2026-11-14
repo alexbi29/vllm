@@ -105,7 +105,7 @@ def commit_gdn_recoverssm_groups(
     grouped: Any,
 ) -> RecoverSSMPostprocessMetadata | None:
     """Commit the GDN groups of one step with one set of launches
-    (``GDNRecoverSSMGroupedCommit``, built over the groups' contexts in this order).
+    (`GDNRecoverSSMGroupedCommit`, built over the groups' contexts in this order).
     Returns the postprocess metadata once for all groups: the align update writes the
     same per-request values for every group with the same block size."""
     c0 = metas[0].recoverssm_commit

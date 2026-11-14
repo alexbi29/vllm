@@ -580,9 +580,9 @@ def test_gate_linear_m_zero_falls_back(monkeypatch):
 
 def test_gate_linear_torch_compile_dynamic_m_dispatch(monkeypatch):
     """Ensure torch.compile tracing at M > 16 does not freeze the M <= 16
-    branch. Dropping guards via ``guard_filter_fn`` and running subsequent
-    M <= 16 calls under ``fail_on_recompile`` emulates vLLM's
-    ``TorchCompileWithNoGuardsWrapper`` (which drops all Dynamo guards and
+    branch. Dropping guards via `guard_filter_fn` and running subsequent
+    M <= 16 calls under `fail_on_recompile` emulates vLLM's
+    `TorchCompileWithNoGuardsWrapper` (which drops all Dynamo guards and
     never recompiles), so a frozen branch or recompile fails the test.
     """
     gate = _make_gate_linear(monkeypatch, params_dtype=torch.bfloat16)

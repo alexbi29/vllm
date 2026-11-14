@@ -23,40 +23,35 @@ from vllm.config.utils import (
 @pytest.mark.parametrize("omit_v", [False, True])
 @pytest.mark.parametrize("fp8_storage", [False, True])
 def test_gemma4_compact_kv_reaches_text_model_and_compilation_cache(
-    omit_v, fp8_storage
+    omit_v, fp8_storage, tmp_path
 ):
     from transformers import Gemma4Config
 
+    from vllm.config import VllmConfig
     from vllm.config.model import ModelConfig
     from vllm.model_executor.models.config import Gemma4Config as ModelVerifier
 
-    # Hashing needs config fields, not checkpoint loading or a device.
-    config = object.__new__(ModelConfig)
-    parent = Gemma4Config()
-    config.hf_config = parent.text_config
-    config.multimodal_config = None
-    standard = config.compute_hash()
+    parent = Gemma4Config(architectures=["Gemma4ForConditionalGeneration"])
+    parent.save_pretrained(tmp_path)
+    config = ModelConfig(
+        model=str(tmp_path), skip_tokenizer_init=True, dtype="bfloat16"
+    )
+    parent = config.hf_config
+    standard = hash_config(config)
     parent.gemma4_compact_kv = True
     parent.gemma4_compact_no_v_proj = omit_v
     parent.gemma4_compact_fp8_storage = fp8_storage
-    wrapper = SimpleNamespace(
-        hf_config=parent,
-        hf_text_config=parent.text_config,
-        model_arch_config=SimpleNamespace(total_num_hidden_layers=0),
-    )
-    ModelVerifier.verify_and_update_config(
-        SimpleNamespace(model_config=wrapper)  # type: ignore[arg-type]
-    )
-    assert config.hf_config.gemma4_compact_kv is True
-    assert config.hf_config.gemma4_compact_no_v_proj is omit_v
-    assert config.hf_config.gemma4_compact_fp8_storage is fp8_storage
-    assert config.compute_hash() != standard
-    compact_hash = config.compute_hash()
-    config.hf_config.gemma4_compact_no_v_proj = not omit_v
-    assert config.compute_hash() != compact_hash
-    compact_hash = config.compute_hash()
-    config.hf_config.gemma4_compact_fp8_storage = not fp8_storage
-    assert config.compute_hash() != compact_hash
+    ModelVerifier.verify_and_update_config(VllmConfig(model_config=config))
+    assert config.hf_text_config.gemma4_compact_kv is True
+    assert config.hf_text_config.gemma4_compact_no_v_proj is omit_v
+    assert config.hf_text_config.gemma4_compact_fp8_storage is fp8_storage
+    assert hash_config(config) != standard
+    compact_hash = hash_config(config)
+    config.hf_text_config.gemma4_compact_no_v_proj = not omit_v
+    assert hash_config(config) != compact_hash
+    compact_hash = hash_config(config)
+    config.hf_text_config.gemma4_compact_fp8_storage = not fp8_storage
+    assert hash_config(config) != compact_hash
 
 
 def endswith_fqname(obj, suffix: str) -> bool:
@@ -245,7 +240,6 @@ def test_classes_are_types():
 
 
 def test_ir_config_hash_initializes_provider_and_tracks_implementation(monkeypatch):
-    from types import SimpleNamespace
 
     from vllm.config.kernel import IrOpPriorityConfig
     from vllm.ir.op import IrOp

@@ -2927,10 +2927,10 @@ def fused_gdn_decode_post_conv_mtp_replay(
 ) -> torch.Tensor:
     """RecoverSSM verify of GDN speculative windows with the fused CUDA kernel.
 
-    Each window starts from its checkpoint ``state[state_indices[i, 0]]``, which
+    Each window starts from its checkpoint `state[state_indices[i, 0]]`, which
     is only read. Instead of per-token states the kernel writes each token's
-    replay record ``[correction (V), normalized key (K), decay (1)]`` into
-    ``replay[state_indices[i, 0], :, t]``, the layout the RecoverSSM commit folds.
+    replay record `[correction (V), normalized key (K), decay (1)]` into
+    `replay[state_indices[i, 0], :, t]`, the layout the RecoverSSM commit folds.
     """
     if out is None:
         out = torch.empty_like(output_gate)

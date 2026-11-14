@@ -485,7 +485,7 @@ _DRAFT_VLLM_CONFIG_OVERRIDES = (
 
 
 def normalize_token_ranges(ranges) -> list[tuple[int, int]]:
-    """Validate half-open ``[start, end)`` token-id ranges."""
+    """Validate half-open `[start, end)` token-id ranges."""
     out = [tuple(r) for r in ranges]
     if not out or any(
         len(r) != 2 or not all(isinstance(v, int) for v in r) or not 0 <= r[0] < r[1]

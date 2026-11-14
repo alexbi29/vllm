@@ -1438,7 +1438,7 @@ def test_gemma4_compact_global_pages_keep_storage_saving(tp_size, fp8_storage):
     from vllm.v1.attention.backends.gemma4_compact import Gemma4CompactBackend
     from vllm.v1.attention.backends.gemma4_compact_fp8 import Gemma4CompactFp8Backend
 
-    global_spec = FullAttentionSpec(
+    global_spec = AttentionSpec(
         block_size=16,
         num_kv_heads=2 // tp_size,
         head_size=512,
@@ -1446,28 +1446,24 @@ def test_gemma4_compact_global_pages_keep_storage_saving(tp_size, fp8_storage):
     )
     backend = Gemma4CompactFp8Backend if fp8_storage else Gemma4CompactBackend
     compact_spec = backend.customize_spec(global_spec)
-    local_spec = SlidingWindowSpec(
+    local_spec = AttentionSpec(
         block_size=16,
         num_kv_heads=8 // tp_size,
         head_size=256,
         dtype=torch.bfloat16,
-        sliding_window=1024,
     )
     specs = {
-        f"layer.{i}": compact_spec if i % 6 == 5 else local_spec for i in range(30)
+        f"layer.{i}": full_layer(compact_spec)
+        if i % 6 == 5
+        else sliding_window_layer(local_spec, 1024)
+        for i in range(30)
     }
     groups = get_kv_cache_groups(_grouping_config(), specs)
     seen = 0
     for group in groups:
-        spec = group.kv_cache_spec
-        layer_specs = (
-            spec.kv_cache_specs.values()
-            if isinstance(spec, UniformTypeKVCacheSpecs)
-            else [spec]
-        )
-        for layer_spec in layer_specs:
-            assert layer_spec.page_size_padded is None
-            if isinstance(layer_spec, FullAttentionSpec):
+        for layer_spec in group.kv_cache_specs.values():
+            if group.manager_config.manager_cls is FullAttentionManager:
+                assert isinstance(layer_spec, AttentionSpec)
                 assert layer_spec.state_content_size_bytes == (
                     640 if fp8_storage else 1280
                 )
@@ -1476,7 +1472,7 @@ def test_gemma4_compact_global_pages_keep_storage_saving(tp_size, fp8_storage):
                 )
                 assert layer_spec.page_size_padded is None
                 seen += 1
-    assert seen
+    assert seen == 5
     assert (
         compact_spec.page_size_bytes
         // compact_spec.block_size

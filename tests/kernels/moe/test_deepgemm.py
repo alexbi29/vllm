@@ -1196,16 +1196,16 @@ def test_resident_csf_matches_native_moe_across_local_routes(
     tokens = torch.randn(m, k, device="cuda", dtype=torch.bfloat16) * (k**-0.5)
     weights = torch.full((m, 2), 0.5, device="cuda")
     original_apply = packed.apply
-    provide_metadata = False
+    _provide_metadata = False
 
     def apply_with_metadata(**kwargs):
-        if provide_metadata:
+        if _provide_metadata:
             counts = count_expert_num_tokens(kwargs["topk_ids"], e, expert_map)
             kwargs["expert_tokens_meta"] = mk.ExpertTokensMetadata(counts, None)
         return original_apply(**kwargs)
 
     monkeypatch.setattr(packed, "apply", apply_with_metadata)
-    for provide_metadata in (False, True):
+    for _provide_metadata in (False, True):
         for ids in ([0, 2], [1, 3], [4, 6], [0, 7]):
             topk_ids = torch.tensor(ids, device="cuda").expand(m, 2).contiguous()
             args = dict(

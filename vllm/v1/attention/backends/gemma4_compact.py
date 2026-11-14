@@ -17,7 +17,7 @@ from vllm.v1.attention.backends.triton_attn import (
     TritonAttentionMetadataBuilder,
 )
 from vllm.v1.attention.ops.gemma4_compact_cache import write_compact_cache
-from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec, KVQuantMode
+from vllm.v1.kv_cache_interface import AttentionSpec, KVQuantMode
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.attention import Attention
@@ -126,7 +126,7 @@ class Gemma4CompactBackend(TritonAttentionBackend):
     @classmethod
     def customize_spec(cls, spec: AttentionSpec) -> AttentionSpec:
         if (
-            not isinstance(spec, FullAttentionSpec)
+            not isinstance(spec, AttentionSpec)
             or spec.head_size != 512
             or spec.head_size_v != 512
             or spec.dtype != torch.bfloat16
@@ -213,11 +213,11 @@ class Gemma4CompactRawBackend(Gemma4CompactBackend):
 class Gemma4CompactRawImpl(Gemma4CompactImpl):
     """Raw shared projections with FP32 normalization metadata in four slots.
 
-    Raw rows can only be written by ``gemma4_raw_compact_cache_update``, which
+    Raw rows can only be written by `gemma4_raw_compact_cache_update`, which
     receives the token positions. The storage format is fixed by the target
     layer's loaded KNorm weight; MTP readers are shallow copies of the target
     impl and follow that owner, so the writer, the reader and the model agree
-    on one ``use_raw_storage`` value.
+    on one `use_raw_storage` value.
     """
 
     def __init__(
@@ -239,7 +239,7 @@ class Gemma4CompactRawImpl(Gemma4CompactImpl):
 
     @property
     def compact_raw_rope(self) -> torch.Tensor | None:
-        """RoPE table for raw rows; ``None`` selects the normalized format."""
+        """RoPE table for raw rows; `None` selects the normalized format."""
         owner = self._format_owner
         if not owner._use_raw_storage:
             return None

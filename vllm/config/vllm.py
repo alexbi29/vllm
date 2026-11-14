@@ -595,7 +595,7 @@ class VllmConfig:
         """Mamba2 ReplaySSM whose rings follow the runner-committed trackers."""
         return (
             self.cache_config.use_replayssm
-            and not self.cache_config.use_kda_recoverssm
+            and not self.cache_config.use_recoverssm
             and (self.use_flashinfer_replayssm or self.num_speculative_tokens > 0)
         )
 

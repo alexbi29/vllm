@@ -314,11 +314,11 @@ class SamplingParams(
     `None` defaults to enabled."""
     reasoning_temperature: float | None = None
     """Temperature used during the reasoning/thinking phase.
-    When set and different from ``temperature``, reasoning/thinking tokens are
-    sampled at ``reasoning_temperature`` while the answer is sampled at
-    ``temperature``. For example ``temperature=0.0, reasoning_temperature=0.7``
-    gives a greedy answer with stochastic reasoning. Leave unset (``None``,
-    the default) to use ``temperature`` for both phases — no split, no
+    When set and different from `temperature`, reasoning/thinking tokens are
+    sampled at `reasoning_temperature` while the answer is sampled at
+    `temperature`. For example `temperature=0.0, reasoning_temperature=0.7`
+    gives a greedy answer with stochastic reasoning. Leave unset (`None`,
+    the default) to use `temperature` for both phases — no split, no
     overhead."""
     top_p: float = 1.0
     """Controls the cumulative probability of the top tokens to consider. Must
@@ -960,6 +960,7 @@ class SamplingParams(
         self._validate_trace_replay(model_config, speculative_config)
         self._validate_stop_token_ids(model_config)
         self._validate_allowed_token_ids(model_config)
+        self._validate_spec_decode(speculative_config)
         self._validate_diffusion(model_config)
         self._validate_structured_outputs(
             model_config, structured_outputs_config, tokenizer

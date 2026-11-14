@@ -839,7 +839,7 @@ class GDNRecoverSSMGroupedCommit:
         commit_conv: bool = True,
     ) -> None:
         """Fold accepted GDN and convolution inputs into every group's checkpoints.
-        ``state_indices`` and ``block_tables`` hold one tensor per group, in the order
+        `state_indices` and `block_tables` hold one tensor per group, in the order
         of the contexts."""
         _require(
             len(state_indices) == self.num_groups,

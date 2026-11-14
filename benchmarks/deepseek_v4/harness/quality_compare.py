@@ -378,12 +378,14 @@ def render(result):
     lines = [
         "# All-attempt token-cost comparison",
         "",
-        "All completion tokens, including reasoning, caps and "
-        "incorrect answers. Questions receive equal weight. "
-        "No generation, grader, GPU or service calls. CIs are "
-        "pointwise; Holm-adjusted two-sided p-values "
-        "control all reported contrasts in this invocation. A "
-        "p-value is not the probability a model is better.",
+        (
+            "All completion tokens, including reasoning, caps and "
+            "incorrect answers. Questions receive equal weight. "
+            "No generation, grader, GPU or service calls. CIs are "
+            "pointwise; Holm-adjusted two-sided p-values "
+            "control all reported contrasts in this invocation. A "
+            "p-value is not the probability a model is better."
+        ),
         "",
         "| Run | All tok/q | 95% CI | CI scope | Usable | Caps | Errors |",
         "|---|---:|---|---|---:|---:|---:|",
@@ -420,17 +422,21 @@ def render(result):
         )
     lines += [
         "",
-        "Candidate minus baseline: negative means cheaper. "
-        "Attempt/question label-swap tests require "
-        "distributional exchangeability. Matched-seed "
-        "paired-attempt tests use a centered studentized "
-        "bootstrap of the weak mean-cost null and are "
-        "asymptotic. Serving-profile differences are confounded; "
-        ""
-        "p-values do not isolate checkpoint/backend causation.",
+        (
+            "Candidate minus baseline: negative means cheaper. "
+            "Attempt/question label-swap tests require "
+            "distributional exchangeability. Matched-seed "
+            "paired-attempt tests use a centered studentized "
+            "bootstrap of the weak mean-cost null and are "
+            "asymptotic. Serving-profile differences are confounded; "
+            ""
+            "p-values do not isolate checkpoint/backend causation."
+        ),
         "",
-        "| Baseline → candidate | Unit | Δ tok/q | CI for Δ | "
-        "Change | p(two-sided) | p(Holm) |",
+        (
+            "| Baseline → candidate | Unit | Δ tok/q | CI for Δ | "
+            "Change | p(two-sided) | p(Holm) |"
+        ),
         "|---|---|---:|---|---:|---:|---:|",
     ]
     for c in result["comparisons"]:
@@ -446,35 +452,43 @@ def render(result):
         lines.append(f"- **{unit}:** {scope}")
     lines += [
         "",
-        "A shared fixed seed switches auto inference to question "
-        "units; repeated runs with "
-        "that seed are not counted as independent sampled seeds. "
-        "Only the selected questions "
-        "provide question units. Question-mix CIs "
-        "cannot be read as uncertainty for these exact fixed "
-        "questions. Per-question CIs/p-values "
-        "are in JSON only for attempt-level comparisons; "
-        "per-question uncertainty is unavailable "
-        "for the fixed-seed comparisons. All intervals are "
-        "conditional on their stated assumptions.",
+        (
+            "A shared fixed seed switches auto inference to question "
+            "units; repeated runs with "
+            "that seed are not counted as independent sampled seeds. "
+            "Only the selected questions "
+            "provide question units. Question-mix CIs "
+            "cannot be read as uncertainty for these exact fixed "
+            "questions. Per-question CIs/p-values "
+            "are in JSON only for attempt-level comparisons; "
+            "per-question uncertainty is unavailable "
+            "for the fixed-seed comparisons. All intervals are "
+            "conditional on their stated assumptions."
+        ),
         "",
-        "Holm correction covers this declared family only, not "
-        "earlier exploratory selection or "
-        "sequential peeking across the campaign. These "
-        "conditional intervals do not estimate "
-        "variation across unseen boots. A cheaper failing model is not better; "
-        "usable-answer counts and caps are reported separately.",
+        (
+            "Holm correction covers this declared family only, not "
+            "earlier exploratory selection or "
+            "sequential peeking across the campaign. These "
+            "conditional intervals do not estimate "
+            "variation across unseen boots. A cheaper failing model is not better; "
+            "usable-answer counts and caps are reported separately."
+        ),
         "",
-        "Token costs use recorded completion usage. An "
-        "error/timeout can have unreported "
-        "server work; zero recorded usage does not establish zero GPU cost.",
+        (
+            "Token costs use recorded completion usage. An "
+            "error/timeout can have unreported "
+            "server work; zero recorded usage does not establish zero GPU cost."
+        ),
         "",
-        "[SciPy bootstrap "
-        "method](https://docs.scipy.org/doc/scipy/reference/gene"
-        "rated/scipy.stats.bootstrap.html), "
-        "[permutation "
-        "definitions](https://docs.scipy.org/doc/scipy/reference"
-        "/generated/scipy.stats.permutation_test.html).",
+        (
+            "[SciPy bootstrap "
+            "method](https://docs.scipy.org/doc/scipy/reference/gene"
+            "rated/scipy.stats.bootstrap.html), "
+            "[permutation "
+            "definitions](https://docs.scipy.org/doc/scipy/reference"
+            "/generated/scipy.stats.permutation_test.html)."
+        ),
     ]
     return "\n".join(lines) + "\n"
 

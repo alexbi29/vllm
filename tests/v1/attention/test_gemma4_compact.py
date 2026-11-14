@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from vllm.v1.attention.backends.gemma4_compact import Gemma4CompactBackend
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVQuantMode
+from vllm.v1.kv_cache_interface import AttentionSpec, KVQuantMode
 
 
 def _raw_impl(norm, rope):
@@ -141,7 +141,7 @@ def test_compact_backend_selection(
 def test_raw_compact_preserves_global_page_geometry():
     from vllm.v1.attention.backends.gemma4_compact import Gemma4CompactRawBackend
 
-    spec = FullAttentionSpec(
+    spec = AttentionSpec(
         block_size=16,
         num_kv_heads=2,
         head_size=512,
@@ -166,17 +166,16 @@ def test_compact_hybrid_prefix_hits_land_on_small_blocks():
     import math
 
     from vllm.v1.core.kv_cache_planning import unify_kv_cache_spec_page_size
-    from vllm.v1.kv_cache_interface import SlidingWindowSpec
+    from vllm.v1.core.single_type_kv_cache_manager import (
+        FullAttentionManager,
+        SlidingWindowManager,
+    )
 
-    local = SlidingWindowSpec(
-        block_size=16,
-        num_kv_heads=8,
-        head_size=256,
-        dtype=torch.bfloat16,
-        sliding_window=1024,
+    local = AttentionSpec(
+        block_size=16, num_kv_heads=8, head_size=256, dtype=torch.bfloat16
     )
     compact = Gemma4CompactBackend.customize_spec(
-        FullAttentionSpec(
+        AttentionSpec(
             block_size=16,
             num_kv_heads=2,
             head_size=512,
@@ -184,18 +183,24 @@ def test_compact_hybrid_prefix_hits_land_on_small_blocks():
             head_size_v=512,
         )
     )
-    specs = {f"local.{i}": local for i in range(5)} | {"global.0": compact}
+    specs = {
+        f"local.{i}": SlidingWindowManager.layer_config(local, sliding_window=1024)
+        for i in range(5)
+    } | {"global.0": FullAttentionManager.layer_config(compact)}
     unified = unify_kv_cache_spec_page_size(specs)
 
-    assert unified["global.0"].block_size == 64
-    assert unified["local.0"].block_size == 16
-    assert {s.page_size_bytes for s in unified.values()} == {compact.page_size_bytes}
+    assert unified["global.0"].spec.block_size == 64
+    assert unified["local.0"].spec.block_size == 16
+    assert {s.spec.page_size_bytes for s in unified.values()} == {
+        compact.page_size_bytes
+    }
     # Only the window-bounded local pages are padded (by 25%).
     padded_local = unified["local.0"]
-    assert isinstance(padded_local, SlidingWindowSpec)
-    assert padded_local.page_size_padded == compact.page_size_bytes
+    assert padded_local.manager_cls is SlidingWindowManager
+    assert isinstance(padded_local.spec, AttentionSpec)
+    assert padded_local.spec.page_size_padded == compact.page_size_bytes
     assert compact.page_size_bytes * 4 == local.page_size_bytes * 5
-    assert math.lcm(*(s.block_size for s in unified.values())) == 64
+    assert math.lcm(*(s.spec.block_size for s in unified.values())) == 64
 
 
 def _weight_config(name):
@@ -491,7 +496,7 @@ def test_compact_metadata_uses_global_head_width(monkeypatch):
         speculative_config=None,
         scheduler_config=SimpleNamespace(max_num_seqs=256),
     )
-    spec = FullAttentionSpec(
+    spec = AttentionSpec(
         block_size=256, num_kv_heads=2, head_size=512, dtype=torch.bfloat16
     )
     builder = Gemma4CompactMetadataBuilder(spec, [], config, torch.device("cpu"))
@@ -527,7 +532,7 @@ def test_compact_metadata_uses_global_kv_heads(monkeypatch, sm120):
         ),
         scheduler_config=SimpleNamespace(max_num_seqs=64),
     )
-    spec = FullAttentionSpec(
+    spec = AttentionSpec(
         block_size=256, num_kv_heads=2, head_size=512, dtype=torch.bfloat16
     )
     builder = Gemma4CompactMetadataBuilder(spec, [], config, torch.device("cpu"))
@@ -557,7 +562,7 @@ def test_compact_metadata_uses_global_kv_heads(monkeypatch, sm120):
     ],
 )
 def test_compact_cache_rejects_incompatible_storage(dtype, mode, head_size):
-    spec = FullAttentionSpec(
+    spec = AttentionSpec(
         block_size=16,
         num_kv_heads=1,
         head_size=head_size,
@@ -568,13 +573,9 @@ def test_compact_cache_rejects_incompatible_storage(dtype, mode, head_size):
         Gemma4CompactBackend.customize_spec(spec)
 
 
-@pytest.mark.parametrize("runner", ["v1", "v2"])
-def test_gemma4_mtp_reads_target_compact_norm(monkeypatch, runner):
+def test_gemma4_mtp_reads_target_compact_norm(monkeypatch):
     """A draft's independent dense backend must not misinterpret compact KV."""
-    if runner == "v1":
-        from vllm.v1.spec_decode import gemma4 as v1_runner
-    else:
-        from vllm.v1.worker.gpu.spec_decode.gemma4 import speculator as v2_runner
+    from vllm.v1.worker.gpu.spec_decode.gemma4 import speculator as v2_runner
 
     norm = torch.randn(512, dtype=torch.bfloat16)
     target_impl = SimpleNamespace(
@@ -618,24 +619,16 @@ def test_gemma4_mtp_reads_target_compact_norm(monkeypatch, runner):
         ),
     )
     target_name = "model.layers.0.self_attn.attn"
-    if runner == "v1":
-        monkeypatch.setattr(
-            v1_runner,
-            "get_layers_from_vllm_config",
-            lambda *args: {target_name: target},
-        )
-        v1_runner.Gemma4Proposer._setup_gemma4_kv_sharing(proposer, {target_name})
-    else:
-        proposer.vllm_config.compilation_config = SimpleNamespace(
-            static_forward_context={target_name: target}
-        )
-        v2_runner.Gemma4Speculator._setup_gemma4_kv_sharing(
-            proposer, proposer.model, {target_name}
-        )
-        torch.testing.assert_close(draft._k_scale, target._k_scale)
-        torch.testing.assert_close(draft._v_scale, target._v_scale)
-        assert draft._k_scale is not target._k_scale
-        assert draft._v_scale is not target._v_scale
+    proposer.vllm_config.compilation_config = SimpleNamespace(
+        static_forward_context={target_name: target}
+    )
+    v2_runner.Gemma4Speculator._setup_gemma4_kv_sharing(
+        proposer, proposer.model, {target_name}
+    )
+    torch.testing.assert_close(draft._k_scale, target._k_scale)
+    torch.testing.assert_close(draft._v_scale, target._v_scale)
+    assert draft._k_scale is not target._k_scale
+    assert draft._v_scale is not target._v_scale
     assert draft.attn_backend is Gemma4CompactBackend
     assert draft.impl.compact_k_norm is norm
     assert draft.impl.num_heads == 8

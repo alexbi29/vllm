@@ -11,29 +11,29 @@
 # slots are min(T, P); vLLM workspace and custom-op plumbing.
 """W12: lossless 12-bit coding of BF16 weights and its SM120 GEMM wrapper.
 
-A bf16 weight ``w = s * 2^(e-127) * 1.m`` of kernel row ``n`` is coded against
-a per-row window top ``E_n``: the top of the 16-binade window that covers the
-most normal, finite weights of the row (ties go to the highest top; ``E_n`` is
-clamped to [15, 254] so that ``2^(E_n-127)`` is a normal fp32; a row without
-any in-window weight uses 127). The code ``c = e - (E_n - 15)`` is in [0, 15].
-Each weight is stored as a Q byte ``[c0 m6 m5 m4 | s c3 c2 c1]`` plus a B
-nibble ``[m3..m0]``. The kernel rebuilds ``w~ = s * 2^(c-15) * 1.m`` in
+A bf16 weight `w = s * 2^(e-127) * 1.m` of kernel row `n` is coded against
+a per-row window top `E_n`: the top of the 16-binade window that covers the
+most normal, finite weights of the row (ties go to the highest top; `E_n` is
+clamped to [15, 254] so that `2^(E_n-127)` is a normal fp32; a row without
+any in-window weight uses 127). The code `c = e - (E_n - 15)` is in [0, 15].
+Each weight is stored as a Q byte `[c0 m6 m5 m4 | s c3 c2 c1]` plus a B
+nibble `[m3..m0]`. The kernel rebuilds `w~ = s * 2^(c-15) * 1.m` in
 registers and scales the fp32 accumulator by the exact power of two
-``2^(E_n-127)``. Zeros, subnormals, inf/NaN and out-of-window weights are
-escapes: their slot decodes as the placeholder ``2^-15`` and a per-row CSR
-list ``(rp, col, val = w * 2^(127-E_n))`` corrects the accumulator exactly.
+`2^(E_n-127)`. Zeros, subnormals, inf/NaN and out-of-window weights are
+escapes: their slot decodes as the placeholder `2^-15` and a per-row CSR
+list `(rp, col, val = w * 2^(127-E_n))` corrects the accumulator exactly.
 The true bf16 escape values are also kept, so decoding is bit-exact for every
 bf16 pattern.
 
 Records hold 128 rows x 64 k = 12 KB (an 8 KB Q region and a 4 KB B region)
-in mma.sync m16n8k16 A-fragment lane order; ``planes`` is uint8
-``[T, (K / 64) * 12288]`` with ``T = ceil(N / 128)``. With a fused
-act-and-mul epilogue the gate_up rows are interleaved ``[64 gate | 64 up]``
+in mma.sync m16n8k16 A-fragment lane order; `planes` is uint8
+`[T, (K / 64) * 12288]` with `T = ceil(N / 128)`. With a fused
+act-and-mul epilogue the gate_up rows are interleaved `[64 gate | 64 up]`
 per tile.
 
-The GEMM runs one persistent stream-K launch per 64 rows of ``x``. Larger
+The GEMM runs one persistent stream-K launch per 64 rows of `x`. Larger
 inputs either repeat it per 64-row chunk or decode the weight into a shared
-bf16 scratch and run ``torch.mm``; the caller chooses the crossover per shape.
+bf16 scratch and run `torch.mm`; the caller chooses the crossover per shape.
 """
 
 from __future__ import annotations
@@ -223,7 +223,7 @@ def encode(
 ) -> W12Packed:
     """Bit-exact W12 coding of a bf16 [N, K] weight (K % 64 == 0) on w's device.
 
-    ``check`` asserts that the pure-torch decode reproduces ``w`` bitwise.
+    `check` asserts that the pure-torch decode reproduces `w` bitwise.
     """
     if w.dtype != torch.bfloat16 or w.dim() != 2:
         raise ValueError(f"W12 needs a 2-D bf16 weight, got {w.dtype} {w.shape}")
@@ -539,9 +539,9 @@ def w12_linear_impl(
 ) -> torch.Tensor:
     """Y = x @ W^T (act != 0: act(gate) * up) from a W12 weight.
 
-    Rows up to ``kernel_max_m`` run the W12 kernel in 64-row launches; larger
+    Rows up to `kernel_max_m` run the W12 kernel in 64-row launches; larger
     inputs decode W into the shared scratch and use torch.mm. A negative
-    ``kernel_max_m`` means "always the kernel" (no whole-weight decode).
+    `kernel_max_m` means "always the kernel" (no whole-weight decode).
     """
     k = x.shape[-1]
     n_out = n // 2 if act else n
