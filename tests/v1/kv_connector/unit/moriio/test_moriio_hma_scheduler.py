@@ -451,10 +451,10 @@ def test_glm5_next_mtp_read_pairs_every_group(external_tokens):
         assert local == [[], [300], [200]]
 
     output = SchedulerOutput.make_empty()
-    output.new_block_ids_to_zero = [100, 101, 102, 300]
+    output.new_block_ids_to_zero = [[], [100, 101, 102], [300]]
     consumer.build_connector_meta(output)
     expected_zero = [102] if external_tokens else [100, 101, 102]
-    assert output.new_block_ids_to_zero == expected_zero
+    assert output.new_block_ids_to_zero == [[], expected_zero, []]
 
 
 def test_read_blocks_routes_each_hybrid_layer_to_its_group():

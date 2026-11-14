@@ -507,6 +507,7 @@ def test_compact_metadata_uses_global_head_width(monkeypatch):
 def test_compact_metadata_uses_global_kv_heads(monkeypatch, sm120):
     """Split-KV thresholds follow the 2 global KV heads, not the 8 local ones,
     and full verification scratch still has room for the score prefix maxima."""
+    from tests.v1.spec_decode.utils import fake_speculative_config
     from vllm.config import CUDAGraphMode
     from vllm.v1.attention.backends.gemma4_compact import Gemma4CompactMetadataBuilder
     from vllm.v1.attention.backends.triton_attn import current_platform
@@ -527,8 +528,8 @@ def test_compact_metadata_uses_global_kv_heads(monkeypatch, sm120):
             rswa_window=None,
         ),
         parallel_config=None,
-        speculative_config=SimpleNamespace(
-            num_speculative_tokens=2, parallel_drafting=False
+        speculative_config=fake_speculative_config(
+            method="mtp", num_speculative_tokens=2, parallel_drafting=False
         ),
         scheduler_config=SimpleNamespace(max_num_seqs=64),
     )
