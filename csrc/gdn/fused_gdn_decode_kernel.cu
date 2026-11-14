@@ -519,18 +519,20 @@ void launch_gdn_decode_post_conv_mtp(
       get_current_cuda_stream(mixed_qkv.get_device_index());
   const int num_requests = static_cast<int>(state_indices.size(0));
   const auto launch = [&]<int SplitV>() {
-    return launch_split<StateT, ValueHeadsPerKeyHead, SigmoidGate, SplitV, WriteReplay>(
+    return launch_split<StateT, ValueHeadsPerKeyHead, SigmoidGate, SplitV,
+                        WriteReplay>(
         dim3(num_requests, num_value_heads, SplitV), stream,
         static_cast<const __nv_bfloat16*>(mixed_qkv.data_ptr()), a, b,
         static_cast<const float*>(a_log.data_ptr()), dt_bias.data_ptr(),
         static_cast<const int*>(state_indices.data_ptr()),
-        static_cast<const int*>(cu_seqlens.data_ptr()),
-        num_accepted_tokens,
+        static_cast<const int*>(cu_seqlens.data_ptr()), num_accepted_tokens,
         static_cast<StateT*>(state.data_ptr()), output_gate,
         norm_weight.data_ptr(), static_cast<__nv_bfloat16*>(out.data_ptr()),
         num_key_heads, num_value_heads, static_cast<int>(state_indices.size(1)),
-        state_indices.stride(0), dt_bias_type, norm_weight.scalar_type() == ScalarType::BFloat16,
-        static_cast<float>(scale), static_cast<float>(norm_eps), strides, replay);
+        state_indices.stride(0), dt_bias_type,
+        norm_weight.scalar_type() == ScalarType::BFloat16,
+        static_cast<float>(scale), static_cast<float>(norm_eps), strides,
+        replay);
   };
   const cudaError_t error = [&] {
     if constexpr (WriteReplay) {
@@ -538,7 +540,7 @@ void launch_gdn_decode_post_conv_mtp(
       return launch.template operator()<1>();
     } else {
       const int split_v = choose_split_v(num_requests * num_value_heads,
-                                        mixed_qkv.get_device_index());
+                                         mixed_qkv.get_device_index());
       return split_v == 4   ? launch.template operator()<4>()
              : split_v == 2 ? launch.template operator()<2>()
                             : launch.template operator()<1>();
