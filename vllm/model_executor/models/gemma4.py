@@ -411,6 +411,7 @@ def _validate_compact_weight_quantization(quant_config, qkv_proj) -> None:
             CompressedTensorsW4A4Fp4,
             CompressedTensorsW8A8Fp8,
             CompressedTensorsW8A16Fp8,
+            CompressedTensorsWNA16,
         )
 
         if isinstance(qkv_proj.quant_method, UnquantizedLinearMethod) or isinstance(
@@ -419,13 +420,18 @@ def _validate_compact_weight_quantization(quant_config, qkv_proj) -> None:
                 CompressedTensorsW8A8Fp8,
                 CompressedTensorsW8A16Fp8,
                 CompressedTensorsW4A4Fp4,
+                # Weight-only INT4/INT8 (e.g. the Gemma4-31B QAT W4A16
+                # checkpoint): the omitted V shard is just a narrower
+                # packed output, and activations stay BF16.
+                CompressedTensorsWNA16,
             ),
         ):
             return
     scheme_name = type(getattr(qkv_proj, "scheme", None)).__name__
     raise ValueError(
-        "gemma4_compact_kv supports BF16, FP8, and NVFP4 attention weights "
-        "through fp8, modelopt, modelopt_fp4, or compatible compressed-tensors "
+        "gemma4_compact_kv supports BF16, FP8, NVFP4 and weight-only INT "
+        "attention weights through fp8, modelopt, modelopt_fp4, or compatible "
+        "compressed-tensors "
         f"schemes; got {name!r} with {scheme_name}."
     )
 
