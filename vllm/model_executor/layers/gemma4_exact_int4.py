@@ -481,6 +481,11 @@ def _convert_table(name: str, modules: tuple[torch.nn.Module, ...]) -> bool:
         m.register_buffer("exact_int4_scales", scales, persistent=False)
         m.quant_method = method
         m._gemma4_exact_int4 = True
+        # With tensor parallelism VocabParallelEmbedding's fused lookup reads
+        # .weight directly; its masked path calls quant_method.embedding and
+        # stays exact (each token has one owner, the others contribute zeros).
+        if getattr(m, "use_fused_embedding", False):
+            m.use_fused_embedding = False
     _STATE["installed"][f"{name}:{n}x{k}"] += 1
     _STATE["bytes_saved"] += saved
     return True
