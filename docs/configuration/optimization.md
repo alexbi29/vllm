@@ -600,3 +600,39 @@ epilogue. This option supersedes `VLLM_GEMMA4_DENSE_CUDNN` for the weights it
 replaces. Outputs are deterministic for a fixed GPU but not bitwise equal to
 cuBLAS, because the accumulation order differs. `gemma4_w12_state()` in the
 worker reports installed and skipped weights and the freed and resident bytes.
+
+## Experimental Gemma4 Exact INT4 Tables for QAT Checkpoints
+
+Gemma4 quantization-aware-trained (QAT) checkpoints such as
+`google/gemma-4-31B-it-qat-w4a16-ct` keep the tied embedding/LM head in BF16,
+and the matching `google/gemma-4-31B-it-qat-q4_0-unquantized-assistant` keeps
+all of its weights in BF16. The values still lie on the QAT grid: every group
+of 32 consecutive input-dimension values is `bf16(q * d)` for an integer `q` in
+[-8, 7] and one FP32 scale `d` per group. Set `VLLM_GEMMA4_EXACT_INT4=1`
+before starting a fresh worker to recover that representation at load time
+and store those tensors as packed 4-bit codes plus FP32 group scales
+(5 bits per weight instead of 16). The option is disabled by default.
+
+After loading, each candidate table is fitted on the GPU, decoded again by the
+serving kernel and compared bit for bit with the loaded BF16 weight, and the
+GEMM is checked against an FP64 reference; only then is the BF16 original
+freed. A table that does not fit exactly (any group off the grid, negative
+zero, non-finite values, or an input dimension that is not a multiple of 256)
+stays in BF16 and the reason is logged. Converted are the target model's tied
+embedding/LM head and the MTP assistant's own draft-dim LM head; the
+assistant's other linears are left in BF16 because they are launch-latency
+bound at decode sizes. For Gemma4-31B QAT this frees 2.31 GB (262144 x 5376
+table 2.82 GB -> 0.88 GB, assistant head 0.54 GB -> 0.17 GB).
+
+The embedding lookup gathers exact BF16 rows. The LM-head GEMM is a Triton
+kernel that rebuilds the exact BF16 weights in registers and accumulates in
+FP32, so logits equal a BF16 GEMM up to summation order. It reads 3.2x fewer
+bytes than BF16 and is about 3x faster than cuBLAS at up to 32 rows on an RTX
+PRO 6000 Blackwell (1.5x at 64 rows); at 96 or more rows (for example 24+
+concurrent requests verifying three draft tokens) it is up to about 25%
+slower. Requires the V2 model runner; LoRA adapters on the linear layers are
+supported, adapters targeting `embed_tokens`/`lm_head` are rejected. It is
+mutually exclusive with `draft_lm_head_quantization` for the assistant head
+(the quantized copy takes precedence), and converted tables cannot be reloaded
+in place. `gemma4_exact_int4_state()` in the worker reports installed and
+skipped tables and the bytes saved.
