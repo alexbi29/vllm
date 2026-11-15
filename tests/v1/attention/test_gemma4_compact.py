@@ -264,9 +264,10 @@ def test_compact_accepts_quantized_weights_with_bf16_cache(name):
         "CompressedTensorsW8A8Fp8",
         "CompressedTensorsW8A16Fp8",
         "CompressedTensorsW4A4Fp4",
+        "CompressedTensorsWNA16",
     ],
 )
-def test_compact_accepts_compressed_tensors_float_schemes(scheme_name):
+def test_compact_accepts_compressed_tensors_schemes(scheme_name):
     from vllm.model_executor.layers.quantization.compressed_tensors import schemes
     from vllm.model_executor.models.gemma4 import _validate_compact_weight_quantization
 
@@ -282,7 +283,9 @@ def test_compact_accepts_compressed_tensors_float_schemes(scheme_name):
 def test_compact_rejects_other_compressed_tensors_schemes():
     from vllm.model_executor.models.gemma4 import _validate_compact_weight_quantization
 
-    with pytest.raises(ValueError, match="supports BF16, FP8, and NVFP4"):
+    with pytest.raises(
+        ValueError, match="supports BF16, FP8, NVFP4 and weight-only INT"
+    ):
         _validate_compact_weight_quantization(
             _weight_config("compressed-tensors"),
             SimpleNamespace(quant_method=None, scheme=object()),
