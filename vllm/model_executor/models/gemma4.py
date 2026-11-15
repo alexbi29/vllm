@@ -1699,8 +1699,11 @@ class Gemma4ForCausalLM(
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
-        # Post-load W12 installation may run outside the config context.
-        self._w12_vllm_config = vllm_config if envs.VLLM_GEMMA4_W12 else None
+        # Post-load W12 / exact-INT4 installation may run outside the config
+        # context.
+        self._w12_vllm_config = (
+            vllm_config if envs.VLLM_GEMMA4_W12 or envs.VLLM_GEMMA4_EXACT_INT4 else None
+        )
 
         # --- MixtureOfExperts protocol ---
         self.moe_layers: list[nn.Module] = [
@@ -1743,7 +1746,14 @@ class Gemma4ForCausalLM(
         return self.logits_processor(self.lm_head, hidden_states)
 
     def process_weights_after_loading(self) -> None:
-        # Runs after every layer's own post-load processing.
+        # Runs after every layer's own post-load processing. Exact INT4 goes
+        # first: a tied table it converts is no longer BF16, so W12 skips it.
+        if envs.VLLM_GEMMA4_EXACT_INT4:
+            from vllm.model_executor.layers.gemma4_exact_int4 import (
+                install_gemma4_exact_int4_target,
+            )
+
+            install_gemma4_exact_int4_target(self, self._w12_vllm_config)
         if envs.VLLM_GEMMA4_W12:
             from vllm.model_executor.layers.gemma4_w12 import install_gemma4_w12
 

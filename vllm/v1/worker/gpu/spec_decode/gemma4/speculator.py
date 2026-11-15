@@ -123,6 +123,12 @@ class Gemma4Speculator(TargetDependentARSpeculator):
             draft_model.lm_head = quantized_lm_head_copy(
                 draft_model.lm_head, quantization
             )
+        elif envs.VLLM_GEMMA4_EXACT_INT4:
+            from vllm.model_executor.layers.gemma4_exact_int4 import (
+                install_gemma4_exact_int4_draft,
+            )
+
+            install_gemma4_exact_int4_draft(draft_model, self.vllm_config)
         return draft_model
 
     def _create_draft_vllm_config(self) -> VllmConfig:
