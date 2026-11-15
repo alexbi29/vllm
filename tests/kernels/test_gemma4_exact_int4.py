@@ -124,6 +124,7 @@ def _tied_model(weight):
     embed = torch.nn.Module()
     embed.weight = torch.nn.Parameter(weight, requires_grad=False)
     embed.quant_method = UnquantizedEmbeddingMethod()
+    embed.use_fused_embedding = True  # what TP > 1 selects
     head = torch.nn.Module()
     head.weight = embed.weight
     head.quant_method = UnquantizedEmbeddingMethod()
@@ -162,6 +163,8 @@ def test_install_target_replaces_tied_table(cpu_encode):
         assert not hasattr(m, "weight")
         assert m._gemma4_exact_int4
     assert embed.exact_int4_packed is head.exact_int4_packed
+    # TP lookups must take the masked quant_method path, not the fused .weight one.
+    assert embed.use_fused_embedding is False
     assert bits_eq(
         xi4.decode_reference(embed.exact_int4_packed, embed.exact_int4_scales), w
     )
