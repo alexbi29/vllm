@@ -533,7 +533,8 @@ class SpeculativeConfig:
     same setting."""
     draft_lm_head_quantization: Literal["fp8", "nvfp4"] | None = None
     """Quantize the drafter's copy of a target lm_head it shares (EAGLE, MTP
-    and DeepSeek-V4/V4.1 DSpark). "fp8" uses per-row weight and per-token
+    and DeepSeek-V4/V4.1 DSpark). "fp8" fits per-row weight scales at load time
+    with a non-worse FP64 reconstruction-error guard, retaining per-token
     activation scales on the platform's FP8 linear kernel; "nvfp4" is
     weight-only on the platform's W4A16 kernel. The target verifies with its
     own head, so only the acceptance length can change. Model Runner V2 only."""

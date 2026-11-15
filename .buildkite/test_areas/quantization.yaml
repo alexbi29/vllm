@@ -17,6 +17,7 @@ steps:
 #   - vllm/models/deepseek_v41/quant_config.py
 #   - vllm/utils/humming.py
 #   - tests/quantization
+#   - tests/v1/worker/test_gpu_draft_lm_head.py
 #   commands:
 #   # Pin torchao to the version compatible with the CI PyTorch and CUDA stack.
 #   - uv pip install --system torchao==0.18.0 --index-url https://download.pytorch.org/whl/cu130
@@ -24,6 +25,7 @@ steps:
 #   # The SM90-only checkpoint currently contains a removed weight_chan_scale
 #   # parameter. It was not exercised by the previous L4 job.
 #   - VLLM_TEST_FORCE_LOAD_FORMAT=auto pytest -v -s quantization/ --ignore quantization/test_blackwell_moe.py --ignore quantization/test_rocm_moe.py -k 'not test_compressed_tensors_w4a8_fp8'
+#   - pytest -v -s v1/worker/test_gpu_draft_lm_head.py
 #   mirror:
 #     amd:
 #       label: ":amd: (MI300) Quantization"
@@ -40,6 +42,7 @@ steps:
 #       - vllm/model_executor/models/qwen3_dflash.py
 #       - vllm/model_executor/models/utils.py
 #       - tests/quantization
+#       - tests/v1/worker/test_gpu_draft_lm_head.py
 #       - vllm/_aiter_ops.py
 #       - vllm/platforms/rocm.py
 #       - vllm/model_executor/layers/fused_moe/oracle/unquantized.py
@@ -49,6 +52,7 @@ steps:
 #       commands:
 #       - uv pip install --system torchao==0.17.0
 #       - uv pip install --system conch-triton-kernels
+#       - pytest -v -s v1/worker/test_gpu_draft_lm_head.py
 #       - VLLM_TEST_FORCE_LOAD_FORMAT=auto pytest -v -s quantization/ --ignore quantization/test_blackwell_moe.py --ignore quantization/test_rocm_moe.py
 #       - pytest -v -s rocm/test_moe_weight_replay.py
 #       - VLLM_ROCM_USE_AITER=1 VLLM_ROCM_USE_AITER_MOE=1 pytest -v -s rocm/test_moe_padding.py

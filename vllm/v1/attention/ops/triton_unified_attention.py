@@ -15,6 +15,7 @@ import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.ops.gemma4_raw_cache import load_raw_metadata
 from vllm.v1.attention.ops.triton_attention_helpers import (
     apply_alibi_to_score,
     apply_softcap,
@@ -405,6 +406,16 @@ def kernel_unified_attention(
     # instead of letting them override it. Default False preserves the
     # original (causal AND SW) OR mm_prefix behavior for all other models.
     MM_PREFIX_CLAMP_SW: tl.constexpr = False,
+    COMPACT_GEMMA4_KV: tl.constexpr = False,
+    compact_k_norm_ptr=None,
+    COMPACT_GEMMA4_RAW: tl.constexpr = False,
+    compact_rope_ptr=None,
+    COMPACT_ROPE_STRIDE: tl.constexpr = 0,
+    COMPACT_ROPE_ROWS: tl.constexpr = 0,
+    RAW_SINGLE_PV: tl.constexpr = False,
+    SCORE_MAX_ONLY: tl.constexpr = False,
+    USE_PREFIX_MAX: tl.constexpr = False,
+    score_prefix_max_ptr=None,
 ):
     # Per-(token, head) scale caches: used iff KV_QUANT_MODE in {2, 3}.
     USE_PER_TOKEN_HEAD_SCALES: tl.constexpr = (KV_QUANT_MODE >= 2) and (
@@ -448,6 +459,15 @@ def kernel_unified_attention(
         BLOCK_Q, cur_batch_query_len - q_block_local_idx * BLOCK_Q
     )
 
+    # Raw compact KV: prefill sequences use one BF16 P@V product, while decode
+    # and verification rows (up to four query tokens) keep the split hi/lo
+    # product. Decide per sequence so a row's arithmetic does not depend on
+    # which other requests share its batch.
+    if RAW_SINGLE_PV:  # noqa: SIM108 (constexpr branch)
+        raw_single_pv = cur_batch_query_len > 4
+    else:
+        raw_single_pv = False
+
     offs_m = tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, HEAD_SIZE_PADDED)
     offs_t = tl.arange(0, TILE_SIZE)
@@ -464,6 +484,58 @@ def kernel_unified_attention(
     dim_mask = tl.where(offs_d < HEAD_SIZE, 1, 0).to(tl.int1)
     query_mask_0 = tl.where(query_pos < cur_batch_query_len, 1, 0).to(tl.int1)
     query_mask_1 = tl.where(query_offset_1 < num_query_heads, 1, 0).to(tl.int1)
+
+    if COMPACT_GEMMA4_RAW and not USE_SINKS:  # noqa: SIM102
+        if seq_len == 1:
+            physical = tl.load(block_tables_ptr + seq_idx * block_table_stride).to(
+                tl.int64
+            )
+            key_row = physical * stride_k_cache_0 + kv_head_idx * stride_k_cache_2
+            inverse_one, _ = load_raw_metadata(key_cache_ptr, key_row, True)
+            one_value = (
+                tl.load(
+                    value_cache_ptr
+                    + physical * stride_v_cache_0
+                    + kv_head_idx * stride_v_cache_2
+                    + offs_d * stride_v_cache_3,
+                    dim_mask,
+                    other=0.0,
+                ).to(tl.float32)
+                * inverse_one
+            )
+            exact_one = tl.broadcast_to(one_value[None, :], (BLOCK_M, HEAD_SIZE_PADDED))
+            valid_one = query_mask_0 & query_mask_1
+            if IS_3D:
+                offsets = (
+                    query_offset_0[:, None].to(tl.int64)
+                    * (num_query_heads * NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
+                    + query_offset_1[:, None]
+                    * (NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
+                    + segm_idx * HEAD_SIZE_PADDED
+                    + offs_d[None, :]
+                )
+                tl.store(
+                    segm_output_ptr + offsets,
+                    exact_one,
+                    valid_one[:, None] & dim_mask[None, :],
+                )
+                scalars = (
+                    query_offset_0.to(tl.int64) * num_query_heads + query_offset_1
+                ) * NUM_SEGMENTS_PER_SEQ + segm_idx
+                tl.store(segm_max_ptr + scalars, 0.0, valid_one)
+                tl.store(segm_expsum_ptr + scalars, 1.0, valid_one)
+            else:
+                offsets = (
+                    query_offset_0[:, None].to(tl.int64) * output_stride_0
+                    + query_offset_1[:, None] * output_stride_1
+                    + offs_d[None, :]
+                )
+                tl.store(
+                    output_ptr + offsets,
+                    exact_one,
+                    valid_one[:, None] & dim_mask[None, :],
+                )
+            return
 
     # Q : (BLOCK_M, HEAD_SIZE_PADDED)
     if USE_TD_QO:
@@ -490,10 +562,46 @@ def kernel_unified_attention(
 
     block_table_offset = seq_idx * block_table_stride
 
+    if COMPACT_GEMMA4_RAW:
+        rd = tl.arange(0, 128)
+        rd = tl.where(rd < 64, rd, rd + 192)
+        td = tl.arange(0, 4) + 316
+        qbase = query_offset_0 * query_stride_0 + query_offset_1 * query_stride_1
+        qvalid = query_mask_0 & query_mask_1
+        # The 384 unrotated dims score against the raw V tile itself: one dot
+        # over all 512 dims with the rotated query dims zeroed, so the reader
+        # loads the V region once instead of again as a transposed K tile.
+        Q_unrotated = tl.where(((offs_d % 256) >= 64)[None, :], Q, 0.0).to(Q.dtype)
+        Q_rot = tl.load(
+            query_ptr + qbase[:, None] + rd[None, :], qvalid[:, None], other=0.0
+        )
+        Q_tail = tl.load(
+            query_ptr + qbase[:, None] + td[None, :], qvalid[:, None], other=0.0
+        ).to(tl.float32)
+        raw_gamma = tl.load(compact_k_norm_ptr).to(tl.float32)
+
     M = init_softmax_M(
         sink_ptr, query_offset_1, query_mask_1, segm_idx, BLOCK_M, USE_SINKS, IS_3D
     )
     L = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
+    if USE_PREFIX_MAX:
+        # Preserve the serial kernel's scale before rounding P to BF16.
+        segment_ids = tl.arange(0, NUM_SEGMENTS_PER_SEQ)
+        prefix_offsets = (
+            query_offset_0[:, None].to(tl.int64)
+            * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
+            + query_offset_1[:, None] * NUM_SEGMENTS_PER_SEQ
+            + segment_ids[None, :]
+        )
+        prefix_max = tl.load(
+            score_prefix_max_ptr + prefix_offsets,
+            mask=(segment_ids[None, :] < segm_idx)
+            & query_mask_0[:, None]
+            & query_mask_1[:, None],
+            other=float("-inf"),
+        )
+        M = tl.maximum(M, tl.max(prefix_max, axis=1))
+        L = tl.where(segm_idx == 0, L, 0.0)
     # acc : (BLOCK_M, HEAD_SIZE_PADDED)
     acc = tl.zeros([BLOCK_M, HEAD_SIZE_PADDED], dtype=tl.float32)
     score_scale = scale
@@ -546,7 +654,93 @@ def kernel_unified_attention(
             block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
         ).to(tl.int64)
 
-        if USE_TD:
+        if COMPACT_GEMMA4_KV:
+            tl.static_assert(HEAD_SIZE == 512 and KV_QUANT_MODE == 0)
+            v_offset = (
+                physical_block_idx[:, None] * stride_v_cache_0
+                + kv_head_idx * stride_v_cache_2
+                + offs_d[None, :] * stride_v_cache_3
+                + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
+            )
+            V_load = tl.load(
+                value_cache_ptr + v_offset,
+                mask=dim_mask[None, :] & tile_mask[:, None],
+                other=0.0,
+            )
+            if COMPACT_GEMMA4_RAW:
+                row = (
+                    physical_block_idx * stride_k_cache_0
+                    + kv_head_idx * stride_k_cache_2
+                    + (seq_offset % BLOCK_SIZE) * stride_k_cache_1
+                )
+                raw_inverse, raw_position = load_raw_metadata(
+                    key_cache_ptr, row, tile_mask
+                )
+                rot_dim = tl.arange(0, 128)
+                K_rot = tl.load(
+                    key_cache_ptr + row[None, :] + rot_dim[:, None],
+                    (rot_dim[:, None] < 124) & tile_mask[None, :],
+                    other=0.0,
+                )
+                value_row = (
+                    physical_block_idx * stride_v_cache_0
+                    + kv_head_idx * stride_v_cache_2
+                    + (seq_offset % BLOCK_SIZE) * stride_v_cache_1
+                )
+                tail_dim = tl.arange(0, 4) + 60
+                tail_a = tl.load(
+                    value_cache_ptr
+                    + value_row[:, None]
+                    + (tail_dim[None, :] + 256) * stride_v_cache_3,
+                    tile_mask[:, None],
+                    other=0.0,
+                ).to(tl.float32)
+                tail_b = tl.load(
+                    value_cache_ptr
+                    + value_row[:, None]
+                    + tail_dim[None, :] * stride_v_cache_3,
+                    tile_mask[:, None],
+                    other=0.0,
+                ).to(tl.float32)
+                rope_row = raw_position.to(tl.int64) * COMPACT_ROPE_STRIDE
+                rope_valid = (
+                    tile_mask & (raw_position >= 0) & (raw_position < COMPACT_ROPE_ROWS)
+                )
+                cosine = tl.load(
+                    compact_rope_ptr + rope_row[:, None] + tail_dim[None, :],
+                    rope_valid[:, None],
+                    other=0.0,
+                ).to(tl.float32)
+                sine = tl.load(
+                    compact_rope_ptr + rope_row[:, None] + 256 + tail_dim[None, :],
+                    rope_valid[:, None],
+                    other=0.0,
+                ).to(tl.float32)
+                K_tail = (tail_a * cosine + tail_b * sine) * (raw_inverse * raw_gamma)[
+                    :, None
+                ]
+                # Only the raw branch's split operands are consumed below.
+                K_load = tl.full((HEAD_SIZE_PADDED, TILE_SIZE), 0, tl.bfloat16)
+            else:
+                rotated = (offs_d % 256) < 64
+                compact_dim = (offs_d // 256) * 64 + offs_d % 256
+                k_offset = (
+                    physical_block_idx[None, :] * stride_k_cache_0
+                    + kv_head_idx * stride_k_cache_2
+                    + compact_dim[:, None] * stride_k_cache_3
+                    + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+                )
+                rotated_k = tl.load(
+                    key_cache_ptr + k_offset,
+                    mask=rotated[:, None] & tile_mask[None, :],
+                    other=0.0,
+                )
+                norm = tl.load(compact_k_norm_ptr + offs_d, dim_mask, other=0.0)
+                reconstructed = (V_load.T.to(tl.float32) * norm[:, None]).to(
+                    tl.bfloat16
+                )
+                K_load = tl.where(rotated[:, None], rotated_k, reconstructed)
+        elif USE_TD:
             # All TILE_SIZE slots within a single KV tile map to one
             # physical block (guaranteed by ``BLOCK_SIZE % TILE_SIZE == 0``
             # from the static_assert above), so load the block index as
@@ -655,7 +849,15 @@ def kernel_unified_attention(
 
         # S : (BLOCK_M, TILE_SIZE)
         S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
-        if USE_PER_TOKEN_HEAD_SCALES:
+        if COMPACT_GEMMA4_RAW:
+            raw_score = (
+                tl.dot(Q_unrotated, tl.trans(V_load))
+                * (raw_inverse * raw_gamma)[None, :]
+            )
+            raw_score += tl.dot(Q_rot, K_rot)
+            raw_score += tl.sum(Q_tail[:, None, :] * K_tail[None, :, :], axis=2)
+            S += score_scale * raw_score
+        elif USE_PER_TOKEN_HEAD_SCALES:
             # Per-token-head quant: fuse softmax_scale with per-head k_scale
             # to avoid a separate BLOCK_M × TILE_SIZE multiply on S.
             S += tl.dot(Q, K) * (score_scale * k_token_head_scales[None, :])
@@ -679,41 +881,62 @@ def kernel_unified_attention(
                 qq_bias_row_ptrs, seq_offset, context_len, qq_bias_stride_0
             )
 
-        M, L, P, alpha = softmax_step(S, M, L)
-        acc = acc * alpha[:, None]
-
-        if SLIDING_WINDOW:
-            qpos_lo = q_block_local_idx * BLOCK_Q
-            dist = context_len + qpos_lo - seq_offset[:, None]
-            if USE_PER_SEQ_CAUSAL:
-                is_causal_seq = tl.load(per_seq_causal_ptr + seq_idx)
-                sw_mask_v = tl.where(
-                    is_causal_seq,
-                    dist < SLIDING_WINDOW,
-                    (dist < SLIDING_WINDOW) & (dist > -SLIDING_WINDOW),
-                )
-            elif USE_CAUSAL:
-                sw_mask_v = dist < SLIDING_WINDOW
-            else:
-                sw_mask_v = (dist < SLIDING_WINDOW) & (dist > -SLIDING_WINDOW)
-            V = tl.where(sw_mask_v, V, 0.0)
-        if USE_PER_TOKEN_HEAD_SCALES:
-            # Per-token-head quant: apply v_scale to P instead of V.
-            P_v = (P * v_token_head_scales[None, :]).to(V.dtype)
-            acc += tl.dot(P_v, V)
+        if SCORE_MAX_ONLY:
+            M = tl.maximum(M, tl.max(S, axis=1))
         else:
-            # Keep softmax weights representable when the P @ V dot uses FP8
-            # tensor cores. Undo the power-of-two scale after the dot.
-            if V.dtype == tl.float8e4nv:
-                p_scale = 256.0
-            elif V.dtype.is_fp8():
-                p_scale = 128.0
+            M, L, P, alpha = softmax_step(S, M, L)
+            acc = acc * alpha[:, None]
+
+            if SLIDING_WINDOW:
+                qpos_lo = q_block_local_idx * BLOCK_Q
+                dist = context_len + qpos_lo - seq_offset[:, None]
+                if USE_PER_SEQ_CAUSAL:
+                    is_causal_seq = tl.load(per_seq_causal_ptr + seq_idx)
+                    sw_mask_v = tl.where(
+                        is_causal_seq,
+                        dist < SLIDING_WINDOW,
+                        (dist < SLIDING_WINDOW) & (dist > -SLIDING_WINDOW),
+                    )
+                elif USE_CAUSAL:
+                    sw_mask_v = dist < SLIDING_WINDOW
+                else:
+                    sw_mask_v = (dist < SLIDING_WINDOW) & (dist > -SLIDING_WINDOW)
+                V = tl.where(sw_mask_v, V, 0.0)
+            if COMPACT_GEMMA4_RAW:
+                scaled_p = P * raw_inverse[None, :]
+                p_hi = scaled_p.to(V.dtype)
+                acc += tl.dot(p_hi, V)
+                if not raw_single_pv:
+                    p_lo = (scaled_p - p_hi.to(tl.float32)).to(V.dtype)
+                    acc += tl.dot(p_lo, V)
+            elif USE_PER_TOKEN_HEAD_SCALES:
+                # Per-token-head quant: apply v_scale to P instead of V.
+                P_v = (P * v_token_head_scales[None, :]).to(V.dtype)
+                acc += tl.dot(P_v, V)
             else:
-                p_scale = 1.0
-            acc += tl.dot((P * p_scale).to(V.dtype), V) / p_scale
+                # Keep softmax weights representable when the P @ V dot uses FP8
+                # tensor cores. Undo the power-of-two scale after the dot.
+                if V.dtype == tl.float8e4nv:
+                    p_scale = 256.0
+                elif V.dtype.is_fp8():
+                    p_scale = 128.0
+                else:
+                    p_scale = 1.0
+                acc += tl.dot((P * p_scale).to(V.dtype), V) / p_scale
 
     # ---- Epilogue ---------------------------------------------------------
-    if IS_3D:
+    if SCORE_MAX_ONLY:
+        prefix_offsets = (
+            query_offset_0.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
+            + query_offset_1 * NUM_SEGMENTS_PER_SEQ
+            + segm_idx
+        )
+        tl.store(
+            score_prefix_max_ptr + prefix_offsets,
+            M,
+            mask=query_mask_0 & query_mask_1,
+        )
+    elif IS_3D:
         if USE_FP8_Q_DESCALE:
             acc *= value_scale
         # Store per-segment partials; finalized by ``reduce_segments``.
@@ -987,11 +1210,91 @@ def unified_attention(
     # Gemma4: clamp mm_prefix bidirectional ranges by the sliding window.
     # Default False keeps the original behavior for every other model.
     mm_prefix_clamp_sliding_window: bool = False,
+    compact_k_norm=None,
+    compact_fp8_storage: bool = False,
+    compact_raw_rope=None,
 ):
+    compact_storage_dtype = (
+        torch.float8_e4m3fn if compact_fp8_storage else torch.bfloat16
+    )
+    if compact_fp8_storage and compact_k_norm is None:
+        raise ValueError("FP8 compact storage requires the Gemma4 compact layout")
+    if compact_raw_rope is not None and (
+        compact_fp8_storage
+        or compact_k_norm is None
+        or is_batch_invariant
+        or compact_raw_rope.ndim != 2
+        or compact_raw_rope.shape[1] != 512
+        or compact_raw_rope.dtype not in (torch.bfloat16, torch.float32)
+        or compact_raw_rope.stride(1) != 1
+        or compact_raw_rope.device != q.device
+    ):
+        raise ValueError("Raw compact KV requires a RoPE table and BF16 storage")
+    if compact_k_norm is not None and (
+        q.shape[-1] != 512
+        or k.shape[-1] != 128
+        or v.shape[-1] != 512
+        or q.dtype != torch.bfloat16
+        or k.dtype != compact_storage_dtype
+        or v.dtype != compact_storage_dtype
+        or kv_quant_mode != KVQuantMode.NONE
+        or compact_k_norm.dtype != torch.bfloat16
+        or compact_k_norm.shape != ((1,) if compact_raw_rope is not None else (512,))
+        or use_td
+    ):
+        raise ValueError("Invalid compact Gemma4 KV layout or dtype")
     # Resolve causal: bool or per-seq tensor.
     use_per_seq_causal = isinstance(causal, torch.Tensor)
     use_causal = bool(causal) if not use_per_seq_causal else True
     per_seq_causal_ptr = causal if use_per_seq_causal else None
+
+    if (
+        mm_prefix_clamp_sliding_window
+        and compact_k_norm is None
+        and current_platform.is_device_capability_family(120)
+        and q.shape[1:] == (16, 256)
+        and k.shape[2:] == (8, 256)
+        and q.dtype == k.dtype == v.dtype == torch.bfloat16
+        and k.shape[1] % 16 == 0
+        and max_seqlen_q >= 1024
+        and use_causal
+        and not use_per_seq_causal
+        and window_size == (1023, 0)
+        and kv_quant_mode == KVQuantMode.NONE
+        and mm_prefix_range is None
+        and rswa_prefix_lens is None
+        and rswa_window is None
+        and sinks is None
+        and qq_bias is None
+        and alibi_slopes is None
+        and output_scale is None
+        and softcap == 0
+        and chunk_lookback == -1
+        and not use_td
+        and not is_batch_invariant
+    ):
+        from vllm.vllm_flash_attn.flash_attn_interface import (
+            flash_attn_varlen_func,
+            is_fa_version_supported,
+        )
+
+        if is_fa_version_supported(2):
+            flash_attn_varlen_func(
+                q=q,
+                k=k,
+                v=v,
+                out=out,
+                cu_seqlens_q=cu_seqlens_q,
+                max_seqlen_q=max_seqlen_q,
+                seqused_k=seqused_k,
+                max_seqlen_k=max_seqlen_k,
+                softmax_scale=softmax_scale,
+                causal=True,
+                window_size=window_size,
+                block_table=block_table,
+                fa_version=2,
+            )
+            return
 
     # Sub-byte packed mode (INT4) needs a bespoke kernel (split-dot +
     # sub-byte unpack); everything else goes through the core kernel below.
@@ -1078,6 +1381,39 @@ def unified_attention(
     # Tuned launch parameters; ``None`` lets Triton pick its defaults.
     launch_num_warps: int | None = None
     launch_num_stages: int | None = None
+    if compact_k_norm is not None:
+        # Reconstructing 512-wide K tiles needs more shared memory than the
+        # dense path. Bound pipelining to fit SM120's per-block limit.
+        launch_num_stages = 1
+        if (
+            compact_fp8_storage
+            and current_platform.is_device_capability(120)
+            and num_seqs == 1
+            and num_kv_heads == 2
+            and num_queries_per_kv == 8
+            and block_size == 512
+            and max_seqlen_q >= 1024
+            and window_size == (-1, -1)
+            and use_causal
+            and not use_per_seq_causal
+            and not is_batch_invariant
+            and mm_prefix_range is None
+            and rswa_prefix_lens is None
+            and rswa_window is None
+            and sinks is None
+            and qq_bias is None
+            and alibi_slopes is None
+            and output_scale is None
+            and softcap == 0
+            and chunk_lookback == -1
+        ):
+            # More warps reduce FP8 reconstruction spills without repacking KV.
+            launch_num_warps = 8
+
+    # head_size 256 with many query rows per sequence (e.g. diffusion-gemma
+    if compact_raw_rope is not None:
+        launch_num_stages = 2
+        launch_num_warps = 4
 
     # head_size 256 with many query rows per sequence (e.g. diffusion-gemma
     # bidirectional canvas passes) is prefill-shaped, but the decode-oriented
@@ -1145,6 +1481,10 @@ def unified_attention(
     TILE_SIZE_DECODE = _get_tile_size(
         head_size, sliding_window_val, q.element_size(), is_prefill=False
     )
+    if compact_k_norm is not None and current_platform.is_device_capability(120):
+        # The 32-token compact tile fits SM120 with one pipeline stage and
+        # amortizes reconstruction better than the dense BF16 decode default.
+        TILE_SIZE_DECODE = 32
 
     # Wider KV tile for the tuned large-head path (see above). Only the 2D
     # path (used when max_seqlen_q > 1) reads TILE_SIZE_PREFILL.
@@ -1210,13 +1550,49 @@ def unified_attention(
     ):
         seq_threshold_3D = max(1, seq_threshold_3D // 2)
 
+    # Compact global attention has very few KV heads. Short verification
+    # queries whose scratch holds every query row keep the per-sequence
+    # split-KV threshold, instead of serially scanning the context on a few
+    # CTAs once the Q-block count passes it.
+    compact_short_query = (
+        compact_k_norm is not None
+        and current_platform.is_device_capability(120)
+        and max_seqlen_q <= 4
+        and softmax_segm_output is not None
+        and softmax_segm_max is not None
+        and softmax_segm_expsum is not None
+        and min(
+            softmax_segm_output.shape[0],
+            softmax_segm_max.shape[0],
+            softmax_segm_expsum.shape[0],
+        )
+        >= q.shape[0]
+    )
+
+    score_prefix_max = None
+    if (
+        compact_short_query
+        and max_seqlen_q > 1
+        and num_par_softmax_segments is not None
+    ):
+        # Maxima live beyond all output rows; the second pass cannot overwrite them.
+        used = (
+            q.shape[0] * num_query_heads * num_par_softmax_segments * head_size_padded
+        )
+        needed = q.shape[0] * num_query_heads * num_par_softmax_segments
+        if softmax_segm_output.numel() >= used + needed:
+            score_prefix_max = softmax_segm_output.view(-1)[used : used + needed]
+        else:
+            compact_short_query = False
+
     # Launch the 2D kernel if
     # 1. No split-K threshold or scratch buffers, or the scratch has fewer
     #    rows than query tokens, or
     # 2. max_seqlen_q > 1 and either it exceeds MAX_3D_QUERY_LEN, masking is
     #    non-causal, per-sequence causal, or mm-prefix, or the tuned
     #    large-head path applies, or
-    # 3. The number of Q blocks exceeds seq_threshold_3D, or
+    # 3. The number of Q blocks (sequences, for compact short queries)
+    #    exceeds seq_threshold_3D, or
     # 4. Batch invariance is enabled
     use_3d = not (
         seq_threshold_3D is None
@@ -1234,11 +1610,25 @@ def unified_attention(
                 or tuned_large_head
             )
         )
-        or num_seqs * triton.cdiv(max_seqlen_q, BLOCK_Q) > seq_threshold_3D
+        or (
+            num_seqs
+            if compact_short_query
+            else num_seqs * triton.cdiv(max_seqlen_q, BLOCK_Q)
+        )
+        > seq_threshold_3D
         or is_batch_invariant
     )
     if use_3d and softmax_segm_max.shape[0] < q.shape[0]:
         logger.debug_once("Split-K scratch rows < query tokens; using 2D.")
+        use_3d = False
+    if (
+        use_3d
+        and compact_k_norm is not None
+        and max_seqlen_q > 1
+        and score_prefix_max is None
+    ):
+        # Compact multi-token queries split KV only with the serial-scale
+        # prefix pass below; otherwise keep the serial 2D scan.
         use_3d = False
 
     # RDNA launch tuning, after vLLM's 2D/3D choice (it keeps vLLM's split-KV
@@ -1392,7 +1782,7 @@ def unified_attention(
     if launch_num_stages is not None:
         launch_kwargs["num_stages"] = launch_num_stages
 
-    kernel_unified_attention[grid](
+    kernel_kwargs = dict(
         output_ptr=out,
         segm_output_ptr=segm_output_ptr,
         segm_max_ptr=segm_max_ptr,
@@ -1468,7 +1858,35 @@ def unified_attention(
         USE_TD=use_td,
         USE_TD_QO=use_td_qo,
         MM_PREFIX_CLAMP_SW=mm_prefix_clamp_sliding_window,
+        COMPACT_GEMMA4_KV=compact_k_norm is not None,
+        compact_k_norm_ptr=compact_k_norm,
+        COMPACT_GEMMA4_RAW=compact_raw_rope is not None,
+        compact_rope_ptr=compact_raw_rope,
+        COMPACT_ROPE_STRIDE=compact_raw_rope.stride(0)
+        if compact_raw_rope is not None
+        else 0,
+        COMPACT_ROPE_ROWS=compact_raw_rope.shape[0]
+        if compact_raw_rope is not None
+        else 0,
+        RAW_SINGLE_PV=compact_raw_rope is not None,
         **launch_kwargs,
+    )
+
+    # The raw reader retains the low part of scaled probabilities; it does not
+    # need an extra QK pass to reproduce the old single-BF16 probability cast.
+    faithful_split = (
+        use_3d and score_prefix_max is not None and compact_raw_rope is None
+    )
+    if faithful_split:
+        kernel_unified_attention[grid](
+            **kernel_kwargs,
+            SCORE_MAX_ONLY=True,
+            score_prefix_max_ptr=score_prefix_max,
+        )
+    kernel_unified_attention[grid](
+        **kernel_kwargs,
+        USE_PREFIX_MAX=faithful_split,
+        score_prefix_max_ptr=score_prefix_max,
     )
 
     if use_3d:

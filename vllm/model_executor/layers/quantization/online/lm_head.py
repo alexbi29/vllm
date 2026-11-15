@@ -16,6 +16,9 @@ from vllm.model_executor.layers.quantization.online.fp8 import (
     Fp8PtpcOnlineLinearMethod,
     OnlineLinearBase,
 )
+from vllm.model_executor.layers.quantization.online.lm_head_fp8 import (
+    fit_fp8_head_scales,
+)
 from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
     FLOAT4_E2M1_MAX,
     ref_nvfp4_quant,
@@ -80,8 +83,16 @@ class _LMHeadNvfp4Method(OnlineLinearBase):
         return self.kernel.apply_weights(layer, x, bias)
 
 
+class _LMHeadFp8Method(Fp8PtpcOnlineLinearMethod):
+    def quantize_weight(
+        self, weight: torch.Tensor, scale: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        quantized, scale = super().quantize_weight(weight, scale)
+        return fit_fp8_head_scales(weight, quantized, scale)
+
+
 _LM_HEAD_METHODS: dict[str, type[OnlineLinearBase]] = {
-    "fp8": Fp8PtpcOnlineLinearMethod,
+    "fp8": _LMHeadFp8Method,
     "nvfp4": _LMHeadNvfp4Method,
 }
 
@@ -133,8 +144,9 @@ def quantized_lm_head_copy(
 ) -> ParallelLMHead:
     """A ParallelLMHead holding this rank's shard of `lm_head`, quantized.
 
-    "fp8" uses per-row weight and per-token activation scales on the platform's
-    FP8 linear kernel; "nvfp4" is weight-only on the
+    "fp8" fits per-row weight scales at load time, with a non-worse FP64
+    reconstruction-error guard, and keeps per-token activation scales on the
+    platform's FP8 linear kernel; "nvfp4" is weight-only on the
     platform's W4A16 kernel. `lm_head` is left
     unchanged and no bf16 copy of its weight is made. The copy is derived state:
     `refresh_quantized_lm_heads` re-derives it after `lm_head` changes.

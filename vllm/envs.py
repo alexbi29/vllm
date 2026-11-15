@@ -93,6 +93,10 @@ if TYPE_CHECKING:
     VLLM_MAIN_CUDA_VERSION: str = "13.0"
     VLLM_FLOAT32_MATMUL_PRECISION: Literal["highest", "high", "medium"] = "highest"
     VLLM_BATCH_INVARIANT: bool = False
+    VLLM_GEMMA4_DENSE_CUDNN: bool = False
+    VLLM_GEMMA4_Q_ONLY_DRAFTING: bool = False
+    VLLM_GEMMA4_W12: bool = False
+    VLLM_GEMMA4_EXACT_INT4: bool = False
     VLLM_TRITON_USE_TD: bool | None = None
     VLLM_GPU_SYNC_CHECK: Literal["warn", "error"] | None = None
     MAX_JOBS: str | None = None
@@ -670,6 +674,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable batch-invariant mode: deterministic results regardless of
     # batch composition. Requires NVIDIA GPU with compute capability >= 9.0.
     "VLLM_BATCH_INVARIANT": lambda: bool(int(os.getenv("VLLM_BATCH_INVARIANT", "0"))),
+    # Opt-in SM120 BF16 Gemma4 shared-MLP projections with audited cuDNN plans.
+    "VLLM_GEMMA4_DENSE_CUDNN": lambda: bool(
+        int(os.getenv("VLLM_GEMMA4_DENSE_CUDNN", "0"))
+    ),
+    "VLLM_GEMMA4_Q_ONLY_DRAFTING": lambda: bool(
+        int(os.getenv("VLLM_GEMMA4_Q_ONLY_DRAFTING", "0"))
+    ),
+    # Opt-in SM120 lossless 12-bit (W12) storage for Gemma4's BF16 linears.
+    "VLLM_GEMMA4_W12": lambda: bool(int(os.getenv("VLLM_GEMMA4_W12", "0"))),
+    # Opt-in exact INT4 x FP32-scale storage for Gemma4 QAT tensors kept in
+    # BF16 (tied embedding / LM head, MTP assistant head); bit-exact weights.
+    "VLLM_GEMMA4_EXACT_INT4": lambda: bool(
+        int(os.getenv("VLLM_GEMMA4_EXACT_INT4", "0"))
+    ),
     "VLLM_REPLICATE_EMBED": lambda: (
         os.getenv("VLLM_REPLICATE_EMBED", "0").strip().lower() in ("1", "true")
     ),
